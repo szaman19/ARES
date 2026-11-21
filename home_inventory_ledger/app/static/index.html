@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Home Inventory Ledger · Pre-Loss Coverage &amp; Verification Agent</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <div>
+        <h1>Home Inventory Ledger</h1>
+        <p class="subtitle">Film your things for 60 seconds. Know today whether your insurance covers them.</p>
+      </div>
+    </div>
+    <div class="topbar-meta">
+      <span id="mode-pill" class="mode-pill">Checking API…</span>
+      <span class="model-strip">Gemini 4 Carbon · Hydrogen ×N · Decision-1 · shop.dev</span>
+    </div>
+  </header>
+
+  <div id="replay-banner" class="replay-banner hidden">
+    <strong>DISCLOSED REPLAY / DEMO BACKUP MODE ACTIVE:</strong>
+    Set <code>GEMINI_API_KEY</code> in <code>.env</code> (or uncheck Replay Mode) for live Gemini 4 &amp; Shop MCP inference.
+  </div>
+
+  <main class="container">
+    <!-- STEP 1 & 2: CAPTURE FLOW -->
+    <section class="capture-grid">
+      <!-- Policy Declarations Card -->
+      <div class="panel">
+        <div class="step-tag">STEP 1 · POLICY DECLARATIONS</div>
+        <h2>Coverage C Personal Property Limit</h2>
+        <p class="muted">Snap or upload your policy declarations page (use a sample, never personal PII), or enter your limit.</p>
+
+        <div class="policy-controls">
+          <label class="btn btn-secondary">
+            📷 Snap / Upload Declarations Page
+            <input type="file" id="policy-file" accept="image/*" capture="environment" hidden />
+          </label>
+          <button type="button" id="btn-sample-policy" class="btn btn-ghost">Use Sample $7,500 Policy</button>
+        </div>
+
+        <div class="input-row">
+          <div>
+            <label for="coverage-limit">Coverage C Limit (USD)</label>
+            <input type="number" id="coverage-limit" value="7500" min="1000" step="500" />
+          </div>
+          <div>
+            <label for="deductible">Deductible (USD)</label>
+            <input type="number" id="deductible" value="500" min="0" step="100" />
+          </div>
+        </div>
+        <div id="policy-status" class="status-chip hidden"></div>
+      </div>
+
+      <!-- Walkthrough Video + Audio Capture Card -->
+      <div class="panel">
+        <div class="step-tag">STEP 2 · MULTIMODAL WALKTHROUGH (VIDEO + VOICE)</div>
+        <h2>Film Your Desk or Room &amp; Narrate</h2>
+        <p class="muted">Pan across your items while talking naturally (e.g., <em>"MacBook from last year, Sony headphones…"</em>).</p>
+
+        <div class="camera-box" id="walkthrough-cam-box">
+          <video id="live-video" playsinline muted autoplay class="hidden"></video>
+          <div id="cam-placeholder" class="cam-placeholder">
+            <span>🎥 Live Camera + Mic or Video Upload</span>
+            <small>Supports phone camera, laptop webcam, or .mp4 / .mov / .webm clips</small>
+          </div>
+          <div id="rec-indicator" class="rec-indicator hidden">● REC <span id="rec-timer">00:00</span></div>
+        </div>
+
+        <div class="capture-actions">
+          <button type="button" id="btn-start-cam" class="btn btn-primary">🎥 Record Live Walkthrough</button>
+          <button type="button" id="btn-stop-cam" class="btn btn-danger hidden">⏹ Stop &amp; Analyze</button>
+          <label class="btn btn-secondary">
+            📁 Upload Clip
+            <input type="file" id="walkthrough-file" accept="video/*" hidden />
+          </label>
+          <button type="button" id="btn-demo-walkthrough" class="btn btn-accent">▶ Run Sample Desk Clip</button>
+        </div>
+
+        <label class="replay-toggle">
+          <input type="checkbox" id="toggle-replay" />
+          <span>Force offline <code>--replay</code> backup mode (disclosed)</span>
+        </label>
+      </div>
+    </section>
+
+    <!-- PIPELINE PROGRESS -->
+    <section id="progress-panel" class="panel progress-panel hidden">
+      <div class="progress-header">
+        <span class="spinner"></span>
+        <strong id="progress-title">Running Gemini 4 + Decision-1 Pipeline…</strong>
+      </div>
+      <div class="stage-track">
+        <span class="stage-pill" data-stage="ingest">1. Deterministic Ingest (dHash + Blur)</span>
+        <span class="stage-pill" data-stage="understand">2. Carbon (Segments + Audio + Policy)</span>
+        <span class="stage-pill" data-stage="extract">3. Hydrogen ×N (Parallel Extract + Magnets)</span>
+        <span class="stage-pill" data-stage="price_verify">4. Shop MCP + Verifiers (I1–I7)</span>
+        <span class="stage-pill" data-stage="decide_probe">5. Decision-1 (Verdict + VoI Probe)</span>
+      </div>
+    </section>
+
+    <!-- RESULTS: VERDICT FIRST + HERO VOI ASK LOOP -->
+    <section id="results-section" class="hidden">
+      <div class="verdict-ask-grid">
+        <!-- COVERAGE VERDICT CARD (HEADLINE) -->
+        <div class="card-light verdict-card">
+          <div class="eyebrow">COVERAGE VERDICT · GEMINI DECISION-1</div>
+          <div class="verdict-headline-row">
+            <h2 id="verdict-label" class="verdict-title">—</h2>
+            <span id="verdict-conf" class="conf-pill">confidence —</span>
+          </div>
+
+          <!-- Range Bar vs Policy Limit -->
+          <div class="range-viz">
+            <div class="limit-marker" id="limit-marker">
+              <span id="limit-marker-label">Limit $8,000</span>
+            </div>
+            <div class="range-bar-bg">
+              <div id="bar-certified" class="bar-certified"></div>
+              <div id="bar-uncertified" class="bar-uncertified"></div>
+            </div>
+          </div>
+
+          <div class="totals-split">
+            <div>
+              <span class="lbl">Certified Floor</span>
+              <strong id="val-certified" class="val green">$0</strong>
+            </div>
+            <div>
+              <span class="lbl">Estimated Replacement Total</span>
+              <strong id="val-range" class="val amber">$0 – $0</strong>
+            </div>
+            <div>
+              <span class="lbl">Certified Share</span>
+              <strong id="val-cert-share" class="val">0%</strong>
+            </div>
+          </div>
+
+          <div class="hinges-block">
+            <span class="lbl">Verdict Hinges On (Counterfactual TV Influence):</span>
+            <div id="hinges-pills" class="pill-row"></div>
+          </div>
+
+          <div id="prob-bars" class="prob-bars"></div>
+
+          <p class="legal-note">Informational pre-loss assessment only — not a legal coverage determination.</p>
+        </div>
+
+        <!-- ACTIVE VOI CAPTURE REQUEST ("FILM THIS NEXT") + CONTRADICTION ALERT -->
+        <div class="right-stack">
+          <div id="conflict-banner" class="conflict-card hidden">
+            <div class="conflict-header">
+              <span class="bang-dot">!</span>
+              <strong>NARRATION vs. VISUAL CONFLICT CAUGHT</strong>
+            </div>
+            <p id="conflict-text"></p>
+          </div>
+
+          <div id="ask-card" class="ask-card">
+            <div class="eyebrow-blue">BEST NEXT SHOT · HIGHEST VALUE OF INFORMATION (VoI)</div>
+            <h3 id="ask-instruction">Show me the model label underneath the laptop</h3>
+            <p id="ask-voi-sub" class="ask-sub">Settles ±$850 of uncertainty in your coverage verdict</p>
+
+            <div id="followup-cam-wrap" class="followup-cam-wrap hidden">
+              <video id="followup-video" playsinline muted autoplay></video>
+            </div>
+
+            <div class="ask-actions">
+              <button type="button" id="btn-record-followup" class="btn btn-primary">🎥 Film 4s Label Close-Up</button>
+              <label class="btn btn-secondary">
+                📁 Upload Follow-Up
+                <input type="file" id="followup-file" accept="video/*" hidden />
+              </label>
+              <button type="button" id="btn-demo-followup" class="btn btn-accent">✨ Run Sample Label Clip (A2992)</button>
+            </div>
+
+            <div id="other-asks" class="other-asks"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SUPPORTING EVIDENCE LEDGER + EXPORT + SHOP CART -->
+      <div class="card-light ledger-section">
+        <div class="ledger-header">
+          <div>
+            <div class="eyebrow">INVARIANT-VERIFIED EVIDENCE LEDGER (0 INVENTED PRICES · DRIFT = <span id="drift-val">0</span>)</div>
+            <h3>Cited Item Schedule</h3>
+          </div>
+          <div class="export-actions">
+            <a id="link-export-csv" href="#" class="btn btn-secondary btn-sm">⬇ Export CSV</a>
+            <a id="link-export-html" href="#" target="_blank" class="btn btn-secondary btn-sm">🖨 Printable Schedule (PDF)</a>
+            <button type="button" id="btn-shop-cart" class="btn btn-shop btn-sm">🛍 Rebuild My Home (Shop Cart)</button>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="ledger-table">
+            <thead>
+              <tr>
+                <th>Visual Proof</th>
+                <th>Item &amp; Model Provenance</th>
+                <th>Qty</th>
+                <th>Status</th>
+                <th>Replacement (New)</th>
+                <th>VoI Swing</th>
+                <th>Live Catalog Citation</th>
+              </tr>
+            </thead>
+            <tbody id="ledger-tbody"></tbody>
+          </table>
+        </div>
+
+        <div id="telemetry-bar" class="telemetry-bar"></div>
+      </div>
+
+      <!-- SHOPIFY REPLACEMENT CART MODAL / DRAWER -->
+      <div id="cart-panel" class="card-light cart-panel hidden">
+        <div class="ledger-header">
+          <div>
+            <div class="eyebrow">BONUS TRACK · POWERED BY SHOP.DEV MCP</div>
+            <h3>Rebuild My Home — Replacement Cart Manifest</h3>
+          </div>
+          <button type="button" id="btn-close-cart" class="btn btn-ghost btn-sm">✕ Close</button>
+        </div>
+        <div id="cart-lines" class="cart-lines"></div>
+        <div class="cart-footer">
+          <div>
+            <span class="lbl">Verified Cart Subtotal</span>
+            <strong id="cart-subtotal" class="val">$0</strong>
+          </div>
+          <a id="cart-checkout-link" href="#" target="_blank" rel="noopener" class="btn btn-shop">
+            Review on Shop (User Confirms Checkout) →
+          </a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
