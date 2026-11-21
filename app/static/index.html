@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARES · NASA TESS Planet Hunter vs. Cosmic Impostors</title>
+  <style>
+    :root {
+      --bg: #0B0F19;
+      --surface: #131B2E;
+      --surface-alt: #19243D;
+      --border: #2B3B5E;
+      --text: #F8FAFC;
+      --muted: #94A3B8;
+      --cyan: #38BDF8;
+      --green: #10B981;
+      --amber: #F59E0B;
+      --red: #EF4444;
+      --violet: #A78BFA;
+      --gold: #FBBF24;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at 15% 0%, #15223e 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.45;
+    }
+    code, .mono { font-family: "SF Mono", "Menlo", "Consolas", monospace; }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      background: rgba(19, 27, 46, 0.92);
+      backdrop-filter: blur(10px);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .brand-pill {
+      background: rgba(56, 189, 248, 0.16);
+      border: 1px solid var(--cyan);
+      color: var(--cyan);
+      font-weight: 700;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      letter-spacing: 0.06em;
+    }
+    .brand h1 {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .brand p {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .stats-strip {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .stat-chip {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 12px;
+    }
+    .stat-chip b { color: var(--cyan); }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 330px 1fr 410px;
+      gap: 18px;
+      padding: 18px 22px;
+      max-width: 1820px;
+      margin: 0 auto;
+    }
+    @media (max-width: 1360px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: rgba(19, 27, 46, 0.94);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(43, 59, 94, 0.65);
+      padding-bottom: 10px;
+    }
+    .panel-title {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+
+    .case-group-lbl {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-top: 6px;
+      color: var(--muted);
+    }
+    .case-btn {
+      width: 100%;
+      text-align: left;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .case-btn:hover { border-color: var(--cyan); transform: translateY(-1px); }
+    .case-btn.active {
+      border-color: var(--cyan);
+      background: rgba(56, 189, 248, 0.13);
+      box-shadow: 0 0 0 1px var(--cyan);
+    }
+    .case-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .case-sub { font-size: 11px; color: var(--muted); }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+    .b-cert { background: rgba(16, 185, 129, 0.18); color: var(--green); border: 1px solid var(--green); }
+    .b-uncert { background: rgba(245, 158, 11, 0.18); color: var(--amber); border: 1px solid var(--amber); }
+    .b-unk { background: rgba(148, 163, 184, 0.14); color: var(--muted); border: 1px solid var(--border); }
+    .b-decoy { background: rgba(239, 68, 68, 0.18); color: var(--red); border: 1px solid var(--red); }
+    .b-planet { background: rgba(56, 189, 248, 0.18); color: var(--cyan); border: 1px solid var(--cyan); }
+
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .action-btn {
+      flex: 1;
+      padding: 10px 12px;
+      border-radius: 9px;
+      font-weight: 700;
+      font-size: 12.5px;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #0284c7, #2563eb);
+      color: white;
+      border-color: var(--cyan);
+    }
+    .btn-primary:hover { filter: brightness(1.1); }
+    .btn-secondary {
+      background: var(--surface-alt);
+      color: var(--text);
+      border-color: var(--violet);
+    }
+    .btn-secondary:hover { background: rgba(167, 139, 250, 0.18); }
+    .btn-gold {
+      background: rgba(251, 191, 36, 0.16);
+      color: var(--gold);
+      border-color: var(--gold);
+    }
+    .btn-gold:hover { background: rgba(251, 191, 36, 0.28); }
+    .action-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .verdict-banner {
+      background: var(--surface-alt);
+      border: 1.5px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .verdict-banner.cert { border-color: var(--green); background: rgba(16, 185, 129, 0.09); }
+    .verdict-banner.uncert { border-color: var(--amber); background: rgba(245, 158, 11, 0.09); }
+
+    .artifact-tabs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .tab-btn {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab-btn.active { border-color: var(--cyan); color: var(--cyan); background: rgba(56, 189, 248, 0.14); }
+    .ablate-toggle {
+      margin-left: auto;
+      background: rgba(251, 191, 36, 0.14);
+      border: 1px solid var(--gold);
+      color: var(--gold);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .ablate-toggle.active {
+      background: var(--gold);
+      color: #0B0F19;
+    }
+
+    .card-frame {
+      background: #070A12;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px;
+      min-height: 430px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+    .card-frame img {
+      width: 100%;
+      height: auto;
+      border-radius: 8px;
+      display: block;
+    }
+    .sha-foot {
+      width: 100%;
+      margin-top: 8px;
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .board-row {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .board-row-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .field-name { font-size: 12.5px; font-weight: 700; color: var(--cyan); }
+    .field-val { font-size: 12px; color: var(--text); word-break: break-word; }
+    .bar-wrap {
+      display: grid;
+      grid-template-columns: 78px 1fr 46px;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .bar-track {
+      height: 7px;
+      background: #0B0F19;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .bar-fill-inf { height: 100%; background: var(--gold); border-radius: 99px; }
+    .bar-fill-voi { height: 100%; background: var(--violet); border-radius: 99px; }
+
+    .reveal-card {
+      background: rgba(167, 139, 250, 0.1);
+      border: 1.5px solid var(--violet);
+      border-radius: 12px;
+      padding: 14px;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .reveal-card.visible { display: flex; }
+
+    .compare-box {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-top-color: var(--cyan);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="brand-pill mono">ARES × NASA TESS</span>
+      <div>
+        <h1>Planet Hunter vs. Cosmic Impostors</h1>
+        <p>Parallel SQL Magnets · Deterministic Keplerian &amp; CCD Verifiers · Counterfactual Decision-1 Probing</p>
+      </div>
+    </div>
+    <div class="stats-strip mono" id="headerStats">
+      <div class="stat-chip">Haystack: <b id="statCadences">2,311,320</b> real 2-min cadences</div>
+      <div class="stat-chip">Sector Stars: <b id="statStars">120+</b></div>
+      <div class="stat-chip">Core Drift: <b id="statDrift">0.0000</b></div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- LEFT RAIL: JUDGE SECTOR MENU -->
+    <section class="panel">
+      <div class="panel-header">
+        <span class="panel-title">1 · Live Judge Sector Menu</span>
+        <label style="font-size:11.5px; color:var(--muted); cursor:pointer;">
+          <input type="checkbox" id="blindToggle" checked /> Blinded IDs
+        </label>
+      </div>
+
+      <div id="caseList" style="display:flex; flex-direction:column; gap:7px;"></div>
+
+      <div class="btn-row" style="margin-top:6px;">
+        <button class="action-btn btn-secondary" id="btnPreview" title="Instant deterministic DuckDB physics + 2x2 NASA CCD card (<1s)">
+          ⚡ Instant Physics Scan
+        </button>
+        <button class="action-btn btn-primary" id="btnLiveAres" title="Full Gemini-4-Hydrogen + Carbon + Decision-1 + Baseline">
+          🚀 Run Full ARES + Baseline
+        </button>
+      </div>
+
+      <button class="action-btn btn-gold" id="btnReveal">
+        🔭 Reveal Official NASA Archive Disposition
+      </button>
+
+      <div class="reveal-card" id="revealBox"></div>
+    </section>
+
+    <!-- CENTER STAGE: 2x2 NASA TESS OBSERVATORY DIAGNOSTIC CARDS -->
+    <section class="panel">
+      <div class="panel-header">
+        <span class="panel-title">2 · Cross-Modal NASA TESS CCD &amp; Orbital Evidence</span>
+        <span class="mono" style="font-size:11.5px; color:var(--cyan);" id="runTimer">Select a sector alert to begin</span>
+      </div>
+
+      <div class="verdict-banner" id="verdictBanner">
+        <div>
+          <div style="font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em;">Active Investigation Verdict</div>
+          <div style="font-size:19px; font-weight:800; margin-top:2px;" id="verdictTitle">Awaiting Sector Injection (`plant()`)</div>
+          <div style="font-size:12.5px; color:var(--muted); margin-top:2px;" id="verdictSub">
+            Agents never read the 2.3M-row haystack; they write SQL magnets and certify physical laws.
+          </div>
+        </div>
+        <div id="verdictBadgeWrap"></div>
+      </div>
+
+      <div class="artifact-tabs" id="artifactTabs"></div>
+
+      <div class="card-frame" id="cardFrame">
+        <div style="text-align:center; color:var(--muted); padding:40px; max-width:520px;">
+          <div style="font-size:32px; margin-bottom:10px;">🛰️</div>
+          <div style="font-weight:700; color:var(--text); margin-bottom:6px;">Real NASA TESS SPOC Light Curves &amp; 11×11 Target Pixel Stamps</div>
+          <div style="font-size:13px;">
+            Pick any real TESS alert on the left and click <b>Instant Physics Scan</b> or <b>Run Full ARES + Baseline</b> to render deterministic SHA-256 2×2 observatory cards.
+          </div>
+        </div>
+      </div>
+
+      <div id="comparisonContainer"></div>
+    </section>
+
+    <!-- RIGHT PANEL: PROVENANCE BOARD & DECISION-1 RELIANCE / VOI -->
+    <section class="panel">
+      <div class="panel-header">
+        <span class="panel-title">3 · Bounded Board &amp; Decision-1 Probe</span>
+        <span class="badge b-unk mono" id="boardVerBadge">v0</span>
+      </div>
+
+      <div class="compare-box mono" id="invariantStrip">
+        <div style="display:flex; justify-content:space-between;">
+          <span>I1 Ungrounded Claims: <b style="color:var(--green)" id="invUngrounded">0</b></span>
+          <span>I2 Illegal Certs: <b style="color:var(--green)" id="invIllegal">0</b></span>
+        </div>
+        <div style="display:flex; justify-content:space-between;">
+          <span>Cert Reliance: <b style="color:var(--cyan)" id="certShare">—</b></span>
+          <span>Max Unknown VoI: <b style="color:var(--violet)" id="voiMax">—</b></span>
+        </div>
+      </div>
+
+      <div id="boardFields" style="display:flex; flex-direction:column; gap:9px;"></div>
+    </section>
+  </main>
+
+  <script>
+    let casesData = [];
+    let selectedCaseId = null;
+    let currentRun = null;
+    let activeArtifactIdx = 0;
+    let ccdAblatedView = false;
+
+    const elCaseList = document.getElementById('caseList');
+    const elBlind = document.getElementById('blindToggle');
+    const elBtnPreview = document.getElementById('btnPreview');
+    const elBtnLive = document.getElementById('btnLiveAres');
+    const elBtnReveal = document.getElementById('btnReveal');
+    const elRevealBox = document.getElementById('revealBox');
+
+    function catMeta(cat) {
+      if (cat === 'multi_clue_join') return { label: 'Confirmed World Hunt', cls: 'b-planet' };
+      if (cat === 'look_alike_decoy') return { label: 'Cosmic Impostor Battle', cls: 'b-decoy' };
+      return { label: 'Ambiguous Candidate Trap', cls: 'b-uncert' };
+    }
+
+    function renderCaseMenu() {
+      const blind = elBlind.checked;
+      elCaseList.innerHTML = '';
+      const groups = [
+        ['look_alike_decoy', '🔥 Cosmic Impostor Decoy Battles (3/4 Traps)'],
+        ['under_determined', '⚠️ Unconfirmed / Crowded Candidates (VoI)'],
+        ['multi_clue_join', '🌍 Clean Confirmed Worlds (4/4 Physics)'],
+      ];
+
+      for (const [gKey, gTitle] of groups) {
+        const subset = casesData.filter(c => c.category === gKey);
+        if (!subset.length) continue;
+        const hdr = document.createElement('div');
+        hdr.className = 'case-group-lbl';
+        hdr.textContent = gTitle;
+        elCaseList.appendChild(hdr);
+
+        for (const c of subset) {
+          const btn = document.createElement('button');
+          btn.className = 'case-btn' + (c.case_id === selectedCaseId ? ' active' : '');
+          const title = blind ? c.blind_title : c.case_id;
+          const sub = blind
+            ? `TESS Sector ${c.sector} · Blind Vetting Stream`
+            : `${c.scenario_type} · subtlety=${c.subtlety}`;
+          btn.innerHTML = `
+            <div class="case-top">
+              <span>${title}</span>
+              <span class="mono" style="font-size:10.5px; color:var(--cyan);">S${String(c.sector).padStart(2,'0')}</span>
+            </div>
+            <div class="case-sub mono">${sub}</div>
+          `;
+          btn.onclick = () => {
+            selectedCaseId = c.case_id;
+            elRevealBox.classList.remove('visible');
+            renderCaseMenu();
+          };
+          elCaseList.appendChild(btn);
+        }
+      }
+    }
+
+    elBlind.onchange = renderCaseMenu;
+
+    async function loadInitial() {
+      const res = await fetch('/api/cases');
+      const data = await res.json();
+      casesData = data.cases || [];
+      if (data.base_sector_stats) {
+        document.getElementById('statCadences').textContent = data.base_sector_stats.cadence_rows.toLocaleString();
+        document.getElementById('statStars').textContent = data.base_sector_stats.total_stars + '+';
+      }
+      const firstDecoy = casesData.find(c => c.category === 'look_alike_decoy') || casesData[0];
+      if (firstDecoy) selectedCaseId = firstDecoy.case_id;
+      renderCaseMenu();
+    }
+
+    function extractTicFromFilename(fn) {
+      const m = fn.match(/TIC-\d+/);
+      return m ? m[0] : fn;
+    }
+
+    function renderArtifactViewer() {
+      const tabsEl = document.getElementById('artifactTabs');
+      const frameEl = document.getElementById('cardFrame');
+      tabsEl.innerHTML = '';
+
+      if (!currentRun || !currentRun.artifacts || !currentRun.artifacts.length) {
+        return;
+      }
+
+      // Deduplicate by TIC ID
+      const uniqueArts = [];
+      const seenTics = new Set();
+      for (const a of currentRun.artifacts) {
+        const tic = extractTicFromFilename(a.filename);
+        if (!seenTics.has(tic)) {
+          seenTics.add(tic);
+          uniqueArts.push({ ...a, tic });
+        }
+      }
+
+      if (activeArtifactIdx >= uniqueArts.length) activeArtifactIdx = 0;
+
+      uniqueArts.forEach((art, idx) => {
+        const b = document.createElement('button');
+        b.className = 'tab-btn mono' + (idx === activeArtifactIdx ? ' active' : '');
+        const confirmedVal = currentRun.board?.fields?.confirmed_exoplanet_target?.value;
+        const isConfirmed = confirmedVal === art.tic || (Array.isArray(confirmedVal) && confirmedVal.includes(art.tic));
+        const tag = isConfirmed ? '✓ CERTIFIED PLANET' : '✗ PRUNED / UNCERTIFIED';
+        b.textContent = `${art.tic} (${tag})`;
+        b.onclick = () => {
+          activeArtifactIdx = idx;
+          renderArtifactViewer();
+        };
+        tabsEl.appendChild(b);
+      });
+
+      const chosen = uniqueArts[activeArtifactIdx];
+      const maskedUrl = (currentRun.masked_ccd_artifacts || {})[chosen.tic];
+      if (maskedUrl) {
+        const abBtn = document.createElement('button');
+        abBtn.className = 'ablate-toggle mono' + (ccdAblatedView ? ' active' : '');
+        abBtn.textContent = ccdAblatedView
+          ? '👁️ Restore CCD Stamp'
+          : '🧪 Ablate CCD Stamp ("unknown")';
+        abBtn.onclick = () => {
+          ccdAblatedView = !ccdAblatedView;
+          renderArtifactViewer();
+        };
+        tabsEl.appendChild(abBtn);
+      }
+
+      const imgSrc = (ccdAblatedView && maskedUrl) ? maskedUrl : chosen.url;
+      const ccdInf = currentRun.board?.fields?.ccd_centroid_lock?.influence;
+      const infNote = (ccdAblatedView && ccdInf !== undefined)
+        ? ` | Decision-1 CCD Reliance = ${(ccdInf * 100).toFixed(1)}%`
+        : '';
+
+      frameEl.innerHTML = `
+        <img src="${imgSrc}" alt="NASA TESS 2x2 Vetting Card for ${chosen.tic}" />
+        <div class="sha-foot mono">
+          <span>Artifact: ${chosen.artifact_id} (produced_by_verifier=true)${infNote}</span>
+          <span>SHA-256: ${chosen.sha256.slice(0, 16)}…</span>
+        </div>
+      `;
+    }
+
+    function renderBoard(run) {
+      const board = run.board;
+      document.getElementById('boardVerBadge').textContent = `board_version = ${board.board_version}`;
+      document.getElementById('statDrift').textContent = Number(run.board_drift || 0).toFixed(4);
+      document.getElementById('invUngrounded').textContent = run.ungrounded_fields ?? 0;
+      document.getElementById('invIllegal').textContent = run.illegal_cert_upgrades ?? 0;
+
+      if (run.plant && run.plant.sector_stats) {
+        document.getElementById('statCadences').textContent = run.plant.sector_stats.cadence_rows.toLocaleString();
+        document.getElementById('statStars').textContent = run.plant.sector_stats.total_stars;
+      }
+
+      const dec = board.decision || {};
+      const decisions = board.decisions || {};
+      const followup = decisions.recommended_followup?.answer || '—';
+
+      if (run.mode === 'live_ares') {
+        document.getElementById('certShare').textContent = `${((dec.certified_influence_share || 0) * 100).toFixed(1)}%`;
+        document.getElementById('voiMax').textContent = (dec.unknown_voi_max || 0).toFixed(3);
+      } else {
+        document.getElementById('certShare').textContent = 'Det. Scan';
+        document.getElementById('voiMax').textContent = 'Run Decision-1';
+      }
+
+      // Verdict Banner
+      const banner = document.getElementById('verdictBanner');
+      const vTitle = document.getElementById('verdictTitle');
+      const vSub = document.getElementById('verdictSub');
+      const vBadge = document.getElementById('verdictBadgeWrap');
+
+      const confPlanet = board.fields?.confirmed_exoplanet_target?.value;
+      const confStatus = board.fields?.confirmed_exoplanet_target?.status;
+
+      if (run.mode === 'live_ares') {
+        const isCert = run.termination_reason === 'certified_success';
+        banner.className = 'verdict-banner ' + (isCert ? 'cert' : 'uncert');
+        vTitle.textContent = isCert
+          ? `Confirmed Exoplanet: ${dec.answer}`
+          : `Halt: Unconfirmed Candidate (${dec.answer})`;
+        vSub.textContent = `Action: ${followup} · Decision-1 Confidence: ${((dec.confidence || 0) * 100).toFixed(1)}% · Probes: ${run.probe_api_calls} calls`;
+        vBadge.innerHTML = isCert
+          ? `<span class="badge b-cert mono">CERTIFIED CONVERGENCE</span>`
+          : `<span class="badge b-uncert mono">HONEST UNCERTIFIED</span>`;
+      } else {
+        const isCert = confStatus === 'certified' && confPlanet && confPlanet !== 'none';
+        banner.className = 'verdict-banner ' + (isCert ? 'cert' : 'uncert');
+        vTitle.textContent = isCert
+          ? `4-Way Physics Lock: ${confPlanet}`
+          : `Spatial / Orbital Gate Blocked — Unconfirmed`;
+        vSub.textContent = `5 deterministic DuckDB verifiers executed over ${run.plant.sector_stats.cadence_rows.toLocaleString()} TESS cadences in ${run.elapsed_ms} ms`;
+        vBadge.innerHTML = isCert
+          ? `<span class="badge b-cert mono">4/4 CERTIFIED</span>`
+          : `<span class="badge b-uncert mono">UNCERTIFIED</span>`;
+      }
+
+      // Board Fields
+      const fieldsEl = document.getElementById('boardFields');
+      fieldsEl.innerHTML = '';
+      for (const [fname, fld] of Object.entries(board.fields || {})) {
+        const stCls = fld.status === 'certified' ? 'b-cert' : (fld.status === 'uncertified' ? 'b-uncert' : 'b-unk');
+        const valStr = typeof fld.value === 'object' ? JSON.stringify(fld.value) : String(fld.value);
+        const infPct = Math.min(100, Math.round((fld.influence || 0) * 100));
+        const voiPct = Math.min(100, Math.round((fld.voi || 0) * 100));
+
+        const row = document.createElement('div');
+        row.className = 'board-row';
+        row.innerHTML = `
+          <div class="board-row-top">
+            <span class="field-name mono">${fname}</span>
+            <span class="badge ${stCls} mono">${fld.status.toUpperCase()}</span>
+          </div>
+          <div class="field-val mono">value = ${valStr}</div>
+          <div style="font-size:10.5px; color:var(--muted);" class="mono">
+            sources: [${(fld.sources || []).join(', ')}]
+          </div>
+          <div class="bar-wrap mono">
+            <span>Reliance</span>
+            <div class="bar-track"><div class="bar-fill-inf" style="width:${infPct}%"></div></div>
+            <span>${(fld.influence || 0).toFixed(2)}</span>
+          </div>
+          <div class="bar-wrap mono">
+            <span>Active VoI</span>
+            <div class="bar-track"><div class="bar-fill-voi" style="width:${voiPct}%"></div></div>
+            <span>${(fld.voi || 0).toFixed(2)}</span>
+          </div>
+        `;
+        fieldsEl.appendChild(row);
+      }
+
+      // Baseline comparison box if present
+      const compEl = document.getElementById('comparisonContainer');
+      if (run.baseline) {
+        const bAns = run.baseline.answers?.confirmed_planet_tic || 'unknown';
+        const bAct = run.baseline.answers?.recommended_followup || '—';
+        const bPass = run.baseline.score?.overall_pass;
+        const aPass = run.ares_score?.overall_pass;
+        compEl.innerHTML = `
+          <div class="compare-box" style="border-color: var(--violet);">
+            <div style="font-weight:700; color:var(--violet); font-size:12.5px;">
+              Head-to-Head vs. Single-Agent Gemini-4-Carbon + Identical DuckDB SQL Tool
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:4px;">
+              <div style="padding:8px; background:#0B0F19; border-radius:8px; border:1px solid ${aPass ? 'var(--green)' : 'var(--amber)'}">
+                <div class="mono" style="font-weight:700; color:var(--cyan);">ARES Swarm + Decision-1</div>
+                <div class="mono" style="margin-top:4px;">Target: <b>${dec.answer}</b> · Action: <b>${followup}</b></div>
+                <div class="mono" style="margin-top:2px; color:${aPass ? 'var(--green)' : 'var(--red)'}">
+                  Benchmark Verdict: ${aPass ? '✓ PASS' : '✗ FAIL'} (${(run.wall_clock_ms/1000).toFixed(1)}s)
+                </div>
+              </div>
+              <div style="padding:8px; background:#0B0F19; border-radius:8px; border:1px solid ${bPass ? 'var(--green)' : 'var(--red)'}">
+                <div class="mono" style="font-weight:700; color:var(--muted);">Single-Agent Carbon SQL Baseline</div>
+                <div class="mono" style="margin-top:4px;">Target: <b>${bAns}</b> · Action: <b>${bAct}</b></div>
+                <div class="mono" style="margin-top:2px; color:${bPass ? 'var(--green)' : 'var(--red)'}">
+                  Benchmark Verdict: ${bPass ? '✓ PASS' : '✗ TRICKED / FALSE CERT'} (${(run.baseline.wall_clock_ms/1000).toFixed(1)}s)
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      } else {
+        compEl.innerHTML = '';
+      }
+    }
+
+    async function executeRun(endpoint, label) {
+      if (!selectedCaseId) return;
+      elBtnPreview.disabled = true;
+      elBtnLive.disabled = true;
+      ccdAblatedView = false;
+      activeArtifactIdx = 0;
+      document.getElementById('runTimer').innerHTML = `<span class="spinner"></span>${label}...`;
+
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ case_id: selectedCaseId, include_baseline: true }),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        currentRun = data;
+        const ms = data.wall_clock_ms || data.elapsed_ms || 0;
+        document.getElementById('runTimer').textContent = `Completed in ${(ms / 1000).toFixed(2)}s`;
+        renderArtifactViewer();
+        renderBoard(data);
+      } catch (err) {
+        document.getElementById('runTimer').textContent = `Error: ${err.message}`;
+      } finally {
+        elBtnPreview.disabled = false;
+        elBtnLive.disabled = false;
+      }
+    }
+
+    elBtnPreview.onclick = () => executeRun('/api/verify_preview', 'Running deterministic TESS physics & CCD scan');
+    elBtnLive.onclick = () => executeRun('/api/investigate', 'Running parallel Hydrogen + Carbon + Decision-1 + Baseline');
+
+    elBtnReveal.onclick = async () => {
+      if (!selectedCaseId) return;
+      const res = await fetch(`/api/reveal/${encodeURIComponent(selectedCaseId)}`);
+      const rev = await res.json();
+      const t = rev.nasa_target_archive || {};
+      const d = rev.nasa_decoy_archive;
+      let html = `
+        <div style="font-weight:800; color:var(--violet); font-size:13px;">
+          🏛️ OFFICIAL NASA EXOPLANET ARCHIVE GROUND TRUTH
+        </div>
+        <div style="font-size:12px;">${rev.description}</div>
+        <div class="mono" style="font-size:11.5px; background:#0B0F19; padding:8px; border-radius:8px;">
+          <div><b>Primary Star:</b> ${t.tic_id || rev.target_entity} (${t.toi || ''})</div>
+          <div><b>NASA TFOP Disposition:</b> <span style="color:var(--green)">${t.official_nasa_disposition} — ${t.disposition_meaning}</span></div>
+          <div><b>Host Star:</b> R★=${t.stellar_radius_rsun} R☉ · Teff=${t.teff_k} K · Tmag=${t.tmag}</div>
+        </div>
+      `;
+      if (d) {
+        html += `
+          <div class="mono" style="font-size:11.5px; background:#0B0F19; padding:8px; border-radius:8px; border:1px solid var(--red);">
+            <div><b>Planted Decoy Star:</b> ${d.tic_id} (${d.toi})</div>
+            <div><b>NASA TFOP Disposition:</b> <span style="color:var(--red)">${d.official_nasa_disposition} — ${d.disposition_meaning}</span></div>
+            <div><b>Catalog Depth:</b> ${Number(d.catalog_depth_ppm).toLocaleString()} ppm · Period=${d.period_days} d</div>
+          </div>
+        `;
+      }
+      elRevealBox.innerHTML = html;
+      elRevealBox.classList.add('visible');
+    };
+
+    loadInitial();
+  </script>
+</body>
+</html>
