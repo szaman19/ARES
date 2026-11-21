@@ -1,0 +1,21 @@
+[project]
+name = "ares-hack"
+version = "0.1.0"
+description = "ARES Hackathon: Parallel Hypothesis Swarm, Deterministic Certification, and Counterfactual Decision Probing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1.0",
+    "numpy>=2.0.0",
+    "pyarrow>=18.0.0",
+    "pydantic>=2.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
