@@ -804,6 +804,32 @@ def run_live_nyc_search(
     )
     anchor_cam = r1_sorted[0][2] if r1_sorted else None
 
+    # Launch Gemini Solo in parallel RIGHT AFTER Round 1 on ONLY the 6 Round-1 JPEGs
+    # (so Gemini Solo doesn't cheat off ARES's Round-2 GPS zoom-in!)
+    r1_photo_pairs = [(row[2], row[3]) for row in inspected_lock_items if row[0] == 1]
+    solo_executor: concurrent.futures.ThreadPoolExecutor | None = None
+    solo_future: concurrent.futures.Future[GeminiSoloBaseline] | None = None
+    if include_solo_baseline and r1_photo_pairs:
+        _emit(
+            "solo_start",
+            f"POST gemini-4-carbon (Gemini Solo, IN PARALLEL): evaluating the {len(r1_photo_pairs)} Round-1 JPEGs (no Round-2 zoom)...",
+        )
+        solo_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        def _run_solo() -> GeminiSoloBaseline:
+            res_solo = run_gemini_solo_baseline(
+                query=query,
+                area=area,
+                round1_items=r1_photo_pairs,
+            )
+            _emit(
+                "solo_done",
+                f"Gemini Solo finished in {res_solo.wall_clock_s}s → {res_solo.predicted_intersection} ({res_solo.confidence:.0%})",
+            )
+            return res_solo
+
+        solo_future = solo_executor.submit(_run_solo)
+
     # --- Round 2: Spatial Zoom-In (3 nearest online neighbors to anchor) ---
     if anchor_cam is not None and round2_k > 0:
         seen_ids = {row[2].id for row in inspected_lock_items}
@@ -877,31 +903,6 @@ def run_live_nyc_search(
         },
         fields={},
     )
-    # Launch Gemini Solo in parallel right after all 9 live JPEGs are ready!
-    all_photo_pairs = [(item.camera, item.artifact) for item in inspected]
-    solo_executor: concurrent.futures.ThreadPoolExecutor | None = None
-    solo_future: concurrent.futures.Future[GeminiSoloBaseline] | None = None
-    if include_solo_baseline:
-        _emit(
-            "solo_start",
-            f"POST gemini-4-carbon (Gemini Solo, IN PARALLEL): sending the exact same {len(all_photo_pairs)} live JPEGs...",
-        )
-        solo_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-        def _run_solo() -> GeminiSoloBaseline:
-            res_solo = run_gemini_solo_baseline(
-                query=query,
-                area=area,
-                round1_items=all_photo_pairs,
-            )
-            _emit(
-                "solo_done",
-                f"Gemini Solo finished in {res_solo.wall_clock_s}s → {res_solo.predicted_intersection} ({res_solo.confidence:.0%})",
-            )
-            return res_solo
-
-        solo_future = solo_executor.submit(_run_solo)
-
     _emit("fusion", f"fusion/patch.py: validating {len(updates)} board fields + SHA-256 JPEG receipts...")
     board, _patch_report = validate_and_merge_patch(
         initial_board,

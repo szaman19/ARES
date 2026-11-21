@@ -27,11 +27,7 @@ RUN_ROOT.mkdir(parents=True, exist_ok=True)
 _RUNS: dict[str, NYCDemoResult] = {}
 
 
-DEFAULT_SNAPSHOT_DIR = (
-    Path("fixtures/nyc_snapshot")
-    if Path("fixtures/nyc_snapshot/manifest.json").exists()
-    else Path("data/nyc_snapshot")
-)
+DEFAULT_SNAPSHOT_DIR = Path("data/nyc_snapshot")
 
 
 class LiveSearchRequest(BaseModel):
@@ -312,59 +308,62 @@ HTML_PAGE = """<!doctype html>
     </div>
     <div>
       <label>Live Search Query</label>
-      <input id="query" type="text" value="open legal street parking spot along a normal city curb (no bus lanes, bike lanes, or bridges)" />
+      <input id="query" type="text" value="open legal street parking spot along a normal city curb" />
     </div>
     <div>
-      <label>Street Filter (Optional)</label>
+      <label>Street Filter</label>
       <input id="keyword" type="text" placeholder="e.g. Broadway, 5 Ave" />
     </div>
     <div>
-      <button id="runBtn" class="primary" onclick="runSearch()">Run / Re-Run Live</button>
+      <button id="runBtn" class="primary" onclick="runSearch()">Re-Run Live</button>
     </div>
     <div class="check-row">
-      <label><input id="streetOnly" type="checkbox" checked /> Street intersections only (exclude highways, bridges &amp; tunnels)</label>
-      <label><input id="hideDisq" type="checkbox" checked onchange="rerenderGrid()" /> Hide disqualified non-streets</label>
-      <label><input id="useSnapshot" type="checkbox" /> Use saved offline snapshot (<code>fixtures/nyc_snapshot</code>)</label>
+      <label><input id="streetOnly" type="checkbox" checked /> Streets only</label>
+      <label><input id="showRejected" type="checkbox" onchange="rerenderGrid()" /> Show rejected cameras</label>
+      <label><input id="useSnapshot" type="checkbox" /> Offline snapshot</label>
     </div>
   </div>
 
-  <div id="status" class="status">Click <b>Run / Re-Run Live</b> to fetch fresh NYC street intersection frames right now.</div>
+  <div id="status" class="status">Starting live search...</div>
 
   <div class="pipelines">
     <div class="pipe-row">
       <div class="pipe-label ares">ARES Search</div>
       <div class="pipe-stages">
-        <div class="stage" id="st_catalog"><div class="st-title">1. Street Filter</div><div class="st-sub" id="st_catalog_sub">waiting...</div></div>
+        <div class="stage" id="st_catalog"><div class="st-title">1. Filter</div><div class="st-sub" id="st_catalog_sub">waiting...</div></div>
         <span class="arrow">→</span>
-        <div class="stage" id="st_r1"><div class="st-title">2. Parallel Sweep (×6)</div><div class="st-sub" id="st_r1_sub">ARESRunner + hydrogen</div></div>
+        <div class="stage" id="st_r1"><div class="st-title">2. Sweep (×6)</div><div class="st-sub" id="st_r1_sub">parallel</div></div>
         <span class="arrow">→</span>
-        <div class="stage" id="st_r2"><div class="st-title">3. GPS Zoom-In (×3)</div><div class="st-sub" id="st_r2_sub">nearest street neighbors</div></div>
+        <div class="stage" id="st_r2"><div class="st-title">3. GPS Zoom (×3)</div><div class="st-sub" id="st_r2_sub">nearest streets</div></div>
         <span class="arrow">→</span>
-        <div class="stage" id="st_fusion"><div class="st-title">4. Guardrails</div><div class="st-sub" id="st_fusion_sub">patch.py + disqualifiers</div></div>
+        <div class="stage" id="st_fusion"><div class="st-title">4. Rules</div><div class="st-sub" id="st_fusion_sub">patch.py</div></div>
         <span class="arrow">→</span>
-        <div class="stage" id="st_probe"><div class="st-title">5. Decision-1 Probe</div><div class="st-sub" id="st_probe_sub">counterfactual drops</div></div>
+        <div class="stage" id="st_probe"><div class="st-title">5. Decision-1</div><div class="st-sub" id="st_probe_sub">calibrated</div></div>
       </div>
     </div>
     <div class="pipe-row">
       <div class="pipe-label solo">Gemini Solo</div>
       <div class="pipe-stages">
-        <div class="stage" id="st_solo_in"><div class="st-title">1. Single Prompt Dump</div><div class="st-sub" id="st_solo_in_sub">same 9 JPEGs, no zoom</div></div>
+        <div class="stage" id="st_solo_in"><div class="st-title">1. Same 6 R1 Photos</div><div class="st-sub" id="st_solo_in_sub">no Round-2 zoom</div></div>
         <span class="arrow">→</span>
-        <div class="stage" id="st_solo_out"><div class="st-title">2. Unverified Answer</div><div class="st-sub" id="st_solo_out_sub">no disqualifiers / no probe</div></div>
+        <div class="stage" id="st_solo_out"><div class="st-title">2. 1-Shot Guess</div><div class="st-sub" id="st_solo_out_sub">no rules / no probe</div></div>
       </div>
     </div>
   </div>
 
-  <div id="traceBox" class="trace-box"></div>
+  <details id="traceDetails" open style="margin-bottom:14px;">
+    <summary style="cursor:pointer;font-size:12px;color:#93a1b0;margin-bottom:6px;">Live API Request Trace</summary>
+    <div id="traceBox" class="trace-box" style="margin-bottom:0;"></div>
+  </details>
 
   <div id="compare" class="compare" style="display:none;">
     <div class="panel ares">
-      <span class="badge green">ARES LIVE VERIFIED SEARCH</span>
+      <span class="badge green">ARES (2-ROUND SEARCH + VERIFIED)</span>
       <div id="aresVerdict" class="verdict"></div>
       <div id="aresMeta" class="meta"></div>
     </div>
     <div class="panel solo">
-      <span class="badge orange">GEMINI SOLO (EXACT SAME 9 LIVE PHOTOS · NO ARES VERIFIERS / NO DECISION-1)</span>
+      <span class="badge orange">GEMINI SOLO (6 R1 PHOTOS · NO ZOOM)</span>
       <div id="soloVerdict" class="verdict"></div>
       <div id="soloMeta" class="meta"></div>
     </div>
@@ -443,13 +442,13 @@ function updateStagesFromEvent(step, message, elapsed) {
   } else if (step === "ares_done") {
     setStage("st_probe", "done-ares", `calibrated verdict ready (${t})`);
   } else if (step === "solo_start") {
-    setStage("st_solo_in", "active", "sending all 9 JPEGs in parallel...");
-    setStage("st_solo_out", "active", "racing ARES on gemini-4-carbon...");
+    setStage("st_solo_in", "active", "6 R1 JPEGs in 1 call...");
+    setStage("st_solo_out", "active", "racing ARES Round 2...");
   } else if (step === "solo_done") {
-    setStage("st_solo_in", "done-solo", "9 JPEGs dumped in 1 call");
-    setStage("st_solo_out", "done-solo", `unverified guess (${t})`);
+    setStage("st_solo_in", "done-solo", "6 R1 JPEGs only");
+    setStage("st_solo_out", "done-solo", `1-shot guess (${t})`);
   } else if (step === "done") {
-    setStage("st_solo_in", "done-solo", "9 JPEGs dumped in 1 call");
+    setStage("st_solo_in", "done-solo", "6 R1 JPEGs only");
   }
 }
 
@@ -505,16 +504,16 @@ function runSearch() {
       currentData = data;
       renderResult(data);
       const liveTime = formatLocalTime(data.timestamp_utc);
-      const prunedDisq = data.inspected.filter(i => i.observation.disqualifier && i.observation.disqualifier !== "none").length;
-      setStage("st_fusion", "done-ares", `${prunedDisq} non-streets pruned · 0 violations`);
-      setStage("st_probe", "done-ares", `${(data.board.decision.confidence * 100).toFixed(1)}% conf (${data.wall_clock_s}s)`);
+      const matches = data.inspected.filter(i => i.observation.verdict === "strong_match" || i.observation.verdict === "partial_match").length;
+      const rejected = data.inspected.length - matches;
+      setStage("st_fusion", "done-ares", `${rejected} pruned · 0 violations`);
+      setStage("st_probe", "done-ares", `${(data.board.decision.confidence * 100).toFixed(1)}% (${data.wall_clock_s}s)`);
       if (data.solo_baseline) {
-        setStage("st_solo_out", "done-solo", `${(data.solo_baseline.confidence * 100).toFixed(0)}% self-conf (${data.solo_baseline.wall_clock_s}s)`);
+        setStage("st_solo_out", "done-solo", `${(data.solo_baseline.confidence * 100).toFixed(0)}% (${data.solo_baseline.wall_clock_s}s)`);
       }
+      document.getElementById("traceDetails").open = false;
       status.innerHTML =
-        `Live capture at <b>${liveTime}</b> (run <code>${data.run_id}</code>) — ` +
-        `ARES searched <b>${data.total_online_cameras_in_area}</b> street cameras → inspected <b>${data.cameras_inspected_count}</b> live JPEGs in <b>${data.wall_clock_s}s</b> ` +
-        `(<b>${prunedDisq}</b> non-street/obstructed cameras disqualified). Both ARES &amp; Gemini Solo saw the exact same ${data.cameras_inspected_count} live JPEGs.`;
+        `Live @ <b>${liveTime}</b> — <b>${matches}</b> verified spot(s) found (${rejected} non-matches/non-streets pruned from ${data.total_online_cameras_in_area} street cameras).`;
       es.close();
       activeStream = null;
       btn.disabled = false;
@@ -540,18 +539,13 @@ function renderResult(data) {
   const liveTime = formatLocalTime(data.timestamp_utc);
   document.getElementById("aresVerdict").textContent = dec.answer;
   document.getElementById("aresMeta").innerHTML =
-    `<b>Time:</b> ${data.wall_clock_s}s (live @ ${liveTime}) &nbsp;|&nbsp; ` +
-    `<b>Decision-1 Confidence:</b> ${(dec.confidence * 100).toFixed(1)}% &nbsp;|&nbsp; ` +
-    `<b>Certified Share:</b> ${(dec.certified_influence_share * 100).toFixed(0)}% &nbsp;|&nbsp; ` +
-    `<b>Receipts:</b> ${data.cameras_inspected_count} SHA-256 live JPEGs`;
+    `<b>${(dec.confidence * 100).toFixed(1)}%</b> calibrated confidence &nbsp;·&nbsp; <b>${data.wall_clock_s}s</b> &nbsp;·&nbsp; live @ ${liveTime}`;
 
   if (data.solo_baseline) {
     const s = data.solo_baseline;
     document.getElementById("soloVerdict").textContent = s.predicted_intersection;
     document.getElementById("soloMeta").innerHTML =
-      `<b>Time:</b> ${s.wall_clock_s}s &nbsp;|&nbsp; ` +
-      `<b>Self-reported Confidence:</b> ${(s.confidence * 100).toFixed(0)}% &nbsp;|&nbsp; ` +
-      `<b style="color:#fdba74;">No deterministic disqualifiers · No Round-2 zoom · No Decision-1 probe</b><br/>${s.reasoning}`;
+      `<b>${(s.confidence * 100).toFixed(0)}%</b> self-reported &nbsp;·&nbsp; <b>${s.wall_clock_s}s</b> &nbsp;·&nbsp; 6 R1 photos only<br/>${s.reasoning}`;
   }
 
   rerenderGrid();
@@ -559,25 +553,25 @@ function renderResult(data) {
 
 function rerenderGrid() {
   if (!currentData) return;
-  const hideDisq = document.getElementById("hideDisq").checked;
+  const showRejected = document.getElementById("showRejected").checked;
   const liveTime = formatLocalTime(currentData.timestamp_utc);
   const grid = document.getElementById("grid");
   grid.innerHTML = "";
 
   const visibleItems = currentData.inspected.filter(item => {
-    const isDisq = item.observation.disqualifier && item.observation.disqualifier !== "none";
-    return !(hideDisq && isDisq);
+    const isMatch = item.observation.verdict === "strong_match" || item.observation.verdict === "partial_match";
+    return showRejected || isMatch;
   });
 
   if (visibleItems.length === 0) {
-    grid.innerHTML = `<div style="grid-column:1/-1;color:#93a1b0;padding:18px;background:#182028;border-radius:10px;">All ${currentData.inspected.length} inspected cameras were disqualified as non-streets (bus/bike lanes, bridges, or obstructed). Uncheck <b>Hide disqualified non-streets</b> above to inspect them.</div>`;
+    grid.innerHTML = `<div style="grid-column:1/-1;color:#93a1b0;padding:18px;background:#182028;border-radius:10px;">No verified open parking spots in these ${currentData.inspected.length} cameras right now (ARES honestly abstains instead of guessing). Check <b>Show rejected cameras</b> above to inspect them.</div>`;
     return;
   }
 
   for (const item of visibleItems) {
     const v = item.observation.verdict;
     const badgeCls = v === "strong_match" ? "green" : (v === "partial_match" ? "orange" : "gray");
-    const dist = item.distance_m_from_anchor != null ? ` (${Math.round(item.distance_m_from_anchor)}m from anchor)` : "";
+    const roundTag = item.round_num === 2 ? "R2 Zoom" : "R1";
     const card = document.createElement("div");
     card.className = `cam-card ${v}` + (hiddenFields.has(item.field_name) ? " hidden-clue" : "");
     card.id = `card_${item.field_name}`;
@@ -589,14 +583,14 @@ function rerenderGrid() {
       <img src="${item.image_endpoint}" alt="${item.camera.name}" />
       <div class="cam-body">
         <div>
-          <span class="badge ${badgeCls}">R${item.round_num} · ${v} (${item.observation.match_score.toFixed(2)})</span>
-          <span class="badge gray">drop=${(item.influence || 0).toFixed(2)}</span>
+          <span class="badge ${badgeCls}">${roundTag} · ${v.replace("_", " ")}</span>
+          <span class="badge gray">impact ${(item.influence * 100).toFixed(0)}%</span>
           ${disq}
         </div>
-        <div class="cam-title">${item.camera.name}${dist}</div>
+        <div class="cam-title">${item.camera.name}</div>
         <div class="cam-desc">${item.observation.summary}</div>
         <div class="cam-foot">
-          <span class="meta">${liveTime} · sha256: ${item.artifact.sha256.slice(0,8)}</span>
+          <span class="meta">${liveTime}</span>
           <button class="hide-btn ${isHidden ? "active" : ""}" id="btn_${item.field_name}" onclick="toggleHide('${item.field_name}')">${isHidden ? "Hidden (Restore)" : "Hide camera"}</button>
         </div>
       </div>
