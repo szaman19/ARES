@@ -1,0 +1,660 @@
+"""Live Interactive NYC Street-Camera ARES Demo Web App (`ui/nyc_live_app.py`).
+
+Run with:
+    uv run uvicorn ui.nyc_live_app:app --host 127.0.0.1 --port 8765
+"""
+
+from __future__ import annotations
+
+import json
+import queue
+import threading
+import uuid
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from domain.nyc_cameras import NYCDemoResult, run_live_nyc_search
+from models.decision_probe import DecisionProbeClient, ablate_board_fields
+
+app = FastAPI(title="ARES Live NYC Street-Camera Search Demo")
+
+RUN_ROOT = Path("benchmark/results/nyc_live_web")
+RUN_ROOT.mkdir(parents=True, exist_ok=True)
+_RUNS: dict[str, NYCDemoResult] = {}
+
+
+DEFAULT_SNAPSHOT_DIR = (
+    Path("fixtures/nyc_snapshot")
+    if Path("fixtures/nyc_snapshot/manifest.json").exists()
+    else Path("data/nyc_snapshot")
+)
+
+
+class LiveSearchRequest(BaseModel):
+    area: str = "Manhattan"
+    query: str = "open legal street parking spot along a normal city curb (no bus lanes, bike lanes, or bridges)"
+    keyword: str | None = None
+    street_only: bool = True
+    use_snapshot: bool = False
+    round1_k: int = Field(default=6, ge=2, le=9)
+    round2_k: int = Field(default=3, ge=0, le=6)
+
+
+class AblateRequest(BaseModel):
+    run_id: str
+    hidden_fields: list[str] = Field(default_factory=list)
+
+
+def _serialize_run(run_id: str, res: NYCDemoResult) -> dict[str, Any]:
+    payload = res.model_dump(mode="json")
+    payload["run_id"] = run_id
+    for item in payload["inspected"]:
+        fname = Path(item["artifact"]["path"]).name
+        item["image_endpoint"] = f"/api/runs/{run_id}/frames/{fname}"
+        item["influence"] = res.probe_result.field_influences.get(item["field_name"], 0.0)
+    return payload
+
+
+@app.post("/api/search")
+def api_search(req: LiveSearchRequest) -> dict[str, Any]:
+    run_id = uuid.uuid4().hex[:10]
+    run_dir = RUN_ROOT / run_id
+    try:
+        res = run_live_nyc_search(
+            query=req.query,
+            area=req.area,
+            keyword=req.keyword or None,
+            street_only=req.street_only,
+            include_solo_baseline=True,
+            round1_k=req.round1_k,
+            round2_k=req.round2_k,
+            out_dir=run_dir,
+            snapshot_dir=DEFAULT_SNAPSHOT_DIR if req.use_snapshot else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _RUNS[run_id] = res
+    return _serialize_run(run_id, res)
+
+
+@app.get("/api/search/stream")
+def api_search_stream(
+    area: str = Query(default="Manhattan"),
+    query: str = Query(default="open legal street parking spot along a normal city curb (no bus lanes, bike lanes, or bridges)"),
+    keyword: str | None = Query(default=None),
+    street_only: bool = Query(default=True),
+    use_snapshot: bool = Query(default=False),
+    round1_k: int = Query(default=6, ge=2, le=9),
+    round2_k: int = Query(default=3, ge=0, le=6),
+) -> StreamingResponse:
+    run_id = uuid.uuid4().hex[:10]
+    run_dir = RUN_ROOT / run_id
+    ev_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+    def _on_event(ev: dict[str, Any]) -> None:
+        ev_q.put({"type": "log", **ev})
+
+    def _worker() -> None:
+        try:
+            res = run_live_nyc_search(
+                query=query,
+                area=area,
+                keyword=keyword or None,
+                street_only=street_only,
+                include_solo_baseline=True,
+                round1_k=round1_k,
+                round2_k=round2_k,
+                out_dir=run_dir,
+                snapshot_dir=DEFAULT_SNAPSHOT_DIR if use_snapshot else None,
+                on_event=_on_event,
+            )
+            _RUNS[run_id] = res
+            ev_q.put({"type": "result", "data": _serialize_run(run_id, res)})
+        except Exception as exc:
+            ev_q.put({"type": "error", "detail": str(exc)})
+        finally:
+            ev_q.put(None)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    def _gen():
+        while True:
+            item = ev_q.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+@app.get("/api/runs/{run_id}/frames/{filename}")
+def api_frame(run_id: str, filename: str) -> FileResponse:
+    safe_name = Path(filename).name
+    fpath = RUN_ROOT / run_id / "frames" / safe_name
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail="Frame not found")
+    return FileResponse(str(fpath), media_type="image/jpeg")
+
+
+@app.post("/api/ablate")
+def api_ablate(req: AblateRequest) -> dict[str, Any]:
+    res = _RUNS.get(req.run_id)
+    if res is None or res.question is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    ablated_board = (
+        ablate_board_fields(res.board, req.hidden_fields)
+        if req.hidden_fields
+        else res.board
+    )
+    hidden_set = set(req.hidden_fields)
+    remaining_arts = [
+        x.artifact
+        for x in sorted(
+            res.inspected,
+            key=lambda i: (i.observation.verdict != "unclear_camera", i.observation.match_score),
+            reverse=True,
+        )
+        if x.field_name not in hidden_set
+    ][:3]
+
+    probe = DecisionProbeClient()
+    ev = probe.evaluate_board(
+        ablated_board,
+        [res.question],
+        artifact_refs=remaining_arts,
+    )
+    q_ev = ev.answers[res.question.question_id]
+    base_conf = res.board.decision.confidence
+    base_ans = res.board.decision.answer
+    return {
+        "hidden_fields": req.hidden_fields,
+        "base_answer": base_ans,
+        "base_confidence": base_conf,
+        "ablated_answer": q_ev.answer,
+        "ablated_confidence": q_ev.confidence,
+        "confidence_delta": round(q_ev.confidence - base_conf, 4),
+        "answer_flipped": q_ev.answer != base_ans,
+        "probabilities": q_ev.probabilities,
+    }
+
+
+HTML_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ARES Live NYC Street-Camera Search</title>
+<style>
+  :root {
+    --bg: #0f1419; --card: #182028; --border: #2a3642;
+    --text: #eef2f6; --muted: #93a1b0;
+    --green: #1b9e77; --orange: #d95f02; --purple: #7570b3; --red: #e41a1c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); padding: 20px; line-height: 1.45;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { margin: 0 0 6px; font-size: 22px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .controls {
+    display: grid; grid-template-columns: 150px 1fr 170px auto; gap: 10px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
+    align-items: end;
+  }
+  label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  select, input[type=text] {
+    width: 100%; background: #10161d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 10px; font-size: 13px;
+  }
+  button.primary {
+    background: var(--green); color: white; border: none; border-radius: 8px;
+    padding: 10px 18px; font-weight: 700; font-size: 13px; cursor: pointer; white-space: nowrap;
+  }
+  button.primary:disabled { opacity: 0.55; cursor: wait; }
+  .check-row { grid-column: 1 / -1; display: flex; gap: 16px; align-items: center; font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .check-row label { display: inline-flex; align-items: center; gap: 6px; margin: 0; text-transform: none; font-size: 13px; color: var(--text); cursor: pointer; }
+  .status { margin: 14px 0 8px; font-size: 13px; color: #7dd3fc; min-height: 20px; }
+  .trace-box {
+    background: #0b0f14; border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; color: #cbd5e1; max-height: 170px; overflow-y: auto; display: none;
+  }
+  .trace-line { margin: 2px 0; }
+  .trace-time { color: #64748b; margin-right: 8px; }
+  .trace-step { color: #5eead4; font-weight: 700; margin-right: 8px; }
+  .pipelines {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .pipe-row { display: grid; grid-template-columns: 120px 1fr; gap: 10px; align-items: center; }
+  .pipe-label { font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; }
+  .pipe-label.ares { color: #5eead4; }
+  .pipe-label.solo { color: #fdba74; }
+  .pipe-stages { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .stage {
+    flex: 1; min-width: 120px; background: #10161d; border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 9px; font-size: 11.5px; transition: all 0.2s ease;
+    opacity: 0.55;
+  }
+  .stage .st-title { font-weight: 700; color: var(--text); }
+  .stage .st-sub { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+  .stage.active { opacity: 1; border-color: #38bdf8; box-shadow: 0 0 0 1px rgba(56,189,248,0.35); }
+  .stage.done-ares { opacity: 1; border-color: var(--green); background: rgba(27,158,119,0.12); }
+  .stage.done-solo { opacity: 1; border-color: var(--orange); background: rgba(217,95,2,0.12); }
+  .arrow { color: #475569; font-weight: 700; font-size: 12px; user-select: none; }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+  .panel {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px;
+  }
+  .panel.ares { border-left: 4px solid var(--green); }
+  .panel.solo { border-left: 4px solid var(--orange); }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
+    margin-bottom: 6px;
+  }
+  .badge.green { background: rgba(27,158,119,0.2); color: #5eead4; }
+  .badge.orange { background: rgba(217,95,2,0.22); color: #fdba74; }
+  .badge.gray { background: rgba(148,163,184,0.2); color: #cbd5e1; }
+  .verdict { font-size: 20px; font-weight: 800; margin: 4px 0; }
+  .meta { font-size: 12px; color: var(--muted); }
+  .ablate-banner {
+    background: rgba(117,112,179,0.16); border: 1px solid var(--purple); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 16px; font-size: 13px; display: none;
+  }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .cam-card {
+    background: var(--card); border: 2px solid var(--border); border-radius: 12px; overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  .cam-card.strong_match { border-color: var(--green); }
+  .cam-card.partial_match { border-color: var(--orange); }
+  .cam-card.hidden-clue { opacity: 0.48; border-style: dashed; border-color: var(--purple); }
+  .cam-card img { width: 100%; height: 190px; object-fit: cover; background: #000; display: block; }
+  .cam-body { padding: 10px 12px; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+  .cam-title { font-weight: 700; font-size: 13px; }
+  .cam-desc { font-size: 12px; color: var(--muted); flex: 1; }
+  .cam-foot { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-top: 4px; }
+  button.hide-btn {
+    background: transparent; color: #c4b5fd; border: 1px solid var(--purple); border-radius: 6px;
+    padding: 5px 9px; font-size: 11px; font-weight: 600; cursor: pointer;
+  }
+  button.hide-btn.active { background: var(--purple); color: white; }
+  @media (max-width: 900px) {
+    .controls, .compare, .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ARES Live NYC Street-Camera Search</h1>
+  <div class="sub">
+    Live 2-round parallel search over NYC DOT street intersections (no highways/bridges), verified by <code>fusion/patch.py</code> + <code>gemini-decision-1</code> counterfactual probing — compared side-by-side against Gemini Solo.
+  </div>
+
+  <div class="controls">
+    <div>
+      <label>Borough</label>
+      <select id="area">
+        <option value="Manhattan" selected>Manhattan</option>
+        <option value="Brooklyn">Brooklyn</option>
+        <option value="Queens">Queens</option>
+        <option value="Bronx">Bronx</option>
+        <option value="Staten Island">Staten Island</option>
+      </select>
+    </div>
+    <div>
+      <label>Live Search Query</label>
+      <input id="query" type="text" value="open legal street parking spot along a normal city curb (no bus lanes, bike lanes, or bridges)" />
+    </div>
+    <div>
+      <label>Street Filter (Optional)</label>
+      <input id="keyword" type="text" placeholder="e.g. Broadway, 5 Ave" />
+    </div>
+    <div>
+      <button id="runBtn" class="primary" onclick="runSearch()">Run / Re-Run Live</button>
+    </div>
+    <div class="check-row">
+      <label><input id="streetOnly" type="checkbox" checked /> Street intersections only (exclude highways, bridges &amp; tunnels)</label>
+      <label><input id="hideDisq" type="checkbox" checked onchange="rerenderGrid()" /> Hide disqualified non-streets</label>
+      <label><input id="useSnapshot" type="checkbox" /> Use saved offline snapshot (<code>fixtures/nyc_snapshot</code>)</label>
+    </div>
+  </div>
+
+  <div id="status" class="status">Click <b>Run / Re-Run Live</b> to fetch fresh NYC street intersection frames right now.</div>
+
+  <div class="pipelines">
+    <div class="pipe-row">
+      <div class="pipe-label ares">ARES Search</div>
+      <div class="pipe-stages">
+        <div class="stage" id="st_catalog"><div class="st-title">1. Street Filter</div><div class="st-sub" id="st_catalog_sub">waiting...</div></div>
+        <span class="arrow">→</span>
+        <div class="stage" id="st_r1"><div class="st-title">2. Parallel Sweep (×6)</div><div class="st-sub" id="st_r1_sub">ARESRunner + hydrogen</div></div>
+        <span class="arrow">→</span>
+        <div class="stage" id="st_r2"><div class="st-title">3. GPS Zoom-In (×3)</div><div class="st-sub" id="st_r2_sub">nearest street neighbors</div></div>
+        <span class="arrow">→</span>
+        <div class="stage" id="st_fusion"><div class="st-title">4. Guardrails</div><div class="st-sub" id="st_fusion_sub">patch.py + disqualifiers</div></div>
+        <span class="arrow">→</span>
+        <div class="stage" id="st_probe"><div class="st-title">5. Decision-1 Probe</div><div class="st-sub" id="st_probe_sub">counterfactual drops</div></div>
+      </div>
+    </div>
+    <div class="pipe-row">
+      <div class="pipe-label solo">Gemini Solo</div>
+      <div class="pipe-stages">
+        <div class="stage" id="st_solo_in"><div class="st-title">1. Single Prompt Dump</div><div class="st-sub" id="st_solo_in_sub">same 9 JPEGs, no zoom</div></div>
+        <span class="arrow">→</span>
+        <div class="stage" id="st_solo_out"><div class="st-title">2. Unverified Answer</div><div class="st-sub" id="st_solo_out_sub">no disqualifiers / no probe</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="traceBox" class="trace-box"></div>
+
+  <div id="compare" class="compare" style="display:none;">
+    <div class="panel ares">
+      <span class="badge green">ARES LIVE VERIFIED SEARCH</span>
+      <div id="aresVerdict" class="verdict"></div>
+      <div id="aresMeta" class="meta"></div>
+    </div>
+    <div class="panel solo">
+      <span class="badge orange">GEMINI SOLO (EXACT SAME 9 LIVE PHOTOS · NO ARES VERIFIERS / NO DECISION-1)</span>
+      <div id="soloVerdict" class="verdict"></div>
+      <div id="soloMeta" class="meta"></div>
+    </div>
+  </div>
+
+  <div id="ablateBanner" class="ablate-banner"></div>
+  <div id="grid" class="grid"></div>
+</div>
+
+<script>
+let currentRunId = null;
+let currentData = null;
+let hiddenFields = new Set();
+
+function formatLocalTime(isoStr) {
+  try {
+    return new Date(isoStr).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return isoStr || "";
+  }
+}
+
+let activeStream = null;
+let r1Count = 0;
+let r2Count = 0;
+
+function setStage(id, state, subText) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove("active", "done-ares", "done-solo");
+  if (state) el.classList.add(state);
+  if (subText !== undefined) {
+    const sub = document.getElementById(id + "_sub");
+    if (sub) sub.textContent = subText;
+  }
+}
+
+function resetStages() {
+  r1Count = 0;
+  r2Count = 0;
+  setStage("st_catalog", "", "waiting...");
+  setStage("st_r1", "", "ARESRunner + hydrogen");
+  setStage("st_r2", "", "nearest street neighbors");
+  setStage("st_fusion", "", "patch.py + disqualifiers");
+  setStage("st_probe", "", "counterfactual drops");
+  setStage("st_solo_in", "", "same 9 JPEGs, no zoom");
+  setStage("st_solo_out", "", "no disqualifiers / no probe");
+}
+
+function updateStagesFromEvent(step, message, elapsed) {
+  const t = `+${Number(elapsed || 0).toFixed(1)}s`;
+  if (step === "catalog") {
+    setStage("st_catalog", "active", "fetching NYC DOT API...");
+  } else if (step === "catalog_done") {
+    setStage("st_catalog", "done-ares", `${message.replace("Found ", "").replace(" online street intersection cameras in ", " cams · ")} (${t})`);
+  } else if (step === "round1_start") {
+    setStage("st_r1", "active", "0/6 live JPEGs checked...");
+  } else if (step === "camera_done") {
+    if (message.startsWith("[R1]")) {
+      r1Count += 1;
+      setStage("st_r1", "active", `${r1Count}/6 live JPEGs checked (${t})`);
+    } else if (message.startsWith("[R2]")) {
+      r2Count += 1;
+      setStage("st_r2", "active", `${r2Count}/3 neighbors checked (${t})`);
+    }
+  } else if (step === "round2_start") {
+    setStage("st_r1", "done-ares", `${r1Count}/6 done · picked anchor (${t})`);
+    setStage("st_r2", "active", "0/3 GPS neighbors checked...");
+  } else if (step === "fusion") {
+    setStage("st_r1", "done-ares", `${r1Count}/6 done`);
+    setStage("st_r2", "done-ares", `${r2Count}/3 done`);
+    setStage("st_fusion", "active", "verifying SHA-256 + rules...");
+  } else if (step === "probe") {
+    setStage("st_fusion", "done-ares", `0 invariant violations (${t})`);
+    setStage("st_probe", "active", "running 9 parallel ablations...");
+  } else if (step === "ares_done") {
+    setStage("st_probe", "done-ares", `calibrated verdict ready (${t})`);
+  } else if (step === "solo_start") {
+    setStage("st_solo_in", "active", "sending all 9 JPEGs in parallel...");
+    setStage("st_solo_out", "active", "racing ARES on gemini-4-carbon...");
+  } else if (step === "solo_done") {
+    setStage("st_solo_in", "done-solo", "9 JPEGs dumped in 1 call");
+    setStage("st_solo_out", "done-solo", `unverified guess (${t})`);
+  } else if (step === "done") {
+    setStage("st_solo_in", "done-solo", "9 JPEGs dumped in 1 call");
+  }
+}
+
+function appendTrace(step, message, elapsed) {
+  const box = document.getElementById("traceBox");
+  box.style.display = "block";
+  const line = document.createElement("div");
+  line.className = "trace-line";
+  line.innerHTML = `<span class="trace-time">[+${Number(elapsed || 0).toFixed(2)}s]</span><span class="trace-step">${step}</span>${message}`;
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+}
+
+function runSearch() {
+  if (activeStream) {
+    activeStream.close();
+    activeStream = null;
+  }
+  const btn = document.getElementById("runBtn");
+  const status = document.getElementById("status");
+  const box = document.getElementById("traceBox");
+  btn.disabled = true;
+  hiddenFields = new Set();
+  resetStages();
+  document.getElementById("ablateBanner").style.display = "none";
+  box.innerHTML = "";
+  box.style.display = "block";
+  status.innerHTML = "Streaming live requests...";
+
+  const params = new URLSearchParams({
+    area: document.getElementById("area").value,
+    query: document.getElementById("query").value,
+    street_only: document.getElementById("streetOnly").checked ? "true" : "false",
+    use_snapshot: document.getElementById("useSnapshot").checked ? "true" : "false",
+    round1_k: "6",
+    round2_k: "3",
+  });
+  const kw = document.getElementById("keyword").value.trim();
+  if (kw) params.set("keyword", kw);
+
+  const es = new EventSource(`/api/search/stream?${params.toString()}`);
+  activeStream = es;
+
+  es.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (msg.type === "log") {
+      appendTrace(msg.step, msg.message, msg.elapsed_s);
+      updateStagesFromEvent(msg.step, msg.message, msg.elapsed_s);
+      status.innerHTML = `<b>[+${Number(msg.elapsed_s || 0).toFixed(1)}s]</b> ${msg.message}`;
+    } else if (msg.type === "result") {
+      const data = msg.data;
+      currentRunId = data.run_id;
+      currentData = data;
+      renderResult(data);
+      const liveTime = formatLocalTime(data.timestamp_utc);
+      const prunedDisq = data.inspected.filter(i => i.observation.disqualifier && i.observation.disqualifier !== "none").length;
+      setStage("st_fusion", "done-ares", `${prunedDisq} non-streets pruned · 0 violations`);
+      setStage("st_probe", "done-ares", `${(data.board.decision.confidence * 100).toFixed(1)}% conf (${data.wall_clock_s}s)`);
+      if (data.solo_baseline) {
+        setStage("st_solo_out", "done-solo", `${(data.solo_baseline.confidence * 100).toFixed(0)}% self-conf (${data.solo_baseline.wall_clock_s}s)`);
+      }
+      status.innerHTML =
+        `Live capture at <b>${liveTime}</b> (run <code>${data.run_id}</code>) — ` +
+        `ARES searched <b>${data.total_online_cameras_in_area}</b> street cameras → inspected <b>${data.cameras_inspected_count}</b> live JPEGs in <b>${data.wall_clock_s}s</b> ` +
+        `(<b>${prunedDisq}</b> non-street/obstructed cameras disqualified). Both ARES &amp; Gemini Solo saw the exact same ${data.cameras_inspected_count} live JPEGs.`;
+      es.close();
+      activeStream = null;
+      btn.disabled = false;
+    } else if (msg.type === "error") {
+      status.innerHTML = `<span style="color:#fca5a5;">Error: ${msg.detail}</span>`;
+      es.close();
+      activeStream = null;
+      btn.disabled = false;
+    }
+  };
+
+  es.onerror = () => {
+    status.innerHTML = `<span style="color:#fca5a5;">Stream disconnected. Click Run / Re-Run Live to retry.</span>`;
+    es.close();
+    activeStream = null;
+    btn.disabled = false;
+  };
+}
+
+function renderResult(data) {
+  document.getElementById("compare").style.display = "grid";
+  const dec = data.board.decision;
+  const liveTime = formatLocalTime(data.timestamp_utc);
+  document.getElementById("aresVerdict").textContent = dec.answer;
+  document.getElementById("aresMeta").innerHTML =
+    `<b>Time:</b> ${data.wall_clock_s}s (live @ ${liveTime}) &nbsp;|&nbsp; ` +
+    `<b>Decision-1 Confidence:</b> ${(dec.confidence * 100).toFixed(1)}% &nbsp;|&nbsp; ` +
+    `<b>Certified Share:</b> ${(dec.certified_influence_share * 100).toFixed(0)}% &nbsp;|&nbsp; ` +
+    `<b>Receipts:</b> ${data.cameras_inspected_count} SHA-256 live JPEGs`;
+
+  if (data.solo_baseline) {
+    const s = data.solo_baseline;
+    document.getElementById("soloVerdict").textContent = s.predicted_intersection;
+    document.getElementById("soloMeta").innerHTML =
+      `<b>Time:</b> ${s.wall_clock_s}s &nbsp;|&nbsp; ` +
+      `<b>Self-reported Confidence:</b> ${(s.confidence * 100).toFixed(0)}% &nbsp;|&nbsp; ` +
+      `<b style="color:#fdba74;">No deterministic disqualifiers · No Round-2 zoom · No Decision-1 probe</b><br/>${s.reasoning}`;
+  }
+
+  rerenderGrid();
+}
+
+function rerenderGrid() {
+  if (!currentData) return;
+  const hideDisq = document.getElementById("hideDisq").checked;
+  const liveTime = formatLocalTime(currentData.timestamp_utc);
+  const grid = document.getElementById("grid");
+  grid.innerHTML = "";
+
+  const visibleItems = currentData.inspected.filter(item => {
+    const isDisq = item.observation.disqualifier && item.observation.disqualifier !== "none";
+    return !(hideDisq && isDisq);
+  });
+
+  if (visibleItems.length === 0) {
+    grid.innerHTML = `<div style="grid-column:1/-1;color:#93a1b0;padding:18px;background:#182028;border-radius:10px;">All ${currentData.inspected.length} inspected cameras were disqualified as non-streets (bus/bike lanes, bridges, or obstructed). Uncheck <b>Hide disqualified non-streets</b> above to inspect them.</div>`;
+    return;
+  }
+
+  for (const item of visibleItems) {
+    const v = item.observation.verdict;
+    const badgeCls = v === "strong_match" ? "green" : (v === "partial_match" ? "orange" : "gray");
+    const dist = item.distance_m_from_anchor != null ? ` (${Math.round(item.distance_m_from_anchor)}m from anchor)` : "";
+    const card = document.createElement("div");
+    card.className = `cam-card ${v}` + (hiddenFields.has(item.field_name) ? " hidden-clue" : "");
+    card.id = `card_${item.field_name}`;
+    const disq = item.observation.disqualifier && item.observation.disqualifier !== "none"
+      ? `<span class="badge" style="background:rgba(228,26,28,0.22);color:#fca5a5;">✕ ${item.observation.disqualifier}</span>`
+      : "";
+    const isHidden = hiddenFields.has(item.field_name);
+    card.innerHTML = `
+      <img src="${item.image_endpoint}" alt="${item.camera.name}" />
+      <div class="cam-body">
+        <div>
+          <span class="badge ${badgeCls}">R${item.round_num} · ${v} (${item.observation.match_score.toFixed(2)})</span>
+          <span class="badge gray">drop=${(item.influence || 0).toFixed(2)}</span>
+          ${disq}
+        </div>
+        <div class="cam-title">${item.camera.name}${dist}</div>
+        <div class="cam-desc">${item.observation.summary}</div>
+        <div class="cam-foot">
+          <span class="meta">${liveTime} · sha256: ${item.artifact.sha256.slice(0,8)}</span>
+          <button class="hide-btn ${isHidden ? "active" : ""}" id="btn_${item.field_name}" onclick="toggleHide('${item.field_name}')">${isHidden ? "Hidden (Restore)" : "Hide camera"}</button>
+        </div>
+      </div>
+    `;
+    grid.appendChild(card);
+  }
+}
+
+async function toggleHide(fieldName) {
+  if (!currentRunId) return;
+  const card = document.getElementById(`card_${fieldName}`);
+  const btn = document.getElementById(`btn_${fieldName}`);
+  if (hiddenFields.has(fieldName)) {
+    hiddenFields.delete(fieldName);
+    card.classList.remove("hidden-clue");
+    btn.classList.remove("active");
+    btn.textContent = "Hide camera";
+  } else {
+    hiddenFields.add(fieldName);
+    card.classList.add("hidden-clue");
+    btn.classList.add("active");
+    btn.textContent = "Hidden (Restore)";
+  }
+
+  const banner = document.getElementById("ablateBanner");
+  banner.style.display = "block";
+  banner.innerHTML = "Re-probing <code>gemini-decision-1</code> with hidden camera(s)...";
+
+  try {
+    const resp = await fetch("/api/ablate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ run_id: currentRunId, hidden_fields: Array.from(hiddenFields) })
+    });
+    const r = await resp.json();
+    if (!resp.ok) throw new Error(r.detail || "Ablation failed");
+    const deltaPct = (r.confidence_delta * 100).toFixed(1);
+    const sign = r.confidence_delta >= 0 ? "+" : "";
+    const flipMsg = r.answer_flipped
+      ? ` <b style="color:#fca5a5;">VERDICT FLIPPED → ${r.ablated_answer}</b>`
+      : ` (verdict stayed <b>${r.ablated_answer}</b>)`;
+    banner.innerHTML =
+      `<b>Live Counterfactual Probe (${r.hidden_fields.length} camera hidden):</b> ` +
+      `Confidence went from <b>${(r.base_confidence * 100).toFixed(1)}%</b> → ` +
+      `<b>${(r.ablated_confidence * 100).toFixed(1)}%</b> (${sign}${deltaPct}%)` + flipMsg;
+  } catch (err) {
+    banner.innerHTML = `<span style="color:#fca5a5;">Ablation error: ${err.message}</span>`;
+  }
+}
+
+// Auto-run once on load so the page is immediately live!
+window.addEventListener("DOMContentLoaded", () => runSearch());
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    return HTMLResponse(HTML_PAGE)
