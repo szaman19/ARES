@@ -21,6 +21,20 @@ CaseCategory = Literal["multi_clue_join", "look_alike_decoy", "under_determined"
 RecommendedAction = Literal["rollback", "restart", "scale_pool", "escalate"]
 SubtletyLevel = Literal["low", "medium", "high"]
 QuestionType = Literal["multiple_choice", "yes_no", "bounded_score"]
+ArtifactKind = Literal["plot_png", "image", "table_slice"]
+
+
+class ArtifactRef(BaseModel):
+    """Reference to a deterministic visual or tabular artifact (Multimodal Addendum §1)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    artifact_id: str
+    kind: ArtifactKind
+    path: str
+    sha256: str
+    mime_type: str
+    produced_by_verifier: bool
 
 
 class BoardDecision(BaseModel):
@@ -41,6 +55,7 @@ class BoardField(BaseModel):
     value: Any = "unknown"
     status: FieldStatus = "unknown"
     sources: list[str] = Field(default_factory=list)
+    artifact_ids: list[str] = Field(default_factory=list)
     influence: float = Field(default=0.0, ge=0.0, le=1.0)
     voi: float = Field(default=0.0, ge=0.0, le=1.0)
     requested_under: int = Field(default=0, ge=0)
@@ -65,6 +80,8 @@ class Note(BaseModel):
 
     note_id: str
     certification: CertificationStatus
+    sources: list[str] = Field(default_factory=list)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
     verifier_name: str | None = None
     hypothesis_family: str = ""
     query_sql: str = ""
@@ -142,6 +159,7 @@ class VerifierResult(BaseModel):
     passed: bool
     certification: CertificationStatus
     evidence: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
     row_count: int = Field(default=0, ge=0)
     summary: str = ""
 
@@ -240,6 +258,8 @@ class Domain(Protocol):
 
 
 __all__ = [
+    "ArtifactKind",
+    "ArtifactRef",
     "BoardDecision",
     "BoardField",
     "CaseCategory",

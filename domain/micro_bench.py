@@ -23,12 +23,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from contracts import (
+    ArtifactRef,
     DecisionQuestion,
     GroundTruth,
     NeedleSpec,
     VerifierRegistry,
     VerifierResult,
 )
+from domain.artifacts import render_candidate_slice_plot
 
 SERVICES: tuple[str, ...] = (
     "api-gateway",
@@ -1354,6 +1356,25 @@ def verify_three_way_root_cause(
         for r in rows
     ]
     passed = len(candidates) > 0
+    artifacts: list[ArtifactRef] = []
+    artifact_dir = params.get("artifact_dir")
+    if passed and artifact_dir:
+        # I7 (Multimodal Addendum §2): bound visual artifacts to top 1-3 surviving candidates
+        max_artifacts = max(1, min(int(params.get("max_artifacts", 3)), 3))
+        for cand in candidates[:max_artifacts]:
+            artifacts.append(
+                render_candidate_slice_plot(
+                    con=con,
+                    data_dir=data_dir,
+                    service=cand["service"],
+                    shard_id=cand["shard_id"],
+                    out_dir=str(artifact_dir),
+                    window_start=cand["window_start"],
+                    window_end=cand["window_end"],
+                    window_pad_seconds=window_pad_s,
+                )
+            )
+
     return VerifierResult(
         verifier_name="verify_three_way_root_cause",
         passed=passed,
@@ -1362,6 +1383,7 @@ def verify_three_way_root_cause(
             "verified_root_causes": [c["service"] for c in candidates],
             "candidates": candidates,
         },
+        artifacts=artifacts,
         row_count=len(candidates),
         summary=(
             f"CERTIFIED 3-way root cause(s): {[c['service'] for c in candidates]}"

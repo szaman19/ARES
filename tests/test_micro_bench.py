@@ -13,7 +13,7 @@ import duckdb
 import pyarrow.parquet as pq
 import pytest
 
-from contracts import Domain, InMemoryVerifierRegistry
+from contracts import ArtifactRef, BoardField, Domain, InMemoryVerifierRegistry, Note
 from domain.micro_bench import MicroBenchDomain, SERVICES
 
 
@@ -361,3 +361,88 @@ def test_score_certified_decoy_and_under_determined(
     assert s_honest["certification_correct"] is True
     assert s_honest["action_correct"] is True
     assert s_honest["overall_pass"] is True
+
+
+def test_multimodal_contract_models() -> None:
+    ref = ArtifactRef(
+        artifact_id="art_abcdef123456",
+        kind="plot_png",
+        path="/tmp/slice.png",
+        sha256="0" * 64,
+        mime_type="image/png",
+        produced_by_verifier=True,
+    )
+    note = Note(
+        note_id="n_0001",
+        certification="CERTIFIED",
+        sources=["verify_three_way_root_cause"],
+        artifacts=[ref],
+        summary="Verified candidate slice plot.",
+    )
+    field = BoardField(
+        value="payments-db",
+        status="certified",
+        sources=["n_0001"],
+        artifact_ids=[ref.artifact_id],
+    )
+    assert note.artifacts[0].artifact_id == "art_abcdef123456"
+    assert note.sources == ["verify_three_way_root_cause"]
+    assert field.artifact_ids == ["art_abcdef123456"]
+
+
+def test_deterministic_candidate_slice_plot_and_verifier_artifacts(
+    tmp_path: Path,
+    base_haystack_dir: Path,
+    domain: MicroBenchDomain,
+) -> None:
+    # 1. Surviving candidate on look_alike_decoy case produces deterministic PNG artifact
+    decoy_needle = domain.needle_menu()[3]
+    case_dir = tmp_path / "plot_decoy_case"
+    _copy_haystack(base_haystack_dir, case_dir)
+    truth = domain.plant(str(case_dir), decoy_needle)
+
+    registry = InMemoryVerifierRegistry()
+    domain.register_verifiers(registry)
+    verifier = registry.get("verify_three_way_root_cause")
+
+    art_dir_1 = tmp_path / "artifacts_1"
+    art_dir_2 = tmp_path / "artifacts_2"
+    con = duckdb.connect(":memory:")
+    res1 = verifier(con, str(case_dir), {"artifact_dir": str(art_dir_1)})
+    res2 = verifier(con, str(case_dir), {"artifact_dir": str(art_dir_2)})
+
+    assert res1.passed is True
+    assert len(res1.artifacts) == 1
+    assert len(res2.artifacts) == 1
+
+    art1 = res1.artifacts[0]
+    art2 = res2.artifacts[0]
+    assert art1.kind == "plot_png"
+    assert art1.mime_type == "image/png"
+    assert art1.produced_by_verifier is True
+    assert art1.sha256 == art2.sha256
+    assert art1.artifact_id == art2.artifact_id
+
+    png_path = Path(art1.path)
+    assert png_path.exists()
+    raw = png_path.read_bytes()
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+    assert hashlib.sha256(raw).hexdigest() == art1.sha256
+    # Compact size per I7
+    assert len(raw) < 200_000
+    # No ground-truth leakage in filename
+    assert "needle" not in png_path.name.lower()
+    assert "decoy" not in png_path.name.lower()
+    assert truth.root_cause_component in png_path.name
+
+    # 2. Under-determined case produces 0 verifier artifacts
+    ud_needle = domain.needle_menu()[6]
+    ud_dir = tmp_path / "plot_ud_case"
+    _copy_haystack(base_haystack_dir, ud_dir)
+    domain.plant(str(ud_dir), ud_needle)
+
+    res_ud = verifier(con, str(ud_dir), {"artifact_dir": str(tmp_path / "artifacts_ud")})
+    con.close()
+    assert res_ud.passed is False
+    assert res_ud.artifacts == []
+
