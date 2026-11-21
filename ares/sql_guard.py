@@ -23,8 +23,8 @@ class SQLValidationError(ValueError):
 class SQLGuardConfig(BaseModel):
     """Root-guard limits for automated DuckDB SQL queries (Invariant I6)."""
 
-    max_estimated_rows: int = Field(default=5_000_000, gt=0)
-    max_estimated_bytes: int = Field(default=2_000_000_000, gt=0)
+    max_estimated_rows: int = Field(default=50_000_000, gt=0)
+    max_estimated_bytes: int = Field(default=15_000_000_000, gt=0)
     max_result_rows: int = Field(default=500, gt=0)
     avg_bytes_per_row_fallback: int = Field(default=256, gt=0)
     allowed_data_dir: str | None = None
@@ -91,6 +91,19 @@ _FORBIDDEN_FUNCTIONS: frozenset[str] = frozenset(
         "write_parquet",
         "read_blob",
         "read_text",
+        "read_csv",
+        "read_csv_auto",
+        "sniff_csv",
+        "read_json",
+        "read_json_auto",
+        "read_json_objects",
+        "read_ndjson",
+        "read_ndjson_auto",
+        "read_ndjson_objects",
+        "parquet_metadata",
+        "parquet_schema",
+        "parquet_file_metadata",
+        "parquet_kv_metadata",
         "glob",
         "http_get",
         "http_post",
@@ -325,11 +338,14 @@ def query_content_hash(
 
 def _extract_parquet_paths(sql: str) -> list[str]:
     """Extract string-literal paths passed to read_parquet(...) or parquet_scan(...)."""
-    pattern = re.compile(
-        r"\b(?:read_parquet|parquet_scan)\s*\(\s*'([^']+)'",
+    call_pattern = re.compile(
+        r"\b(?:read_parquet|parquet_scan)\s*\(([^)]*)\)",
         re.IGNORECASE,
     )
-    return pattern.findall(sql)
+    paths: list[str] = []
+    for args_str in call_pattern.findall(sql):
+        paths.extend(re.findall(r"'([^']*)'", args_str))
+    return paths
 
 
 def validate_readonly_sql(
@@ -362,6 +378,19 @@ def validate_readonly_sql(
     code_only = " ".join(text for is_lit, text in segments if not is_lit)
     if ";" in code_only:
         raise SQLValidationError("Multi-statement SQL is forbidden.")
+    if re.search(r"\$[A-Za-z0-9_]*\$", code_only):
+        raise SQLValidationError("Dollar-quoted strings are forbidden in guarded SQL.")
+
+    # Reject direct file replacement scans like FROM '/path/file.parquet' or JOIN 'file.csv'
+    code_with_slits = "".join(
+        " __SLIT__ " if (is_lit and text.startswith("'")) else text
+        for is_lit, text in segments
+    )
+    if re.search(r"\b(?:FROM|JOIN)\s+__SLIT__", code_with_slits, re.IGNORECASE):
+        raise SQLValidationError(
+            "Direct file replacement scans (FROM/JOIN '...') are forbidden; "
+            "query registered table views or read_parquet(...) within allowed_data_dir."
+        )
 
     # Must begin with SELECT or WITH
     first_token_match = re.match(r"^\s*([A-Za-z_]+)", code_only)

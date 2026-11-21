@@ -237,10 +237,13 @@ class ARESRunner:
             return spec.dedup_key
 
         if spec.task_type == "sql_query" and spec.hypothesis_spec is not None:
+            effective_vname = (
+                spec.hypothesis_spec.verifier_name if self.registry is not None else None
+            )
             return query_content_hash(
                 spec.hypothesis_spec.query_sql,
                 hypothesis_family=spec.hypothesis_spec.hypothesis_family,
-                verifier_name=spec.hypothesis_spec.verifier_name,
+                verifier_name=effective_vname,
             )
 
         if spec.task_type == "verify":
@@ -433,6 +436,7 @@ class ARESRunner:
                                 hspec.query_sql,
                                 requested_under=spec.requested_under,
                                 hypothesis_family=hspec.hypothesis_family,
+                                query_hash=node.query_hash,
                                 note_store=self.note_store,
                             )
                             delta["sql_queries"] += 1

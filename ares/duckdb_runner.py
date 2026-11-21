@@ -134,6 +134,7 @@ class DuckDBTrustedRunner:
         *,
         requested_under: int = 0,
         hypothesis_family: str = "",
+        query_hash: str = "",
         note_store: NoteStore | None = None,
         config: SQLGuardConfig | None = None,
     ) -> tuple[QueryExecutionResult, Note]:
@@ -144,7 +145,7 @@ class DuckDBTrustedRunner:
         """
         cfg = config or self.guard_config
         norm_sql = validate_readonly_sql(sql, cfg)
-        q_hash = query_content_hash(norm_sql, hypothesis_family=hypothesis_family)
+        q_hash = query_hash or query_content_hash(norm_sql, hypothesis_family=hypothesis_family)
 
         con = self._open_connection()
         try:
@@ -376,6 +377,7 @@ class DuckDBTrustedRunner:
                 norm_sql,
                 requested_under=spec.requested_under,
                 hypothesis_family=spec.hypothesis_family,
+                query_hash=q_hash,
                 note_store=store,
             )
             return note

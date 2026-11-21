@@ -44,9 +44,12 @@ def test_domain_protocol_conformance(domain: MicroBenchDomain) -> None:
     questions = domain.decision_questions()
     q_ids = {q.question_id for q in questions}
     assert {"root_cause", "recommended_action", "sufficiently_verified"} <= q_ids
-    assert "service_logs" in domain.schema_description()
-    assert "metrics" in domain.schema_description()
-    assert "traces" in domain.schema_description()
+    schema_desc = domain.schema_description()
+    assert "service_logs" in schema_desc
+    assert "metrics" in schema_desc
+    assert "traces" in schema_desc
+    assert "<data_dir>" not in schema_desc
+    assert "FROM service_logs" in schema_desc
 
 
 def test_needle_menu_structure(domain: MicroBenchDomain) -> None:

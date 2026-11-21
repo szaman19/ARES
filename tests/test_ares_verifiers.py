@@ -97,6 +97,12 @@ def test_validate_readonly_sql_ignores_keywords_inside_literals() -> None:
         "SELECT 1; DROP TABLE service_logs",
         "SELECT getenv('API_KEY')",
         "SELECT * FROM duckdb_secrets()",
+        "SELECT * FROM read_csv('/etc/passwd')",
+        "SELECT * FROM read_json_auto('/tmp/data.json')",
+        "SELECT * FROM parquet_metadata('/tmp/file.parquet')",
+        "SELECT * FROM '/etc/passwd.parquet'",
+        "SELECT * FROM service_logs JOIN '/tmp/other.parquet' ON true",
+        "SELECT $$unparsed dollar string$$",
         "SELECT * FROM read_parquet('https://evil.example.com/data.parquet')",
         "SELECT * FROM read_parquet('s3://bucket/file.parquet')",
     ],
@@ -111,9 +117,20 @@ def test_validate_readonly_sql_enforces_data_dir_sandbox(tmp_path: Path) -> None
     safe = f"SELECT * FROM read_parquet('{tmp_path}/service_logs/*.parquet')"
     assert validate_readonly_sql(safe, cfg).startswith("SELECT")
 
+    # Standard SQL constructs using FROM (EXTRACT / TRIM / double-quoted view) must pass
+    quoted_view = 'SELECT EXTRACT(EPOCH FROM ts), TRIM(\' \' FROM service) FROM "service_logs"'
+    assert validate_readonly_sql(quoted_view, cfg).startswith("SELECT")
+
     escaped = f"SELECT * FROM read_parquet('{tmp_path}/../etc/passwd')"
     with pytest.raises(SQLValidationError, match="escapes allowed data directory"):
         validate_readonly_sql(escaped, cfg)
+
+    escaped_list = (
+        f"SELECT * FROM read_parquet(['{tmp_path}/service_logs/a.parquet', "
+        f"'{tmp_path}/../etc/passwd'])"
+    )
+    with pytest.raises(SQLValidationError, match="escapes allowed data directory"):
+        validate_readonly_sql(escaped_list, cfg)
 
 
 def test_normalize_and_content_hash_deduplication() -> None:
@@ -532,3 +549,37 @@ def test_ares_library_narrow_waist_boundary() -> None:
         src = py_file.read_text(encoding="utf-8")
         for token in forbidden_tokens:
             assert token not in src, f"Narrow-waist violation: {token!r} found in {py_file.name}"
+
+
+def test_fallback_sql_query_hash_matches_store_when_registry_is_none(
+    planted_micro_bench: dict[str, object],
+) -> None:
+    """Ensure sql_query tasks with verifier_name set still deduplicate via NoteStore when registry=None."""
+    runner = DuckDBTrustedRunner(str(planted_micro_bench["data_dir"]))
+    store = NoteStore()
+    hspec = HypothesisQuerySpec(
+        query_sql="SELECT service, COUNT(*) FROM service_logs GROUP BY service",
+        hypothesis_family="upstream_retry_spike",
+        expected_signal="counts",
+        verifier_name="verify_upstream_retry_spike",
+        requested_under=1,
+    )
+
+    r1 = solve(
+        tasks=[TaskSpec(task_id="t1", task_type="sql_query", hypothesis_spec=hspec)],
+        duckdb_runner=runner,
+        registry=None,
+        note_store=store,
+    )
+    assert r1.usage.completed_tasks == 1
+    assert len(store) == 1
+
+    # Fresh graph against same NoteStore must detect the duplicate hash
+    r2 = solve(
+        tasks=[TaskSpec(task_id="t2", task_type="sql_query", hypothesis_spec=hspec)],
+        duckdb_runner=runner,
+        registry=None,
+        note_store=store,
+    )
+    assert r2.usage.skipped_duplicate_tasks == 1
+    assert len(store) == 1
