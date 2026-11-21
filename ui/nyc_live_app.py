@@ -27,7 +27,12 @@ RUN_ROOT.mkdir(parents=True, exist_ok=True)
 _RUNS: dict[str, NYCDemoResult] = {}
 
 
-DEFAULT_SNAPSHOT_DIR = Path("data/nyc_snapshot")
+DEFAULT_SNAPSHOT_DIR = Path("fixtures/nyc_snapshot")
+
+
+@app.get("/health")
+def health() -> dict[str, bool]:
+    return {"ok": True}
 
 
 class LiveSearchRequest(BaseModel):

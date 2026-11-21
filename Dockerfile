@@ -1,0 +1,24 @@
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+
+WORKDIR /app
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PYTHONUNBUFFERED=1
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY contracts.py ./
+COPY adapters ./adapters
+COPY ares ./ares
+COPY domain ./domain
+COPY fusion ./fusion
+COPY models ./models
+COPY ui ./ui
+COPY viz ./viz
+COPY fixtures/nyc_snapshot ./fixtures/nyc_snapshot
+
+EXPOSE 8080
+
+CMD ["uv", "run", "--no-sync", "uvicorn", "ui.nyc_live_app:app", "--host", "0.0.0.0", "--port", "8080"]

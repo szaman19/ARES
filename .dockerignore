@@ -1,0 +1,13 @@
+.git
+.venv
+.pytest_cache
+.worktrees
+.demo_workspace
+__pycache__
+*.pyc
+.env
+.env.*
+benchmark/results
+node_modules
+tests
+scripts

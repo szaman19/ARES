@@ -1,0 +1,37 @@
+{
+  "name": "ares-nyc-live-demo",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-21",
+  "upload_source_maps": true,
+  "observability": {
+    "enabled": true
+  },
+  "secrets": {
+    "required": ["GEMINI_API_KEY"]
+  },
+  "containers": [
+    {
+      "class_name": "AresNycContainer",
+      "scheduling_policy": "durable_object",
+      "images": {
+        "base": {
+          "dockerfile": "./Dockerfile"
+        }
+      }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ARES_CONTAINER",
+        "class_name": "AresNycContainer"
+      }
+    ]
+  },
+  "exports": {
+    "AresNycContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
