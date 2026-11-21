@@ -722,6 +722,7 @@ def run_live_nyc_search(
     def _run_camera_batch(
         round_num: int,
         batch: list[tuple[CameraInfo, float | None]],
+        prefetched_arts: dict[str, ArtifactRef] | None = None,
     ) -> None:
         nonlocal total_telemetry
         cam_by_idx = {str(i): pair for i, pair in enumerate(batch)}
@@ -730,7 +731,9 @@ def run_live_nyc_search(
         def _processor(spec: TaskSpec, _ctx: dict[str, Any]) -> ProcessorResult:
             idx_key = str(spec.context["idx"])
             cam, dist_m = cam_by_idx[idx_key]
-            if cam.id in snapshot_frames:
+            if prefetched_arts and cam.id in prefetched_arts:
+                art = prefetched_arts[cam.id]
+            elif cam.id in snapshot_frames:
                 _emit("camera_fetch", f"[R{round_num}] SNAPSHOT → {cam.name}")
                 src_path = snapshot_frames[cam.id]
                 copied = img_dir / src_path.name
@@ -807,31 +810,40 @@ def run_live_nyc_search(
             total_telemetry = total_telemetry.plus(tel)
             inspected_lock_items.append((round_num, i + 1, cam, art, note, obs, dist_m))
 
-    # --- Round 1: Coarse Parallel Sweep ---
+    # --- Pre-fetch Round 1 JPEGs once so ARES & Gemini Solo start at the EXACT same instant ---
     r1_cams = select_spread_cameras(cameras, k=round1_k)
-    _emit(
-        "round1_start",
-        f"ARES Round 1: dispatching {len(r1_cams)} parallel camera tasks (max_concurrent=6)...",
-    )
-    _run_camera_batch(1, [(c, None) for c in r1_cams])
+    _emit("prefetch", f"Pre-fetching {len(r1_cams)} live street JPEGs in parallel for both ARES & Gemini Solo...")
+    prefetched_r1: dict[str, ArtifactRef] = {}
 
-    # Pick top Round-1 anchor camera by match_score
-    r1_sorted = sorted(
-        inspected_lock_items,
-        key=lambda row: (row[5].verdict != "unclear_camera", row[5].match_score),
-        reverse=True,
-    )
-    anchor_cam = r1_sorted[0][2] if r1_sorted else None
+    def _prefetch_one(cam: CameraInfo) -> tuple[str, ArtifactRef | None]:
+        try:
+            if cam.id in snapshot_frames:
+                src_path = snapshot_frames[cam.id]
+                copied = img_dir / src_path.name
+                copied.write_bytes(src_path.read_bytes())
+                return cam.id, _artifact_from_local_jpeg(copied)
+            return cam.id, fetch_camera_jpeg(cam, img_dir)
+        except Exception:
+            return cam.id, None
 
-    # Launch Gemini Solo in parallel RIGHT AFTER Round 1 on ONLY the 6 Round-1 JPEGs
-    # (so Gemini Solo doesn't cheat off ARES's Round-2 GPS zoom-in!)
-    r1_photo_pairs = [(row[2], row[3]) for row in inspected_lock_items if row[0] == 1]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(r1_cams)))) as pf_pool:
+        for cid, art in pf_pool.map(_prefetch_one, r1_cams):
+            if art is not None:
+                prefetched_r1[cid] = art
+
+    r1_ready_cams = [c for c in r1_cams if c.id in prefetched_r1]
+    r1_photo_pairs = [(c, prefetched_r1[c.id]) for c in r1_ready_cams]
+
+    # Start timer AFTER shared photo fetch so both agents race from t=0.0s on the exact same photos!
+    t_race_start = time.perf_counter()
+
+    # Launch Gemini Solo AT THE EXACT SAME TIME as ARES Round 1!
     solo_executor: concurrent.futures.ThreadPoolExecutor | None = None
     solo_future: concurrent.futures.Future[GeminiSoloBaseline] | None = None
     if include_solo_baseline and r1_photo_pairs:
         _emit(
             "solo_start",
-            f"POST gemini-4-carbon (Gemini Solo, IN PARALLEL): evaluating the {len(r1_photo_pairs)} Round-1 JPEGs (no Round-2 zoom)...",
+            f"POST gemini-4-carbon (Gemini Solo, t=0): evaluating the same {len(r1_photo_pairs)} pre-fetched JPEGs...",
         )
         solo_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
@@ -849,7 +861,22 @@ def run_live_nyc_search(
 
         solo_future = solo_executor.submit(_run_solo)
 
-    # --- Round 2: Spatial Zoom-In (3 nearest online neighbors to anchor) ---
+    # --- Round 1: Coarse Parallel Sweep ---
+    _emit(
+        "round1_start",
+        f"ARES Round 1 (t=0): dispatching {len(r1_ready_cams)} parallel gemini-4-hydrogen verifiers...",
+    )
+    _run_camera_batch(1, [(c, None) for c in r1_ready_cams], prefetched_arts=prefetched_r1)
+
+    # Pick top Round-1 anchor camera by match_score
+    r1_sorted = sorted(
+        inspected_lock_items,
+        key=lambda row: (row[5].verdict != "unclear_camera", row[5].match_score),
+        reverse=True,
+    )
+    anchor_cam = r1_sorted[0][2] if r1_sorted else None
+
+    # --- Round 2: Spatial Zoom-In (nearest online neighbors to anchor) ---
     if anchor_cam is not None and round2_k > 0:
         seen_ids = {row[2].id for row in inspected_lock_items}
         neighbors = select_nearest_cameras(anchor_cam, cameras, k=round2_k, exclude_ids=seen_ids)
@@ -963,7 +990,7 @@ def run_live_nyc_search(
         decision_confidence=probe_result.updated_board.decision.confidence,
     )
 
-    ares_wall_clock_s = round(time.perf_counter() - t_start, 2)
+    ares_wall_clock_s = round(time.perf_counter() - t_race_start, 2)
     _emit(
         "ares_done",
         f"ARES finished in {ares_wall_clock_s}s → {probe_result.updated_board.decision.answer} ({probe_result.updated_board.decision.confidence:.1%})",
