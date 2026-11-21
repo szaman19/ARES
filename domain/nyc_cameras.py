@@ -165,6 +165,10 @@ class CameraObservation(BaseModel):
     curb_visibility: Literal["clear", "partial", "blocked_or_blurry"] = "blocked_or_blurry"
     is_legal_parking_street: bool = False
     open_curb_spot_visible: bool = False
+    spot_box: list[int] | None = Field(
+        default=None,
+        description="Optional [ymin, xmin, ymax, xmax] bounding box in 0..1000 normalized coordinates circling the open curb parking space.",
+    )
     disqualifier: Literal[
         "none",
         "red_bus_lane",
@@ -383,7 +387,9 @@ def _inspect_camera_with_hydrogen(
         "   - Bridge approach, overpass, highway, divided roadway, or tunnel -> disqualifier='bridge_or_highway', is_legal_parking_street=false.\n"
         "   - Guardrail or concrete barrier with no sidewalk parking curb -> disqualifier='guardrail_no_curb', is_legal_parking_street=false.\n"
         "3. Set open_curb_spot_visible=true ONLY if you literally see an empty car-length space along a normal city parking curb (typically beside other legally parked cars).\n"
-        "4. Keep summary to 1 concise factual sentence describing what you literally see."
+        "4. If open_curb_spot_visible=true (or partial_match with visible curb space), return spot_box=[ymin, xmin, ymax, xmax] "
+        "in 0..1000 normalized image coordinates tightly circling that exact open curb parking spot; otherwise set spot_box=null.\n"
+        "5. Keep summary to 1 concise factual sentence describing what you literally see."
     )
     t0 = time.perf_counter()
     interaction = client.interactions.create(
@@ -419,13 +425,26 @@ def _inspect_camera_with_hydrogen(
         obs.match_score = min(obs.match_score, 0.15)
         obs.is_legal_parking_street = False
         obs.open_curb_spot_visible = False
+        obs.spot_box = None
     elif wants_parking and (not obs.is_legal_parking_street or obs.disqualifier != "none"):
         obs.verdict = "no_match"
         obs.match_score = min(obs.match_score, 0.15)
         obs.open_curb_spot_visible = False
+        obs.spot_box = None
     elif wants_parking and not obs.open_curb_spot_visible and obs.verdict == "strong_match":
         obs.verdict = "partial_match"
         obs.match_score = min(obs.match_score, 0.55)
+
+    # Validate spot_box coordinates if present
+    if obs.spot_box is not None:
+        if len(obs.spot_box) != 4:
+            obs.spot_box = None
+        else:
+            ymin, xmin, ymax, xmax = [max(0, min(1000, int(v))) for v in obs.spot_box]
+            if ymax <= ymin or xmax <= xmin:
+                obs.spot_box = None
+            else:
+                obs.spot_box = [ymin, xmin, ymax, xmax]
 
     return obs, telemetry
 
@@ -778,7 +797,7 @@ def run_live_nyc_search(
             note_store=note_store,
             processors={"inspect_camera": _processor},
         )
-        runner.solve(graph=graph, max_concurrent=min(6, max(1, len(batch))))
+        runner.solve(graph=graph, max_concurrent=min(10, max(1, len(batch))))
 
         for i in range(len(batch)):
             key = str(i)
@@ -841,26 +860,36 @@ def run_live_nyc_search(
             )
             _run_camera_batch(2, [(c, d) for c, d in neighbors])
 
-    # Build InvestigationBoard & validate strictly via fusion/patch.py
-    candidate_names: list[str] = []
-    updates: dict[str, dict[str, Any]] = {}
+    # Build InvestigationBoard (keep top 8 candidates on the active board so Decision-1 stays fast even for 18-36 cameras)
+    all_inspected_objs: list[tuple[InspectedCamera, Note]] = []
     for round_num, idx, cam, art, note, obs, dist_m in inspected_lock_items:
         fname = _safe_field_name(round_num, idx, cam.name)
-        inspected.append(
-            InspectedCamera(
-                round_num=round_num,
-                camera=cam,
-                artifact=art,
-                note_id=note.note_id,
-                observation=obs,
-                field_name=fname,
-                distance_m_from_anchor=dist_m,
-            )
+        item_obj = InspectedCamera(
+            round_num=round_num,
+            camera=cam,
+            artifact=art,
+            note_id=note.note_id,
+            observation=obs,
+            field_name=fname,
+            distance_m_from_anchor=dist_m,
         )
-        candidate_names.append(cam.name)
-        updates[fname] = {
+        inspected.append(item_obj)
+        all_inspected_objs.append((item_obj, note))
+
+    top_scored = sorted(
+        inspected,
+        key=lambda x: (x.observation.verdict != "unclear_camera", x.observation.match_score),
+        reverse=True,
+    )
+    board_top_names = {x.field_name for x in top_scored[:8]}
+    updates: dict[str, dict[str, Any]] = {}
+    for item_obj, note in all_inspected_objs:
+        if item_obj.field_name not in board_top_names:
+            continue
+        obs = item_obj.observation
+        updates[item_obj.field_name] = {
             "value": {
-                "camera_name": cam.name,
+                "camera_name": item_obj.camera.name,
                 "verdict": obs.verdict,
                 "match_score": obs.match_score,
                 "curb_visibility": obs.curb_visibility,
@@ -869,16 +898,11 @@ def run_live_nyc_search(
                 "disqualifier": obs.disqualifier,
             },
             "sources": [note.note_id],
-            "artifact_ids": [art.artifact_id],
-            "requested_under": round_num - 1,
+            "artifact_ids": [item_obj.artifact.artifact_id],
+            "requested_under": item_obj.round_num - 1,
         }
 
     # Closed-set DecisionQuestion: top 4 highest-scoring cameras + none_verified
-    top_scored = sorted(
-        inspected,
-        key=lambda x: (x.observation.verdict != "unclear_camera", x.observation.match_score),
-        reverse=True,
-    )
     options = ["none_verified"] + list(dict.fromkeys(x.camera.name for x in top_scored[:4]))
     question = DecisionQuestion(
         question_id="best_intersection",

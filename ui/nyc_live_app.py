@@ -32,12 +32,12 @@ DEFAULT_SNAPSHOT_DIR = Path("data/nyc_snapshot")
 
 class LiveSearchRequest(BaseModel):
     area: str = "Manhattan"
-    query: str = "open legal street parking spot along a normal city curb (no bus lanes, bike lanes, or bridges)"
+    query: str = "open legal street parking spot along a normal city curb"
     keyword: str | None = None
     street_only: bool = True
     use_snapshot: bool = False
-    round1_k: int = Field(default=6, ge=2, le=9)
-    round2_k: int = Field(default=3, ge=0, le=6)
+    round1_k: int = Field(default=12, ge=2, le=24)
+    round2_k: int = Field(default=6, ge=0, le=12)
 
 
 class AblateRequest(BaseModel):
@@ -81,12 +81,12 @@ def api_search(req: LiveSearchRequest) -> dict[str, Any]:
 @app.get("/api/search/stream")
 def api_search_stream(
     area: str = Query(default="Manhattan"),
-    query: str = Query(default="open legal street parking spot along a normal city curb (no bus lanes, bike lanes, or bridges)"),
+    query: str = Query(default="open legal street parking spot along a normal city curb"),
     keyword: str | None = Query(default=None),
     street_only: bool = Query(default=True),
     use_snapshot: bool = Query(default=False),
-    round1_k: int = Query(default=6, ge=2, le=9),
-    round2_k: int = Query(default=3, ge=0, le=6),
+    round1_k: int = Query(default=12, ge=2, le=24),
+    round2_k: int = Query(default=6, ge=0, le=12),
 ) -> StreamingResponse:
     run_id = uuid.uuid4().hex[:10]
     run_dir = RUN_ROOT / run_id
@@ -273,7 +273,20 @@ HTML_PAGE = """<!doctype html>
   .cam-card.strong_match { border-color: var(--green); }
   .cam-card.partial_match { border-color: var(--orange); }
   .cam-card.hidden-clue { opacity: 0.48; border-style: dashed; border-color: var(--purple); }
-  .cam-card img { width: 100%; height: 190px; object-fit: cover; background: #000; display: block; }
+  .img-wrap { position: relative; width: 100%; height: 205px; background: #000; overflow: hidden; }
+  .img-wrap img { width: 100%; height: 100%; object-fit: fill; display: block; }
+  .spot-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .mode-switch {
+    display: inline-flex; background: #10161d; border: 1px solid var(--border);
+    border-radius: 10px; padding: 3px; gap: 3px;
+  }
+  .mode-btn {
+    border: none; background: transparent; color: var(--muted); font-size: 12px;
+    font-weight: 700; padding: 6px 12px; border-radius: 7px; cursor: pointer;
+  }
+  .mode-btn.active-live { background: rgba(27,158,119,0.25); color: #5eead4; }
+  .mode-btn.active-off { background: rgba(117,112,179,0.28); color: #ddd6fe; }
+  .header-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
   .cam-body { padding: 10px 12px; flex: 1; display: flex; flex-direction: column; gap: 6px; }
   .cam-title { font-weight: 700; font-size: 13px; }
   .cam-desc { font-size: 12px; color: var(--muted); flex: 1; }
@@ -290,12 +303,18 @@ HTML_PAGE = """<!doctype html>
 </head>
 <body>
 <div class="wrap">
-  <h1>ARES Live NYC Street-Camera Search</h1>
-  <div class="sub">
-    Live 2-round parallel search over NYC DOT street intersections (no highways/bridges), verified by <code>fusion/patch.py</code> + <code>gemini-decision-1</code> counterfactual probing — compared side-by-side against Gemini Solo.
+  <div class="header-row">
+    <div>
+      <h1>ARES Live NYC Street-Camera Search</h1>
+      <div class="sub" style="margin-bottom:0;">2-round parallel street search + deterministic parking rules + <code>gemini-decision-1</code> counterfactuals</div>
+    </div>
+    <div class="mode-switch">
+      <button id="modeLiveBtn" class="mode-btn active-live" onclick="setMode(false)">● LIVE NYC DOT</button>
+      <button id="modeOffBtn" class="mode-btn" onclick="setMode(true)">📦 OFFLINE SNAPSHOT (36)</button>
+    </div>
   </div>
 
-  <div class="controls">
+  <div class="controls" style="grid-template-columns: 140px 1fr 140px 115px auto;">
     <div>
       <label>Borough</label>
       <select id="area">
@@ -307,20 +326,28 @@ HTML_PAGE = """<!doctype html>
       </select>
     </div>
     <div>
-      <label>Live Search Query</label>
+      <label>Search Query</label>
       <input id="query" type="text" value="open legal street parking spot along a normal city curb" />
     </div>
     <div>
       <label>Street Filter</label>
-      <input id="keyword" type="text" placeholder="e.g. Broadway, 5 Ave" />
+      <input id="keyword" type="text" placeholder="e.g. Broadway" />
     </div>
     <div>
-      <button id="runBtn" class="primary" onclick="runSearch()">Re-Run Live</button>
+      <label>Cameras</label>
+      <select id="camBudget">
+        <option value="6,3">9 (6+3)</option>
+        <option value="12,6" selected>18 (12+6)</option>
+        <option value="16,8">24 (16+8)</option>
+        <option value="24,12">36 (24+12)</option>
+      </select>
+    </div>
+    <div>
+      <button id="runBtn" class="primary" onclick="runSearch()">Re-Run</button>
     </div>
     <div class="check-row">
       <label><input id="streetOnly" type="checkbox" checked /> Streets only</label>
       <label><input id="showRejected" type="checkbox" onchange="rerenderGrid()" /> Show rejected cameras</label>
-      <label><input id="useSnapshot" type="checkbox" /> Offline snapshot</label>
     </div>
   </div>
 
@@ -377,6 +404,15 @@ HTML_PAGE = """<!doctype html>
 let currentRunId = null;
 let currentData = null;
 let hiddenFields = new Set();
+let useSnapshotMode = false;
+
+function setMode(isOffline) {
+  useSnapshotMode = isOffline;
+  const liveBtn = document.getElementById("modeLiveBtn");
+  const offBtn = document.getElementById("modeOffBtn");
+  liveBtn.className = "mode-btn" + (isOffline ? "" : " active-live");
+  offBtn.className = "mode-btn" + (isOffline ? " active-off" : "");
+}
 
 function formatLocalTime(isoStr) {
   try {
@@ -478,13 +514,14 @@ function runSearch() {
   box.style.display = "block";
   status.innerHTML = "Streaming live requests...";
 
+  const [r1k, r2k] = document.getElementById("camBudget").value.split(",");
   const params = new URLSearchParams({
     area: document.getElementById("area").value,
     query: document.getElementById("query").value,
     street_only: document.getElementById("streetOnly").checked ? "true" : "false",
-    use_snapshot: document.getElementById("useSnapshot").checked ? "true" : "false",
-    round1_k: "6",
-    round2_k: "3",
+    use_snapshot: useSnapshotMode ? "true" : "false",
+    round1_k: r1k,
+    round2_k: r2k,
   });
   const kw = document.getElementById("keyword").value.trim();
   if (kw) params.set("keyword", kw);
@@ -579,8 +616,26 @@ function rerenderGrid() {
       ? `<span class="badge" style="background:rgba(228,26,28,0.22);color:#fca5a5;">✕ ${item.observation.disqualifier}</span>`
       : "";
     const isHidden = hiddenFields.has(item.field_name);
+    const box = item.observation.spot_box;
+    let overlaySvg = "";
+    if (Array.isArray(box) && box.length === 4 && (v === "strong_match" || v === "partial_match")) {
+      const [ymin, xmin, ymax, xmax] = box;
+      const cx = (xmin + xmax) / 2;
+      const cy = (ymin + ymax) / 2;
+      const rx = Math.max(45, (xmax - xmin) / 2);
+      const ry = Math.max(45, (ymax - ymin) / 2);
+      overlaySvg = `
+        <svg class="spot-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none">
+          <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}"
+            fill="rgba(27,158,119,0.20)" stroke="#22c55e" stroke-width="14" />
+        </svg>
+      `;
+    }
     card.innerHTML = `
-      <img src="${item.image_endpoint}" alt="${item.camera.name}" />
+      <div class="img-wrap">
+        <img src="${item.image_endpoint}" alt="${item.camera.name}" />
+        ${overlaySvg}
+      </div>
       <div class="cam-body">
         <div>
           <span class="badge ${badgeCls}">${roundTag} · ${v.replace("_", " ")}</span>
