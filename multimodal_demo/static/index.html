@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARES Multimodal Dataset Explorer &amp; Counterfactual Probe</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div>
+        <div class="eyebrow">ARES Narrow-Waist Engine · DuckDB Parquet + Real Media + Decision-1</div>
+        <h1>Multimodal Haystack Explorer &amp; Decoy Lab</h1>
+      </div>
+      <div class="controls-right">
+        <label class="toggle-pill" title="Use live gemini-decision-1 multimodal counterfactual calls (falls back cleanly if disabled)">
+          <input type="checkbox" id="liveGeminiToggle" checked />
+          <span id="geminiStatusLabel">Live Gemini Decision-1</span>
+        </label>
+      </div>
+    </div>
+    <nav id="datasetTabs" class="dataset-tabs" aria-label="Select multimodal dataset"></nav>
+  </header>
+
+  <main class="container">
+    <!-- Dataset Banner + Duel CTA -->
+    <section id="datasetHero" class="card hero-card">
+      <div class="hero-main">
+        <div>
+          <span id="dsDomainBadge" class="badge badge-accent">Loading…</span>
+          <h2 id="dsTitle">Loading staged datasets…</h2>
+          <p id="dsDecoyDesc" class="muted"></p>
+          <div id="dsStatsRow" class="stats-row"></div>
+        </div>
+        <div class="hero-actions">
+          <button id="runDuelBtn" class="btn btn-primary btn-large">
+            ⚡ Run Real vs. Decoy Duel
+          </button>
+          <a id="dsSourceLink" href="#" target="_blank" rel="noopener noreferrer" class="source-link">
+            Dataset Source ↗
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <!-- Side-by-Side Duel Output -->
+    <section id="duelSection" class="card hidden">
+      <div class="section-header">
+        <div>
+          <span class="badge badge-cert">Side-by-Side ARES Proof</span>
+          <h3>Numbers Lie, Multimodal Proof Decides: Real Match vs. Look-Alike Decoy</h3>
+        </div>
+        <button id="closeDuelBtn" class="btn btn-ghost">Close</button>
+      </div>
+      <p class="muted small-margin">
+        Both candidates below scored near the top of the naive tabular SQL trigger—yet one is genuine and the other is a natural false-alarm decoy. Each side ran 3 parallel <code>TRUSTED</code> verifiers via <code>ares.solve()</code>, fused an immutable <code>InvestigationBoard</code> (<code>0.0</code> rebuild drift), and ran 1-board-per-call counterfactual ablations on <code>gemini-decision-1</code>.
+      </p>
+      <div id="duelGrid" class="duel-grid"></div>
+    </section>
+
+    <!-- Main Two-Column Workspace: Left = SQL Magnets & Candidate Gallery; Right = ARES Candidate Inspector -->
+    <div class="workspace-grid">
+      <section class="card">
+        <div class="section-header">
+          <div>
+            <h3>1. Write SQL Magnets Over Parquet (`observations`)</h3>
+            <p class="muted">Filter the tabular haystack with <code>DuckDBBackend</code>; ground-truth labels are hermetically withheld.</p>
+          </div>
+        </div>
+
+        <div id="presetButtons" class="preset-row"></div>
+
+        <div class="sql-editor-box">
+          <textarea id="sqlInput" rows="4" spellcheck="false"></textarea>
+          <div class="sql-bar">
+            <button id="runSqlBtn" class="btn btn-secondary">▶ Run Guarded SQL Magnet</button>
+            <button id="testLeakGuardBtn" class="btn btn-ghost" title="Verify ARES SQL guard blocks reading ground_truth.json">
+              🛡️ Test Label-Leak Guard
+            </button>
+            <span id="sqlMeta" class="mono muted"></span>
+          </div>
+        </div>
+        <div id="sqlErrorBox" class="alert-error hidden"></div>
+
+        <div id="candidateGallery" class="candidate-gallery"></div>
+      </section>
+
+      <section class="card inspector-card">
+        <div class="section-header">
+          <div>
+            <h3>2. ARES Multimodal Board &amp; Counterfactual Probe</h3>
+            <p class="muted">Click any candidate card on the left to run <code>ares.solve()</code> + <code>Decision-1</code> counterfactual ablation.</p>
+          </div>
+        </div>
+        <div id="inspectorBody" class="inspector-empty">
+          Select any candidate from the gallery (or click <strong>⚡ Run Real vs. Decoy Duel</strong> above) to inspect its verified media, <code>CERTIFIED</code> board fields, and counterfactual reliance bars.
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
