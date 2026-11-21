@@ -1,10 +1,10 @@
-"""Gemini 4 Interactions API provider (`gemini-4-hydrogen` and `gemini-4-carbon`).
+"""Backend- and domain-agnostic Gemini 4 Interactions API provider (`gemini-4-hydrogen` and `gemini-4-carbon`).
 
 Implements:
-- Parallel SQL hypothesis proposal (`propose_hypotheses` + stateless ARES `make_propose_processor`)
-- Multimodal fusion board patch synthesis (`propose_board_patch`, attaching up to 3 verifier PNG plots)
+- Parallel hypothesis magnet proposal (`propose_hypotheses` + stateless ARES `make_propose_processor`)
+- Multimodal fusion board patch synthesis (`propose_board_patch`, attaching up to 3 verifier PNG slices)
 - High-VoI follow-up task proposal (`propose_followup_tasks`)
-- Honest single-agent `gemini-4-carbon` read-only SQL baseline (`run_carbon_sql_baseline`)
+- Honest single-agent `gemini-4-carbon` read-only baseline (`run_single_agent_baseline`)
 """
 
 from __future__ import annotations
@@ -14,18 +14,17 @@ import json
 import os
 import re
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Callable
 
-from dotenv import load_dotenv
-from google import genai
 from pydantic import BaseModel, Field
 
 from ares.engine import ProcessorFn, ProcessorResult, TaskSpec
 from contracts import (
     ArtifactRef,
     DecisionQuestion,
-    HypothesisQuerySpec,
+    HypothesisSpec,
     InvestigationBoard,
     Note,
 )
@@ -65,7 +64,6 @@ class ModelTelemetry(BaseModel):
     latency_ms: float = 0.0
 
     def plus(self, other: ModelTelemetry) -> ModelTelemetry:
-        """Return a new ModelTelemetry summing self and other."""
         return ModelTelemetry(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
@@ -103,64 +101,56 @@ def extract_telemetry(resp: Any, latency_ms: float, model_calls: int = 1) -> Mod
     )
 
 
-# ----------------------------------------------------------------------
-# Strict Structured Output Schemas (no untyped dict[str, Any])
-# ----------------------------------------------------------------------
-
-
 class _ProposedHypothesisItem(BaseModel):
-    query_sql: str = Field(
+    query: str = Field(
+        default="",
         description=(
-            "Single read-only DuckDB SELECT or WITH...SELECT SQL query referencing "
-            "registered table view names directly (e.g. service_logs, metrics, traces). "
-            "Never use read_parquet(...) or <data_dir> placeholders."
-        )
+            "Single read-only magnet query/expression obeying the domain's magnet rules "
+            "(or empty string if strictly invoking a deterministic verifier via `params_json`)."
+        ),
+    )
+    params_json: str = Field(
+        default="{}",
+        description="Optional JSON object string of structured parameters for the magnet or verifier.",
     )
     hypothesis_family: str = Field(description="Hypothesis family identifier.")
     expected_signal: str = Field(
-        description="Concise description of the empirical signal or anomaly tested."
+        description="Concise description of the empirical signal or invariant tested."
     )
     target_fields: list[str] = Field(
         default_factory=list,
-        description=(
-            "Target board fields (e.g. logs_retry_spike, metrics_zscore_breach, "
-            "traces_error_cluster, three_way_root_cause)."
-        ),
+        description="Target InvestigationBoard fields informed by this hypothesis.",
     )
     verifier_name: str | None = Field(
         default=None,
         description=(
-            "Exact registered verifier name from available_verifiers when deterministic "
-            "certification applies, or null for exploratory SQL."
+            "Exact registered verifier name from `available_verifiers` when deterministic "
+            "certification applies, or null for exploratory probing."
         ),
     )
 
 
 class _HypothesisProposalEnvelope(BaseModel):
-    queries: list[_ProposedHypothesisItem] = Field(default_factory=list)
+    hypotheses: list[_ProposedHypothesisItem] = Field(default_factory=list)
 
 
 class _FieldUpdateItem(BaseModel):
     field_name: str = Field(
-        description=(
-            "Board field name to create or update (prefer canonical names: "
-            "logs_retry_spike, metrics_zscore_breach, traces_error_cluster, "
-            "three_way_root_cause, fault_type, candidate_remediation)."
-        )
+        description="Board field name to create or update (prefer canonical pivotal field names)."
     )
     value_json: str = Field(
         description=(
-            "Exact value grounded in note evidence/summary, encoded as a plain string "
-            "(e.g. 'payments-db') or JSON literal grounded directly in the cited notes."
+            "Exact value grounded directly in the cited notes' evidence or summary, encoded as a "
+            "plain string or JSON literal."
         )
     )
     sources: list[str] = Field(
         default_factory=list,
-        description="Exact note_id values from the provided notes supporting this field.",
+        description="Exact `note_id` values from the provided notes supporting this field.",
     )
     artifact_ids: list[str] = Field(
         default_factory=list,
-        description="Exact artifact_id values from the cited notes relevant to this field.",
+        description="Exact `artifact_id` values from the cited notes relevant to this field.",
     )
 
 
@@ -172,23 +162,15 @@ class _BoardPatchEnvelope(BaseModel):
     )
 
 
-class _BaselineFinalAnswer(BaseModel):
-    root_cause: str = Field(
-        description="Predicted verified root cause component name, or 'none_verified'."
-    )
-    recommended_action: str = Field(
-        description="Recommended remediation action (e.g. rollback, restart, scale_pool, escalate)."
-    )
-    sufficiently_verified: str = Field(
-        description="'yes' if all three required signals are verified on one component, else 'no'."
-    )
-    confidence: float = Field(
-        description="Calibrated confidence in [0.0, 1.0]."
-    )
-    rationale: str = Field(
-        default="",
-        description="Brief empirical summary of SQL findings.",
-    )
+class _BaselineAnswerEntry(BaseModel):
+    question_id: str = Field(description="Exact `question_id` from DecisionQuestions.")
+    answer: str = Field(description="Selected option from the question's `options`.")
+
+
+class _BaselineFinalEnvelope(BaseModel):
+    answers: list[_BaselineAnswerEntry] = Field(default_factory=list)
+    confidence: float = Field(description="Calibrated overall confidence in [0.0, 1.0].")
+    rationale: str = Field(default="", description="Brief empirical summary of findings.")
 
 
 def _strip_json_fences(raw_text: str) -> str:
@@ -212,8 +194,19 @@ def _parse_value_json(raw: str) -> Any:
         return text
 
 
-def _sanitize_sql(sql: str) -> str:
-    cleaned = (sql or "").strip()
+def _parse_params_json(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _sanitize_query(query: str) -> str:
+    cleaned = (query or "").strip()
     while cleaned.endswith(";"):
         cleaned = cleaned[:-1].rstrip()
     return cleaned
@@ -247,7 +240,6 @@ def _summarize_board_for_prompt(board: InvestigationBoard | str | dict[str, Any]
 
 
 def _collect_png_artifacts(notes: list[Note], max_images: int = 3) -> list[ArtifactRef]:
-    """Collect up to `max_images` existing PNG ArtifactRefs from notes (verifier-produced first)."""
     seen_ids: set[str] = set()
     candidates: list[ArtifactRef] = []
     for note in notes:
@@ -261,7 +253,6 @@ def _collect_png_artifacts(notes: list[Note], max_images: int = 3) -> list[Artif
                 continue
             seen_ids.add(art.artifact_id)
             candidates.append(art)
-    # Prioritize deterministic verifier-produced artifacts first (Multimodal Addendum §1-§2)
     candidates.sort(key=lambda a: (0 if a.produced_by_verifier else 1, a.artifact_id))
     return candidates[:max_images]
 
@@ -284,26 +275,70 @@ class GeminiModelProvider:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            load_dotenv()
+            try:
+                from dotenv import load_dotenv
+
+                load_dotenv()
+            except ImportError:
+                pass
+            from google import genai
+
             key = self._api_key or os.environ.get("GEMINI_API_KEY")
             self._client = genai.Client(api_key=key) if key else genai.Client()
         return self._client
 
+    def _parse_hypothesis_items(
+        self,
+        items: Sequence[_ProposedHypothesisItem],
+        *,
+        cap: int,
+        default_family: str,
+        default_targets: Sequence[str],
+        allowed_verifiers: Sequence[str],
+        requested_under: int,
+    ) -> list[HypothesisSpec]:
+        allowed_set = set(allowed_verifiers)
+        specs: list[HypothesisSpec] = []
+        for item in items[:cap]:
+            q_str = _sanitize_query(item.query)
+            params = _parse_params_json(item.params_json)
+            vname = item.verifier_name
+            if vname in ("", "null", "none", "None"):
+                vname = None
+            if vname is not None and allowed_verifiers and vname not in allowed_set:
+                vname = None
+            if not q_str and vname is None and not params:
+                continue
+            specs.append(
+                HypothesisSpec(
+                    query=q_str,
+                    params=params,
+                    hypothesis_family=item.hypothesis_family or default_family,
+                    expected_signal=item.expected_signal,
+                    target_fields=list(item.target_fields or default_targets),
+                    verifier_name=vname,
+                    requested_under=requested_under,
+                )
+            )
+        return specs
+
     def propose_hypotheses(
         self,
         *,
-        schema_description: str,
+        environment_description: str,
         hypothesis_family: str,
+        magnet_rules: str = "",
+        pivotal_fields: Sequence[str] = (),
         board: InvestigationBoard | None = None,
-        available_verifiers: list[str] | None = None,
+        available_verifiers: Sequence[str] | None = None,
         requested_under: int = 0,
         max_queries: int = 2,
         thinking_level: str = "low",
         board_summary: str | None = None,
-    ) -> tuple[list[HypothesisQuerySpec], ModelTelemetry]:
-        """Use `gemini-4-hydrogen` to propose read-only DuckDB SQL HypothesisQuerySpecs."""
+    ) -> tuple[list[HypothesisSpec], ModelTelemetry]:
+        """Use `gemini-4-hydrogen` to propose structured HypothesisSpecs for a family."""
         cap = max(1, int(max_queries))
-        allowed_verifiers = list(available_verifiers or [])
+        allowed_verifiers = list(available_verifiers or ())
         effective_requested_under = (
             board.board_version if (board is not None and requested_under == 0) else requested_under
         )
@@ -313,27 +348,27 @@ class GeminiModelProvider:
             else _summarize_board_for_prompt(board)
         )
 
+        rules_block = f"\nCRITICAL MAGNET RULES:\n{magnet_rules}\n" if magnet_rules else ""
+        pivotal_block = (
+            f"\nTarget canonical pivotal board fields where applicable: {list(pivotal_fields)}."
+            if pivotal_fields
+            else ""
+        )
         sys_instruction = (
-            "You are an ARES parallel SQL hypothesis worker. "
-            "Emit concise, high-signal, read-only DuckDB SELECT (or WITH ... SELECT) queries "
-            "that test the assigned hypothesis family. "
-            "CRITICAL SQL RULES:\n"
-            "1. Reference table view names directly (e.g. `service_logs`, `metrics`, `traces`). "
-            "NEVER call `read_parquet(...)` and NEVER include `<data_dir>` placeholders.\n"
-            "2. Emit single read-only SELECT/WITH queries only (no semicolons, no DDL/DML).\n"
-            "3. Bound result sets with GROUP BY / ORDER BY / LIMIT <= 50.\n"
-            "4. When a registered deterministic verifier in `available_verifiers` directly tests "
-            "the target signal, bind its exact name in `verifier_name`; otherwise set `verifier_name` to null.\n"
-            "5. Target canonical board fields where applicable: `logs_retry_spike`, "
-            "`metrics_zscore_breach`, `traces_error_cluster`, `three_way_root_cause`."
+            "You are an ARES parallel hypothesis worker (`gemini-4-hydrogen`). "
+            "Emit concise, high-signal, read-only magnet queries and/or deterministic verifier "
+            "bindings that test the assigned hypothesis family without reading raw haystacks."
+            f"{rules_block}"
+            "When a registered deterministic verifier in `available_verifiers` directly tests "
+            "the target signal, bind its exact name in `verifier_name`; otherwise set `verifier_name` to null."
+            f"{pivotal_block}"
         )
         prompt = (
-            f"### Schema Description\n{schema_description}\n\n"
+            f"### Domain Environment\n{environment_description}\n\n"
             f"### Assigned Hypothesis Family\n{hypothesis_family}\n\n"
             f"### Available Trusted Verifiers\n{json.dumps(allowed_verifiers)}\n\n"
             f"### Current Investigation Board\n{board_text}\n\n"
-            f"Propose up to {cap} distinct read-only DuckDB SQL hypothesis queries for family "
-            f"'{hypothesis_family}'."
+            f"Propose up to {cap} distinct hypothesis magnets for family '{hypothesis_family}'."
         )
 
         client = self._get_client()
@@ -355,45 +390,35 @@ class GeminiModelProvider:
 
         raw_text = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
         envelope = _HypothesisProposalEnvelope.model_validate_json(raw_text)
-
-        allowed_set = set(allowed_verifiers)
-        specs: list[HypothesisQuerySpec] = []
-        for item in envelope.queries[:cap]:
-            sql = _sanitize_sql(item.query_sql)
-            if not sql:
-                continue
-            vname = item.verifier_name
-            if vname in ("", "null", "none", "None"):
-                vname = None
-            if vname is not None and allowed_verifiers and vname not in allowed_set:
-                vname = None
-            specs.append(
-                HypothesisQuerySpec(
-                    query_sql=sql,
-                    hypothesis_family=item.hypothesis_family or hypothesis_family,
-                    expected_signal=item.expected_signal,
-                    target_fields=list(item.target_fields),
-                    verifier_name=vname,
-                    requested_under=effective_requested_under,
-                )
-            )
+        specs = self._parse_hypothesis_items(
+            envelope.hypotheses,
+            cap=cap,
+            default_family=hypothesis_family,
+            default_targets=(),
+            allowed_verifiers=allowed_verifiers,
+            requested_under=effective_requested_under,
+        )
         return specs, telemetry
 
     def make_propose_processor(
         self,
         *,
-        schema_description: str,
-        available_verifiers: list[str] | None = None,
+        environment_description: str,
+        magnet_rules: str = "",
+        pivotal_fields: Sequence[str] = (),
+        available_verifiers: Sequence[str] | None = None,
     ) -> ProcessorFn:
         """Build a stateless ARES ProcessorFn wrapping `propose_hypotheses`."""
 
         def _processor(spec: TaskSpec, dep_outputs: dict[str, Any]) -> ProcessorResult:
-            del dep_outputs  # Stateless proposal from TaskSpec.context
+            del dep_outputs
             ctx = spec.context or {}
             family = str(ctx.get("hypothesis_family", "general_exploration"))
             max_queries = int(ctx.get("max_queries", 2))
             thinking_level = str(ctx.get("thinking_level", "low"))
-            schema = str(ctx.get("schema_description", schema_description))
+            env_desc = str(ctx.get("environment_description", environment_description))
+            rules = str(ctx.get("magnet_rules", magnet_rules))
+            piv_fields = ctx.get("pivotal_fields", pivotal_fields)
             verifiers = ctx.get("available_verifiers", available_verifiers)
 
             raw_board = ctx.get("board")
@@ -407,8 +432,10 @@ class GeminiModelProvider:
                 board_summary = raw_board
 
             specs, telemetry = self.propose_hypotheses(
-                schema_description=schema,
+                environment_description=env_desc,
                 hypothesis_family=family,
+                magnet_rules=rules,
+                pivotal_fields=piv_fields,
                 board=board_obj,
                 available_verifiers=verifiers,
                 requested_under=spec.requested_under,
@@ -430,7 +457,8 @@ class GeminiModelProvider:
         *,
         board: InvestigationBoard,
         new_notes: list[Note],
-        schema_description: str = "",
+        environment_description: str = "",
+        pivotal_fields: Sequence[str] = (),
         include_images: bool = True,
         thinking_level: str = "medium",
     ) -> tuple[dict[str, Any], ModelTelemetry]:
@@ -457,30 +485,23 @@ class GeminiModelProvider:
             valid_note_ids.update(existing_field.sources)
             valid_artifact_ids.update(existing_field.artifact_ids)
 
+        pivotal_hint = (
+            f"1. Populate canonical pivotal fields {list(pivotal_fields)} whenever supported by note evidence "
+            "(if a verifier returned 0 candidates / UNCERTIFIED, do NOT claim a candidate passed).\n"
+            if pivotal_fields
+            else "1. Populate concise, informative board field names grounded in note evidence.\n"
+        )
         sys_instruction = (
             "You are the ARES Fusion Synthesis Engine (`gemini-4-carbon`). "
-            "Synthesize new immutable evidence notes (and any attached verifier PNG plots) "
+            "Synthesize new immutable evidence notes (and any attached verifier PNG artifacts) "
             "into a strictly grounded patch for the bounded InvestigationBoard.\n"
             "CRITICAL INVARIANTS:\n"
-            "1. Populate canonical pivotal fields whenever supported by note evidence:\n"
-            "   - `logs_retry_spike`: service name (e.g. 'payments-db') with CERTIFIED/observed "
-            "upstream ERROR retry spike (`verify_upstream_retry_spike` or `service_logs` notes). "
-            "If a verifier returned 0 candidates (`UNCERTIFIED`), do NOT claim a service passed.\n"
-            "   - `metrics_zscore_breach`: service name with metric z-score >= 4.0 breach "
-            "(`verify_metric_zscore_breach` or `metrics` notes).\n"
-            "   - `traces_error_cluster`: service name with >= 12 ERROR trace spans >= 800ms "
-            "(`verify_trace_error_cluster` or `traces` notes).\n"
-            "   - `three_way_root_cause`: verified root cause service from `verify_three_way_root_cause` "
-            "when `certification == 'CERTIFIED'` and `verified_root_causes` is non-empty "
-            "(or 'none_verified' if `verify_three_way_root_cause` ran and found 0 candidates).\n"
-            "   - `fault_type`: grounded fault signature when supported by notes.\n"
-            "   - `candidate_remediation`: grounded remediation ('rollback', 'restart', 'scale_pool', "
-            "or 'escalate') when supported by notes.\n"
+            f"{pivotal_hint}"
             "2. Prefer CERTIFIED verifier notes over UNCERTIFIED exploratory notes when citing `sources`, "
             "because citing any UNCERTIFIED note taints a field as uncertified.\n"
             "3. ONLY cite exact `note_id` strings from the provided notes/board, and ONLY attach "
             "exact `artifact_id` strings from those notes.\n"
-            "4. NEVER invent service names, counts, or values—every `value_json` must be grounded "
+            "4. NEVER invent entities, counts, or values—every `value_json` must be grounded "
             "strictly in the cited notes' `evidence` or `summary`."
         )
 
@@ -490,7 +511,7 @@ class GeminiModelProvider:
             for a in png_artifacts
         ]
         prompt_str = (
-            f"### Domain Schema\n{schema_description or '(not provided)'}\n\n"
+            f"### Domain Environment\n{environment_description or '(not provided)'}\n\n"
             f"### Current InvestigationBoard\n{_summarize_board_for_prompt(board)}\n\n"
             f"### New Immutable Evidence Notes\n{json.dumps(notes_payload, indent=2, default=str)}\n\n"
             f"### Attached Verifier PNG Artifacts\n{json.dumps(artifact_manifest)}\n\n"
@@ -546,46 +567,40 @@ class GeminiModelProvider:
                 "artifact_ids": filtered_artifacts,
             }
 
-        patch = {
+        return {
             "updates": updates_dict,
             "rationale": envelope.rationale,
-        }
-        return patch, telemetry
+        }, telemetry
 
     def propose_followup_tasks(
         self,
         *,
         board: InvestigationBoard,
         high_voi_fields: list[str],
-        schema_description: str,
-        available_verifiers: list[str] | None = None,
+        environment_description: str,
+        magnet_rules: str = "",
+        available_verifiers: Sequence[str] | None = None,
         max_queries: int = 3,
         thinking_level: str = "low",
-    ) -> tuple[list[HypothesisQuerySpec], ModelTelemetry]:
-        """Use `gemini-4-carbon` to propose targeted follow-up SQL/verifier tasks for high-VoI gaps."""
+    ) -> tuple[list[HypothesisSpec], ModelTelemetry]:
+        """Use `gemini-4-carbon` to propose targeted follow-up magnets/verifiers for high-VoI gaps."""
         cap = max(1, int(max_queries))
-        allowed_verifiers = list(available_verifiers or [])
+        allowed_verifiers = list(available_verifiers or ())
+        rules_block = f"\nCRITICAL MAGNET RULES:\n{magnet_rules}\n" if magnet_rules else ""
 
         sys_instruction = (
             "You are the ARES Follow-Up Acquisition Planner (`gemini-4-carbon`). "
-            "Inspect the current InvestigationBoard and propose targeted read-only DuckDB SQL "
-            "queries (and deterministic verifier bindings from `available_verifiers`) that resolve "
-            "high-VoI unknown or uncertified fields.\n"
-            "CRITICAL RULES:\n"
-            "1. Reference table view names directly (`service_logs`, `metrics`, `traces`) — "
-            "NEVER use `read_parquet(...)` or `<data_dir>`.\n"
-            "2. Bind `verifier_name` to an exact entry from `available_verifiers` whenever certifying "
-            "`logs_retry_spike` (`verify_upstream_retry_spike`), `metrics_zscore_breach` "
-            "(`verify_metric_zscore_breach`), `traces_error_cluster` (`verify_trace_error_cluster`), "
-            "or `three_way_root_cause` (`verify_three_way_root_cause`).\n"
-            "3. Emit single read-only SELECT/WITH queries without semicolons."
+            "Inspect the current InvestigationBoard and propose targeted read-only magnet queries "
+            "and deterministic verifier bindings from `available_verifiers` that resolve high-VoI "
+            "unknown or uncertified fields."
+            f"{rules_block}"
         )
         prompt = (
-            f"### Schema Description\n{schema_description}\n\n"
+            f"### Domain Environment\n{environment_description}\n\n"
             f"### Available Trusted Verifiers\n{json.dumps(allowed_verifiers)}\n\n"
             f"### High-VoI / Uncertified Target Fields\n{json.dumps(high_voi_fields)}\n\n"
             f"### Current InvestigationBoard\n{_summarize_board_for_prompt(board)}\n\n"
-            f"Propose up to {cap} targeted follow-up HypothesisQuerySpecs."
+            f"Propose up to {cap} targeted follow-up HypothesisSpecs."
         )
 
         client = self._get_client()
@@ -607,81 +622,62 @@ class GeminiModelProvider:
 
         raw_text = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
         envelope = _HypothesisProposalEnvelope.model_validate_json(raw_text)
-
-        allowed_set = set(allowed_verifiers)
-        specs: list[HypothesisQuerySpec] = []
-        for item in envelope.queries[:cap]:
-            sql = _sanitize_sql(item.query_sql)
-            if not sql:
-                continue
-            vname = item.verifier_name
-            if vname in ("", "null", "none", "None"):
-                vname = None
-            if vname is not None and allowed_verifiers and vname not in allowed_set:
-                vname = None
-            specs.append(
-                HypothesisQuerySpec(
-                    query_sql=sql,
-                    hypothesis_family=item.hypothesis_family or "followup_voi_acquisition",
-                    expected_signal=item.expected_signal,
-                    target_fields=list(item.target_fields or high_voi_fields),
-                    verifier_name=vname,
-                    requested_under=board.board_version,
-                )
-            )
+        specs = self._parse_hypothesis_items(
+            envelope.hypotheses,
+            cap=cap,
+            default_family="followup_voi_acquisition",
+            default_targets=high_voi_fields,
+            allowed_verifiers=allowed_verifiers,
+            requested_under=board.board_version,
+        )
         return specs, telemetry
 
-    def run_carbon_sql_baseline(
+    def run_single_agent_baseline(
         self,
         *,
-        schema_description: str,
-        decision_questions: list[DecisionQuestion],
-        sql_executor: Callable[[str], dict[str, Any]],
+        environment_description: str,
+        decision_questions: Sequence[DecisionQuestion],
+        query_executor: Callable[[str], dict[str, Any]],
+        magnet_rules: str = "",
+        tool_name: str = "execute_readonly_query",
+        tool_description: str = (
+            "Execute a read-only magnet query against the domain environment and return structured results."
+        ),
         max_queries: int = 12,
         timeout_seconds: float = 180.0,
         thinking_level: str = "medium",
     ) -> dict[str, Any]:
-        """Run an honest single-agent `gemini-4-carbon` read-only SQL baseline with stateless tools."""
-        sql_tool = {
+        """Run an honest single-agent `gemini-4-carbon` baseline using identical read-only query tools."""
+        query_tool = {
             "type": "function",
-            "name": "execute_readonly_sql",
-            "description": (
-                "Execute a read-only DuckDB SELECT/WITH query over table views "
-                "(service_logs, metrics, traces) and return columns, rows, and row_count."
-            ),
+            "name": tool_name,
+            "description": tool_description,
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "sql": {
+                    "query": {
                         "type": "string",
-                        "description": (
-                            "Single read-only DuckDB SELECT/WITH query referencing view names "
-                            "directly (never read_parquet or <data_dir>)."
-                        ),
+                        "description": "Single read-only query/expression obeying the domain magnet rules.",
                     }
                 },
-                "required": ["sql"],
+                "required": ["query"],
             },
         }
 
         questions_desc = [q.model_dump() for q in decision_questions]
+        rules_block = f"\n{magnet_rules}\n" if magnet_rules else ""
         sys_instruction = (
-            "You are a senior SRE incident investigator with access to `execute_readonly_sql`. "
-            "Query the DuckDB views (`service_logs`, `metrics`, `traces`) directly—never use "
-            "`read_parquet(...)` or `<data_dir>`. "
-            f"You may execute at most {max_queries} SQL queries. "
-            "Check all three required signals (upstream ERROR retries, metric z-score >= 4.0 breaches, "
-            "and correlated ERROR trace spans >= 800ms on shared trace_ids) before concluding. "
-            "If any signal is missing for all candidate services, conclude root_cause='none_verified', "
-            "recommended_action='escalate', sufficiently_verified='no'. "
-            "When finished, respond with a JSON object containing keys: "
-            "`root_cause`, `recommended_action`, `sufficiently_verified` ('yes'|'no'), "
-            "`confidence` (0.0..1.0), and `rationale`."
+            f"You are an expert investigator with access to `{tool_name}`.{rules_block}"
+            f"You may execute at most {max_queries} queries. "
+            "Verify all required independent signals before selecting a confident target; if any "
+            "required corroborating signal is missing, select the abstention/unverified option. "
+            "When finished, respond with a JSON object matching `{answers: [{question_id, answer}], "
+            "confidence, rationale}`."
         )
         initial_prompt = (
-            f"### Schema Description\n{schema_description}\n\n"
+            f"### Domain Environment\n{environment_description}\n\n"
             f"### Decision Questions\n{json.dumps(questions_desc, indent=2)}\n\n"
-            "Investigate the incident using `execute_readonly_sql` and output your final JSON answer."
+            f"Investigate using `{tool_name}` and output your final JSON answer."
         )
 
         history: list[dict[str, Any]] = [
@@ -708,7 +704,7 @@ class GeminiModelProvider:
                 store=False,
                 input=history,
                 system_instruction=sys_instruction,
-                tools=[sql_tool],
+                tools=[query_tool],
                 generation_config={"thinking_level": norm_thinking},
             )
             latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -719,8 +715,7 @@ class GeminiModelProvider:
             for step in steps:
                 dumped = step.model_dump() if hasattr(step, "model_dump") else dict(step)
                 history.append(dumped)
-                stype = dumped.get("type")
-                if stype == "function_call":
+                if dumped.get("type") == "function_call":
                     fc_steps.append(step)
 
             if not fc_steps:
@@ -742,7 +737,7 @@ class GeminiModelProvider:
                 else:
                     args_dict = dict(raw_args or {})
 
-                if fc_name != "execute_readonly_sql":
+                if fc_name != tool_name:
                     res_payload: dict[str, Any] = {"error": f"Unsupported tool: {fc_name}"}
                 elif len(queries_executed) >= max_queries or time.perf_counter() >= deadline:
                     budget_exhausted = True
@@ -753,10 +748,12 @@ class GeminiModelProvider:
                         )
                     }
                 else:
-                    sql_str = _sanitize_sql(str(args_dict.get("sql", "")))
-                    queries_executed.append(sql_str)
+                    q_str = _sanitize_query(
+                        str(args_dict.get("query", args_dict.get("sql", "")))
+                    )
+                    queries_executed.append(q_str)
                     try:
-                        res_payload = sql_executor(sql_str)
+                        res_payload = query_executor(q_str)
                     except Exception as exc:
                         res_payload = {"error": str(exc)}
 
@@ -779,7 +776,7 @@ class GeminiModelProvider:
                             {
                                 "type": "text",
                                 "text": (
-                                    "SQL query budget is exhausted. Provide your final JSON "
+                                    "Query budget is exhausted. Provide your final JSON "
                                     "decision now without calling tools."
                                 ),
                             }
@@ -792,11 +789,11 @@ class GeminiModelProvider:
                     store=False,
                     input=history,
                     system_instruction=sys_instruction,
-                    tools=[sql_tool],
+                    tools=[query_tool],
                     response_format={
                         "type": "text",
                         "mime_type": "application/json",
-                        "schema": _BaselineFinalAnswer.model_json_schema(),
+                        "schema": _BaselineFinalEnvelope.model_json_schema(),
                     },
                     generation_config={"thinking_level": norm_thinking},
                 )
@@ -805,57 +802,42 @@ class GeminiModelProvider:
                 final_text = getattr(synth, "output_text", "") or ""
                 break
 
-        parsed_answer = self._parse_baseline_answer(final_text)
+        answers_by_qid: dict[str, str] = {
+            q.question_id: (q.options[-1] if q.options else "unknown")
+            for q in decision_questions
+        }
+        conf_val = 0.0
+        rationale_val = ""
+
+        cleaned_final = _strip_json_fences(final_text)
+        if cleaned_final:
+            try:
+                raw_json = json.loads(cleaned_final)
+                if isinstance(raw_json, dict):
+                    if isinstance(raw_json.get("answers"), list):
+                        env = _BaselineFinalEnvelope.model_validate(raw_json)
+                        for entry in env.answers:
+                            if entry.question_id in answers_by_qid:
+                                answers_by_qid[entry.question_id] = entry.answer
+                        conf_val = float(env.confidence)
+                        rationale_val = env.rationale
+                    else:
+                        for q in decision_questions:
+                            if q.question_id in raw_json:
+                                answers_by_qid[q.question_id] = str(raw_json[q.question_id])
+                        conf_val = float(raw_json.get("confidence", 0.0))
+                        rationale_val = str(raw_json.get("rationale", ""))
+            except Exception:
+                rationale_val = cleaned_final[:500]
+
         return {
-            "root_cause": parsed_answer.root_cause,
-            "recommended_action": parsed_answer.recommended_action,
-            "sufficiently_verified": parsed_answer.sufficiently_verified,
-            "confidence": max(0.0, min(1.0, float(parsed_answer.confidence))),
-            "rationale": parsed_answer.rationale,
-            "answers": {
-                "root_cause": parsed_answer.root_cause,
-                "recommended_action": parsed_answer.recommended_action,
-                "sufficiently_verified": parsed_answer.sufficiently_verified,
-            },
-            "queries_executed": queries_executed,
+            "answers": answers_by_qid,
+            "confidence": max(0.0, min(1.0, conf_val)),
+            "rationale": rationale_val,
             "query_count": len(queries_executed),
+            "queries_executed": queries_executed,
             "telemetry": total_telemetry,
         }
-
-    @staticmethod
-    def _parse_baseline_answer(raw_text: str) -> _BaselineFinalAnswer:
-        cleaned = _strip_json_fences(raw_text)
-        if cleaned:
-            # Try direct JSON parse, or extract first {...} JSON object from prose
-            candidates = [cleaned]
-            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-            if match and match.group(0) != cleaned:
-                candidates.append(match.group(0))
-            for cand in candidates:
-                try:
-                    data = json.loads(cand)
-                    if isinstance(data, dict):
-                        ver_raw = data.get("sufficiently_verified", "no")
-                        if isinstance(ver_raw, bool):
-                            ver_str = "yes" if ver_raw else "no"
-                        else:
-                            ver_str = "yes" if str(ver_raw).strip().lower() in ("yes", "true") else "no"
-                        return _BaselineFinalAnswer(
-                            root_cause=str(data.get("root_cause", "none_verified")),
-                            recommended_action=str(data.get("recommended_action", "escalate")),
-                            sufficiently_verified=ver_str,
-                            confidence=float(data.get("confidence", 0.0)),
-                            rationale=str(data.get("rationale", "")),
-                        )
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    continue
-        return _BaselineFinalAnswer(
-            root_cause="none_verified",
-            recommended_action="escalate",
-            sufficiently_verified="no",
-            confidence=0.0,
-            rationale=raw_text or "Timed out or unparseable baseline output.",
-        )
 
 
 __all__ = [

@@ -1,4 +1,4 @@
-"""Pytest suite for Agent A1: MicroBenchDomain, Parquet generation, planting,
+"""Pytest suite for `MicroBenchDomain`: Parquet generation, planting,
 ground-truth isolation, deterministic DuckDB verifiers, and scoring.
 """
 
@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from contracts import ArtifactRef, BoardField, Domain, InMemoryVerifierRegistry, Note
-from domain.micro_bench import MicroBenchDomain, SERVICES
+from domain.micro_bench import SERVICES, MicroBenchDomain
 
 
 @pytest.fixture(scope="module")
@@ -44,9 +44,21 @@ def test_domain_protocol_conformance(domain: MicroBenchDomain) -> None:
     questions = domain.decision_questions()
     q_ids = {q.question_id for q in questions}
     assert {"root_cause", "recommended_action", "sufficiently_verified"} <= q_ids
-    assert "service_logs" in domain.schema_description()
-    assert "metrics" in domain.schema_description()
-    assert "traces" in domain.schema_description()
+    assert "service_logs" in domain.environment_description()
+    assert "metrics" in domain.environment_description()
+    assert "traces" in domain.environment_description()
+    assert "SELECT" in domain.magnet_rules()
+    assert domain.pivotal_fields() == [
+        "logs_retry_spike",
+        "metrics_zscore_breach",
+        "traces_error_cluster",
+        "three_way_root_cause",
+    ]
+    assert domain.required_signal_fields() == (
+        "logs_retry_spike",
+        "metrics_zscore_breach",
+        "traces_error_cluster",
+    )
 
 
 def test_needle_menu_structure(domain: MicroBenchDomain) -> None:
@@ -60,10 +72,10 @@ def test_needle_menu_structure(domain: MicroBenchDomain) -> None:
 
     for n in menu:
         if n.category == "look_alike_decoy":
-            assert n.decoy_service is not None
-            assert n.decoy_service != n.service
+            assert n.decoy_entity is not None
+            assert n.decoy_entity != n.target_entity
         if n.category == "under_determined":
-            assert n.missing_clue in ("logs", "metrics", "traces")
+            assert n.missing_signal in ("logs", "metrics", "traces")
 
 
 def test_deterministic_generation_and_row_scale(tmp_path: Path, domain: MicroBenchDomain) -> None:
@@ -83,7 +95,6 @@ def test_deterministic_generation_and_row_scale(tmp_path: Path, domain: MicroBen
             assert _sha256_file(fa) == _sha256_file(fb)
             total_rows += pq.read_metadata(fa).num_rows
 
-    # Plan Stage 1 target: ~100K-250K rows across Parquet shards
     assert 100_000 <= total_rows <= 250_000
 
 
@@ -110,7 +121,6 @@ def test_background_haystack_isolation_and_scan_speed(
     elapsed = time.perf_counter() - t0
     con.close()
 
-    # DuckDB Parquet scan across all 4 verifiers should be well under 2 seconds
     assert elapsed < 2.0, f"DuckDB scan too slow: {elapsed:.2f}s"
 
 
@@ -121,7 +131,7 @@ def test_no_ground_truth_leakage_in_schema_or_filenames(
 ) -> None:
     case_dir = tmp_path / "leak_check"
     _copy_haystack(base_haystack_dir, case_dir)
-    needle = domain.needle_menu()[3]  # look_alike_decoy
+    needle = domain.needle_menu()[3]
     truth = domain.plant(str(case_dir), needle)
 
     forbidden_tokens = ("needle", "decoy", "truth", "label", needle.case_id)
@@ -135,7 +145,6 @@ def test_no_ground_truth_leakage_in_schema_or_filenames(
                 for tok in forbidden_tokens:
                     assert tok.lower() not in col.lower(), f"Column leaked token {tok}: {col}"
 
-    # Verify trace_ids and messages do not contain leakage markers
     con = duckdb.connect(":memory:")
     leaked_logs = con.execute(
         f"""
@@ -148,7 +157,7 @@ def test_no_ground_truth_leakage_in_schema_or_filenames(
     ).fetchone()[0]
     con.close()
     assert leaked_logs == 0
-    assert len(truth.planted_files) > 0
+    assert len(truth.planted_artifacts) > 0
 
 
 def test_plant_appends_shards_without_modifying_background(
@@ -173,8 +182,8 @@ def test_plant_appends_shards_without_modifying_background(
         assert _sha256_file(case_dir / rel_path) == old_hash
 
     new_files = after_files - set(before_hashes.keys())
-    assert len(new_files) == 3  # 1 appended shard per table
-    assert len(truth.planted_files) == 3
+    assert len(new_files) == 3
+    assert len(truth.planted_artifacts) == 3
 
 
 @pytest.mark.parametrize("case_idx", range(9))
@@ -207,15 +216,14 @@ def test_all_nine_micro_bench_cases_ground_truth_isolation(
         assert res_traces.passed is True
         assert res_3way.passed is True
         assert res_3way.certification == "CERTIFIED"
-        assert res_3way.evidence["verified_root_causes"] == [truth.root_cause_component]
-        assert res_3way.evidence["candidates"][0]["shard_id"] == truth.shard_id
+        assert res_3way.evidence["verified_root_causes"] == [truth.primary_target]
+        assert res_3way.evidence["candidates"][0]["shard_id"] == truth.metadata["shard_id"]
 
     elif needle.category == "look_alike_decoy":
         assert truth.is_sufficiently_verified is True
         assert truth.expected_status == "CERTIFIED"
-        assert truth.decoy_component is not None
+        assert truth.decoy_target is not None
 
-        # Decoy should appear in 2 of the 3 single-signal verifiers with HIGHER volume
         decoy_signals = 0
         for res, count_key in (
             (res_logs, "distinct_traces"),
@@ -223,33 +231,30 @@ def test_all_nine_micro_bench_cases_ground_truth_isolation(
             (res_traces, "distinct_traces"),
         ):
             by_svc = {c["service"]: c[count_key] for c in res.evidence["candidates"]}
-            if truth.decoy_component in by_svc:
+            if truth.decoy_target in by_svc:
                 decoy_signals += 1
                 if count_key == "distinct_traces":
-                    assert by_svc[truth.decoy_component] > by_svc[truth.root_cause_component]
+                    assert by_svc[truth.decoy_target] > by_svc[truth.primary_target]
         assert decoy_signals == 2
 
-        # Compound 3-way verifier must reject decoy and certify ONLY true root cause
         assert res_3way.passed is True
         assert res_3way.certification == "CERTIFIED"
-        assert res_3way.evidence["verified_root_causes"] == [truth.root_cause_component]
-        assert truth.decoy_component not in res_3way.evidence["verified_root_causes"]
+        assert res_3way.evidence["verified_root_causes"] == [truth.primary_target]
+        assert truth.decoy_target not in res_3way.evidence["verified_root_causes"]
 
     elif needle.category == "under_determined":
         assert truth.is_sufficiently_verified is False
         assert truth.expected_status == "UNCERTIFIED"
-        assert truth.root_cause_component is None
+        assert truth.primary_target is None
 
-        # Exactly 2 of 3 single signals pass; the missing clue fails
         signal_map = {
             "logs": res_logs.passed,
             "metrics": res_metrics.passed,
             "traces": res_traces.passed,
         }
         assert sum(signal_map.values()) == 2
-        assert signal_map[needle.missing_clue] is False
+        assert signal_map[needle.missing_signal] is False
 
-        # Compound 3-way verifier MUST NOT certify
         assert res_3way.passed is False
         assert res_3way.certification == "UNCERTIFIED"
         assert res_3way.evidence["verified_root_causes"] == []
@@ -260,26 +265,26 @@ def test_score_certified_decoy_and_under_determined(
     base_haystack_dir: Path,
     domain: MicroBenchDomain,
 ) -> None:
-    # 1. Correct certified decision on look_alike_decoy
     decoy_needle = domain.needle_menu()[3]
     case_dir = tmp_path / "score_decoy"
     _copy_haystack(base_haystack_dir, case_dir)
     truth_decoy = domain.plant(str(case_dir), decoy_needle)
+    exp_action = truth_decoy.expected_decisions["recommended_action"]
 
     good_board = {
         "board_version": 5,
         "decision": {
             "question_id": "root_cause",
             "question": "Which component is the verified root cause?",
-            "answer": truth_decoy.root_cause_component,
+            "answer": truth_decoy.primary_target,
             "confidence": 0.93,
             "certified_influence_share": 0.92,
             "uncertified_influence_share": 0.08,
             "unknown_voi_max": 0.05,
         },
         "decisions": {
-            "root_cause": {"answer": truth_decoy.root_cause_component},
-            "recommended_action": {"answer": truth_decoy.recommended_action},
+            "root_cause": {"answer": truth_decoy.primary_target},
+            "recommended_action": {"answer": exp_action},
             "sufficiently_verified": {"answer": "yes"},
         },
         "fields": {
@@ -297,12 +302,11 @@ def test_score_certified_decoy_and_under_determined(
     assert s_good["pivotal_influence_mean"] > s_good["distractor_influence_mean"]
     assert s_good["candidate_narrowing"] == pytest.approx(1.0 - 1.0 / len(SERVICES), abs=1e-3)
 
-    # 2. Falling for the decoy
     decoy_trap_board = {
         "board_version": 5,
         "decision": {
             "question_id": "root_cause",
-            "answer": truth_decoy.decoy_component,
+            "answer": truth_decoy.decoy_target,
             "confidence": 0.91,
             "certified_influence_share": 0.90,
             "uncertified_influence_share": 0.10,
@@ -314,7 +318,6 @@ def test_score_certified_decoy_and_under_determined(
     assert s_trap["decoy_avoided"] is False
     assert s_trap["overall_pass"] is False
 
-    # 3. Under-determined case: false certainty vs honest UNCERTIFIED
     ud_needle = domain.needle_menu()[6]
     ud_dir = tmp_path / "score_ud"
     _copy_haystack(base_haystack_dir, ud_dir)
@@ -324,14 +327,14 @@ def test_score_certified_decoy_and_under_determined(
         "board_version": 4,
         "decision": {
             "question_id": "root_cause",
-            "answer": ud_needle.service,
+            "answer": ud_needle.target_entity,
             "confidence": 0.92,
             "certified_influence_share": 0.90,
             "uncertified_influence_share": 0.10,
             "unknown_voi_max": 0.05,
         },
         "decisions": {
-            "root_cause": {"answer": ud_needle.service},
+            "root_cause": {"answer": ud_needle.target_entity},
             "recommended_action": {"answer": "rollback"},
             "sufficiently_verified": {"answer": "yes"},
         },
@@ -395,7 +398,6 @@ def test_deterministic_candidate_slice_plot_and_verifier_artifacts(
     base_haystack_dir: Path,
     domain: MicroBenchDomain,
 ) -> None:
-    # 1. Surviving candidate on look_alike_decoy case produces deterministic PNG artifact
     decoy_needle = domain.needle_menu()[3]
     case_dir = tmp_path / "plot_decoy_case"
     _copy_haystack(base_haystack_dir, case_dir)
@@ -428,14 +430,11 @@ def test_deterministic_candidate_slice_plot_and_verifier_artifacts(
     raw = png_path.read_bytes()
     assert raw[:8] == b"\x89PNG\r\n\x1a\n"
     assert hashlib.sha256(raw).hexdigest() == art1.sha256
-    # Compact size per I7
     assert len(raw) < 200_000
-    # No ground-truth leakage in filename
     assert "needle" not in png_path.name.lower()
     assert "decoy" not in png_path.name.lower()
-    assert truth.root_cause_component in png_path.name
+    assert truth.primary_target in png_path.name
 
-    # 2. Under-determined case produces 0 verifier artifacts
     ud_needle = domain.needle_menu()[6]
     ud_dir = tmp_path / "plot_ud_case"
     _copy_haystack(base_haystack_dir, ud_dir)
@@ -445,4 +444,3 @@ def test_deterministic_candidate_slice_plot_and_verifier_artifacts(
     con.close()
     assert res_ud.passed is False
     assert res_ud.artifacts == []
-

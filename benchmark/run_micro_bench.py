@@ -1,15 +1,11 @@
 """Stage 1 9-Case Micro-Benchmark Runner & Go/No-Go Gate Evaluator (ARES Plan §7).
 
-Generates a base `MicroBenchDomain` haystack once, isolates each of the 9 cases
-(`3x multi_clue_join`, `3x look_alike_decoy`, `3x under_determined`), plants the
-needle shard, and evaluates:
+Generates a base `Domain` haystack once, isolates each benchmark case, plants the
+needle, and evaluates:
   a) ARES (`run_investigation_loop`)
-  b) Honest Single-Agent SQL Baseline (`GeminiModelProvider.run_carbon_sql_baseline`)
-under identical DuckDB read-only views, schema descriptions, decision questions,
-and wall-clock budgets.
-
-Writes structured per-case + aggregate comparison results to:
-  `benchmark/results/micro_bench_stage1.json`
+  b) Honest Single-Agent Baseline (`GeminiModelProvider.run_single_agent_baseline`)
+under identical read-only `ExecutionBackend` guards, environment descriptions,
+decision questions, and wall-clock budgets.
 """
 
 from __future__ import annotations
@@ -24,10 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-
-from ares.duckdb_runner import DuckDBTrustedRunner
-from contracts import Domain, GroundTruth, NeedleSpec
+from contracts import DecisionQuestion, Domain, GroundTruth, NeedleSpec
 from domain.micro_bench import MicroBenchDomain
 from fusion.loop import LoopConfig, LoopRunResult, run_investigation_loop
 from models.decision_probe import DecisionProbeClient
@@ -37,54 +30,63 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RESULTS_PATH = REPO_ROOT / "benchmark" / "results" / "micro_bench_stage1.json"
 DEFAULT_ARTIFACTS_ROOT = REPO_ROOT / "benchmark" / "results" / "artifacts"
 
+_ABSTAIN_ANSWERS: frozenset[str] = frozenset(
+    {"none_verified", "insufficient_evidence", "unknown", "abstain", "none", ""}
+)
 
-def build_baseline_board_for_scoring(baseline_res: dict[str, Any]) -> dict[str, Any]:
-    """Construct a fair board dict from `run_carbon_sql_baseline` output for `domain.score()`.
 
-    When the baseline claims `sufficiently_verified == 'yes'` and selects a concrete
-    `root_cause` component (not `'none_verified'` or `'unknown'`), sets
-    `uncertified_influence_share = 0.0` and `unknown_voi_max = 0.0` so `domain.score()`:
-    - fairly credits `board_certified = True` when confident & right on verified needles, and
-    - fairly flags `false_certainty = True` when claiming `'yes'` on under-determined cases.
-    """
-    rc = str(baseline_res.get("root_cause", "none_verified"))
-    action = str(baseline_res.get("recommended_action", "escalate"))
-    suff = str(baseline_res.get("sufficiently_verified", "no")).strip().lower()
-    suff_norm = "yes" if suff in ("yes", "true") else "no"
+def build_baseline_board_for_scoring(
+    baseline_res: dict[str, Any],
+    decision_questions: list[DecisionQuestion] | None = None,
+) -> dict[str, Any]:
+    """Construct a fair board dict from `run_single_agent_baseline` output for `domain.score()`."""
+    answers_map: dict[str, str] = dict(baseline_res.get("answers", {}))
+    for k in ("root_cause", "recommended_action", "sufficiently_verified"):
+        if k not in answers_map and k in baseline_res:
+            answers_map[k] = str(baseline_res[k])
+
+    primary_qid = (
+        decision_questions[0].question_id
+        if decision_questions
+        else next(iter(answers_map.keys()), "root_cause")
+    )
+    primary_qtext = (
+        decision_questions[0].question
+        if decision_questions
+        else "What is the verified conclusion?"
+    )
+
+    primary_ans = str(answers_map.get(primary_qid, "none_verified"))
+    suff_raw = str(answers_map.get("sufficiently_verified", "no")).strip().lower()
+    suff_norm = "yes" if suff_raw in ("yes", "true") else "no"
+    answers_map["sufficiently_verified"] = suff_norm
     conf = max(0.0, min(1.0, float(baseline_res.get("confidence", 0.0))))
 
-    claims_verified = suff_norm == "yes" and rc not in ("none_verified", "unknown", "")
+    claims_verified = suff_norm == "yes" and primary_ans.lower() not in _ABSTAIN_ANSWERS
     uncert_share = 0.0 if claims_verified else 1.0
     unk_voi = 0.0 if claims_verified else 1.0
+
+    decisions_dict = {
+        qid: {
+            "question_id": qid,
+            "answer": ans,
+            "confidence": conf,
+        }
+        for qid, ans in answers_map.items()
+    }
 
     return {
         "board_version": 1,
         "decision": {
-            "question_id": "root_cause",
-            "question": "Which component is the verified root cause?",
-            "answer": rc,
+            "question_id": primary_qid,
+            "question": primary_qtext,
+            "answer": primary_ans,
             "confidence": conf,
             "certified_influence_share": 1.0 - uncert_share,
             "uncertified_influence_share": uncert_share,
             "unknown_voi_max": unk_voi,
         },
-        "decisions": {
-            "root_cause": {
-                "question_id": "root_cause",
-                "answer": rc,
-                "confidence": conf,
-            },
-            "recommended_action": {
-                "question_id": "recommended_action",
-                "answer": action,
-                "confidence": conf,
-            },
-            "sufficiently_verified": {
-                "question_id": "sufficiently_verified",
-                "answer": suff_norm,
-                "confidence": conf,
-            },
-        },
+        "decisions": decisions_dict,
         "fields": {},
     }
 
@@ -98,23 +100,24 @@ def _run_single_baseline(
     thinking_level: str = "low",
 ) -> tuple[dict[str, Any], float]:
     provider = GeminiModelProvider()
-    db_runner = DuckDBTrustedRunner(str(case_dir))
+    backend = domain.create_backend(str(case_dir))
 
-    def _sql_executor(sql: str) -> dict[str, Any]:
-        qres, _note = db_runner.execute_readonly_query(sql)
-        return {
-            "columns": qres.columns,
-            "rows": qres.rows,
-            "row_count": qres.row_count,
-            "truncated": qres.truncated,
-            "duration_ms": qres.duration_ms,
-        }
+    def _query_executor(query: str) -> dict[str, Any]:
+        if backend is None:
+            return {"error": "No query backend configured for this domain."}
+        qres, _note = backend.execute_query(query)
+        if hasattr(qres, "model_dump"):
+            return qres.model_dump()
+        if isinstance(qres, dict):
+            return qres
+        return {"result": str(qres)}
 
     t0 = time.perf_counter()
-    res = provider.run_carbon_sql_baseline(
-        schema_description=domain.schema_description(),
+    res = provider.run_single_agent_baseline(
+        environment_description=domain.environment_description(),
+        magnet_rules=domain.magnet_rules(),
         decision_questions=domain.decision_questions(),
-        sql_executor=_sql_executor,
+        query_executor=_query_executor,
         max_queries=max_queries,
         timeout_seconds=wall_clock_budget_s,
         thinking_level=thinking_level,
@@ -202,7 +205,9 @@ def _evaluate_one_case(
         )
 
     ares_score = domain.score(ares_res.board.model_dump(), truth)
-    baseline_board = build_baseline_board_for_scoring(base_raw)
+    baseline_board = build_baseline_board_for_scoring(
+        base_raw, domain.decision_questions()
+    )
     baseline_score = domain.score(baseline_board, truth)
 
     piv_mean = ares_score.get("pivotal_influence_mean")
@@ -228,7 +233,7 @@ def _evaluate_one_case(
             "ungrounded_fields_on_board": ares_res.ungrounded_fields_on_board,
             "illegal_cert_upgrades_on_board": ares_res.illegal_cert_upgrades_on_board,
             "pivotal_beats_distractor": pivotal_beats_distractor,
-            "sql_queries_executed": ares_res.sql_queries_executed,
+            "queries_executed": ares_res.queries_executed,
             "verifiers_executed": ares_res.verifiers_executed,
             "skipped_duplicates": ares_res.skipped_duplicates,
             "rejected_guard": ares_res.rejected_guard,
@@ -242,9 +247,7 @@ def _evaluate_one_case(
         },
         "baseline": {
             "score": baseline_score,
-            "root_cause": base_raw["root_cause"],
-            "recommended_action": base_raw["recommended_action"],
-            "sufficiently_verified": base_raw["sufficiently_verified"],
+            "answers": base_raw["answers"],
             "confidence": base_raw["confidence"],
             "rationale": base_raw["rationale"],
             "query_count": base_raw["query_count"],
@@ -301,7 +304,6 @@ def _summarize_results(
     total_caught = sum(c["ares"]["invariant_violations_caught"] for c in case_records)
     max_drift = max((c["ares"]["final_board_drift"] for c in case_records), default=0.0)
 
-    # Pivotal > distractor check across verifiable cases (and any case with non-zero influence)
     verifiable_cases = [c for c in case_records if c["category"] != "under_determined"]
     piv_gt_dist_verifiable = sum(
         1 for c in verifiable_cases if c["ares"]["pivotal_beats_distractor"]
@@ -376,8 +378,8 @@ def _summarize_results(
                 "total_probe_api_calls": sum(
                     c["ares"]["probe_api_calls"] for c in case_records
                 ),
-                "total_sql_queries_executed": sum(
-                    c["ares"]["sql_queries_executed"] for c in case_records
+                "total_queries_executed": sum(
+                    c["ares"]["queries_executed"] for c in case_records
                 ),
                 "total_verifiers_executed": sum(
                     c["ares"]["verifiers_executed"] for c in case_records
@@ -406,7 +408,7 @@ def _summarize_results(
                 "total_model_calls": sum(
                     c["baseline"]["model_telemetry"]["model_calls"] for c in case_records
                 ),
-                "total_sql_queries_executed": sum(
+                "total_queries_executed": sum(
                     c["baseline"]["query_count"] for c in case_records
                 ),
             },
@@ -417,7 +419,7 @@ def _summarize_results(
 
 def _print_scoreboard(report: dict[str, Any]) -> None:
     print("\n" + "=" * 112)
-    print("STAGE 1 MICRO-BENCHMARK SCOREBOARD (9 CASES: ARES vs. SINGLE-AGENT CARBON SQL BASELINE)")
+    print("STAGE 1 MICRO-BENCHMARK SCOREBOARD (9 CASES: ARES vs. SINGLE-AGENT CARBON BASELINE)")
     print("=" * 112)
     header = (
         f"{'Case ID':<28} | {'Category':<16} | {'ARES RC (Act)':<26} | "
@@ -468,6 +470,7 @@ def _print_scoreboard(report: dict[str, Any]) -> None:
 
 def run_stage1_micro_benchmark(
     *,
+    domain: Domain | None = None,
     out_json_path: Path = DEFAULT_RESULTS_PATH,
     artifacts_root: Path = DEFAULT_ARTIFACTS_ROOT,
     size_gb: float = 0.02,
@@ -477,12 +480,17 @@ def run_stage1_micro_benchmark(
     baseline_thinking_level: str = "low",
     parallel_runners: bool = True,
 ) -> dict[str, Any]:
-    """Execute the full 9-case Stage 1 Micro-Benchmark (ARES vs. Baseline)."""
-    load_dotenv()
+    """Execute the full Stage 1 Micro-Benchmark (ARES vs. Baseline)."""
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
     t_total_start = time.perf_counter()
 
-    domain = MicroBenchDomain()
-    needles = domain.needle_menu()
+    eff_domain = domain if domain is not None else MicroBenchDomain()
+    needles = eff_domain.needle_menu()
     out_json_path.parent.mkdir(parents=True, exist_ok=True)
     artifacts_root.mkdir(parents=True, exist_ok=True)
 
@@ -497,7 +505,7 @@ def run_stage1_micro_benchmark(
         cases_work_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[Stage 1] Generating base haystack (~{size_gb} GB, seed={seed})...", flush=True)
-        domain.generate(str(base_dir), size_gb=size_gb, seed=seed)
+        eff_domain.generate(str(base_dir), size_gb=size_gb, seed=seed)
 
         for idx, needle in enumerate(needles, start=1):
             print(
@@ -506,7 +514,7 @@ def run_stage1_micro_benchmark(
             )
             t_case = time.perf_counter()
             record = _evaluate_one_case(
-                domain=domain,
+                domain=eff_domain,
                 base_haystack_dir=base_dir,
                 work_root=cases_work_dir,
                 artifacts_root=artifacts_root,
@@ -529,7 +537,7 @@ def run_stage1_micro_benchmark(
             )
 
     total_wall_s = time.perf_counter() - t_total_start
-    report = _summarize_results(case_records, total_wall_s, domain.name)
+    report = _summarize_results(case_records, total_wall_s, eff_domain.name)
     out_json_path.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
     _print_scoreboard(report)
     print(f"[Stage 1] Saved detailed JSON results to: {out_json_path}", flush=True)
@@ -538,44 +546,16 @@ def run_stage1_micro_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run Stage 1 9-Case ARES vs. Carbon SQL Micro-Benchmark."
+        description="Run Stage 1 9-Case ARES vs. Carbon Micro-Benchmark."
     )
+    parser.add_argument("--out", type=Path, default=DEFAULT_RESULTS_PATH)
+    parser.add_argument("--size-gb", type=float, default=0.02)
+    parser.add_argument("--budget-s", type=float, default=180.0)
+    parser.add_argument("--baseline-max-queries", type=int, default=10)
     parser.add_argument(
-        "--out",
-        type=Path,
-        default=DEFAULT_RESULTS_PATH,
-        help="Output JSON path (default: benchmark/results/micro_bench_stage1.json).",
+        "--baseline-thinking", type=str, default="low", choices=["low", "medium", "high"]
     )
-    parser.add_argument(
-        "--size-gb",
-        type=float,
-        default=0.02,
-        help="Background haystack scale in GB (default: 0.02 -> ~186K rows).",
-    )
-    parser.add_argument(
-        "--budget-s",
-        type=float,
-        default=180.0,
-        help="Per-case wall-clock budget in seconds for both ARES and Baseline.",
-    )
-    parser.add_argument(
-        "--baseline-max-queries",
-        type=int,
-        default=10,
-        help="Max SQL queries per case for the Carbon baseline (default: 10).",
-    )
-    parser.add_argument(
-        "--baseline-thinking",
-        type=str,
-        default="low",
-        choices=["low", "medium", "high"],
-        help="Thinking level for Carbon SQL baseline (default: low).",
-    )
-    parser.add_argument(
-        "--sequential",
-        action="store_true",
-        help="Run ARES and Baseline sequentially per case instead of concurrently.",
-    )
+    parser.add_argument("--sequential", action="store_true")
     args = parser.parse_args()
 
     run_stage1_micro_benchmark(

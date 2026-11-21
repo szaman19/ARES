@@ -8,20 +8,21 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from ares.duckdb_runner import DuckDBTrustedRunner
+from adapters import DuckDBBackend
 from ares.store import NoteStore
 from contracts import (
     ArtifactRef,
     BoardField,
     DecisionQuestion,
     InMemoryVerifierRegistry,
-    InvestigationBoard,
     Note,
 )
-from domain.micro_bench import MicroBenchDomain
+from domain.micro_bench import (
+    INCIDENT_PIVOTAL_FIELDS,
+    MicroBenchDomain,
+    extract_incident_note_fields,
+)
 from fusion import (
-    CANONICAL_PIVOTAL_FIELDS,
-    DEFAULT_PIVOTAL_FIELDS,
     BoardPatch,
     FieldPatch,
     PatchReport,
@@ -36,11 +37,6 @@ from fusion import (
     validate_and_merge_patch,
     value_is_grounded_in_notes,
 )
-
-
-# ---------------------------------------------------------------------------
-# Test Fixtures & Helpers
-# ---------------------------------------------------------------------------
 
 
 def _sample_questions() -> list[DecisionQuestion]:
@@ -144,7 +140,7 @@ def _seed_store(tmp_path: Path) -> tuple[NoteStore, ArtifactRef]:
             hypothesis_family="ad_hoc_pool_check",
             requested_under=0,
             row_count=2,
-            summary="Ad-hoc read-only SQL returned 2 row(s) in 3.2ms.",
+            summary="Ad-hoc read-only query returned 2 row(s) in 3.2ms.",
             evidence={
                 "columns": ["service", "msg"],
                 "rows": [["payments-db", "pool saturation warning"], ["auth-service", "retry"]],
@@ -178,14 +174,20 @@ def _seed_store(tmp_path: Path) -> tuple[NoteStore, ArtifactRef]:
     return store, png_art
 
 
-# ---------------------------------------------------------------------------
-# 1. Board Initialization Tests
-# ---------------------------------------------------------------------------
+def _new_board():
+    return create_initial_board(_sample_questions(), seed_fields=INCIDENT_PIVOTAL_FIELDS)
+
+
+def _merge(board, patch, store, **kwargs):
+    kwargs.setdefault("seed_fields", INCIDENT_PIVOTAL_FIELDS)
+    kwargs.setdefault("protected_fields", INCIDENT_PIVOTAL_FIELDS)
+    kwargs.setdefault("note_extractor", extract_incident_note_fields)
+    return validate_and_merge_patch(board, patch, store, **kwargs)
 
 
 def test_create_initial_board_defaults_and_custom_seeds() -> None:
     questions = _sample_questions()
-    board = create_initial_board(questions)
+    board = create_initial_board(questions, seed_fields=INCIDENT_PIVOTAL_FIELDS)
 
     assert board.board_version == 0
     assert board.decision.question_id == "root_cause"
@@ -195,30 +197,24 @@ def test_create_initial_board_defaults_and_custom_seeds() -> None:
         "recommended_action",
         "sufficiently_verified",
     }
-    assert list(board.fields.keys()) == DEFAULT_PIVOTAL_FIELDS
-    assert set(board.fields.keys()) == CANONICAL_PIVOTAL_FIELDS
+    assert list(board.fields.keys()) == INCIDENT_PIVOTAL_FIELDS
     for fld in board.fields.values():
         assert fld.value == "unknown"
         assert fld.status == "unknown"
         assert fld.sources == []
         assert fld.artifact_ids == []
 
-    empty_seed_board = create_initial_board(questions, seed_fields=[])
+    empty_seed_board = create_initial_board(questions)
     assert empty_seed_board.fields == {}
 
     fallback_board = create_initial_board([], seed_fields=["custom_clue"])
-    assert fallback_board.decision.question_id == "root_cause"
+    assert fallback_board.decision.question_id == "primary_decision"
     assert "custom_clue" in fallback_board.fields
-
-
-# ---------------------------------------------------------------------------
-# 2. Invariant I1: Provenance, Certified Groundedness & Multimodal Artifacts
-# ---------------------------------------------------------------------------
 
 
 def test_i1_rejects_non_unknown_field_with_empty_sources(tmp_path: Path) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
     patch = BoardPatch(
         updates={
@@ -226,7 +222,7 @@ def test_i1_rejects_non_unknown_field_with_empty_sources(tmp_path: Path) -> None
         }
     )
     with pytest.raises(PatchValidationError) as exc_info:
-        validate_and_merge_patch(board, patch, store)
+        _merge(board, patch, store)
 
     assert exc_info.value.invariant == "I1"
     assert exc_info.value.field_name == "logs_retry_spike"
@@ -234,7 +230,7 @@ def test_i1_rejects_non_unknown_field_with_empty_sources(tmp_path: Path) -> None
 
 def test_i1_rejects_missing_note_id_in_sources(tmp_path: Path) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
     patch = BoardPatch(
         updates={
@@ -242,7 +238,7 @@ def test_i1_rejects_missing_note_id_in_sources(tmp_path: Path) -> None:
         }
     )
     with pytest.raises(PatchValidationError) as exc_info:
-        validate_and_merge_patch(board, patch, store)
+        _merge(board, patch, store)
 
     assert exc_info.value.invariant == "I1"
     assert exc_info.value.field_name == "logs_retry_spike"
@@ -251,28 +247,25 @@ def test_i1_rejects_missing_note_id_in_sources(tmp_path: Path) -> None:
 
 def test_i1_unknown_value_rules_and_blocks_certified_reset(tmp_path: Path) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
-    # Unknown value with sources must fail I1
     with pytest.raises(PatchValidationError) as exc_info:
-        validate_and_merge_patch(
+        _merge(
             board,
             {"logs_retry_spike": {"value": "unknown", "sources": ["n_0001"]}},
             store,
         )
     assert exc_info.value.invariant == "I1"
 
-    # Certify logs_retry_spike first
-    board, _ = validate_and_merge_patch(
+    board, _ = _merge(
         board,
         {"logs_retry_spike": {"value": "payments-db", "sources": ["n_0001"]}},
         store,
     )
     assert board.fields["logs_retry_spike"].status == "certified"
 
-    # Overwriting a certified field back to "unknown" (or None) is forbidden
     with pytest.raises(PatchValidationError) as exc_info2:
-        validate_and_merge_patch(
+        _merge(
             board,
             {"logs_retry_spike": {"value": None, "sources": []}},
             store,
@@ -283,11 +276,10 @@ def test_i1_unknown_value_rules_and_blocks_certified_reset(tmp_path: Path) -> No
 
 def test_i1_certified_value_groundedness_checks(tmp_path: Path) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
-    # Hallucinated service ("inventory-db" when n_0001 only contains "payments-db") -> I1 error
     with pytest.raises(PatchValidationError) as exc_info:
-        validate_and_merge_patch(
+        _merge(
             board,
             {"logs_retry_spike": {"value": "inventory-db", "sources": ["n_0001"]}},
             store,
@@ -295,16 +287,14 @@ def test_i1_certified_value_groundedness_checks(tmp_path: Path) -> None:
     assert exc_info.value.invariant == "I1"
     assert exc_info.value.field_name == "logs_retry_spike"
 
-    # Ungrounded numeric claim on CERTIFIED note -> I1 error
     with pytest.raises(PatchValidationError) as exc_num:
-        validate_and_merge_patch(
+        _merge(
             board,
             {"max_z": {"value": 42.5, "sources": ["n_0002"]}},
             store,
         )
     assert exc_num.value.invariant == "I1"
 
-    # Ungrounded nested list/dict leaf -> I1 error
     n1 = store.get("n_0001")
     n2 = store.get("n_0002")
     assert not value_is_grounded_in_notes(["payments-db", "inventory-db"], [n1])
@@ -312,7 +302,6 @@ def test_i1_certified_value_groundedness_checks(tmp_path: Path) -> None:
     assert not value_is_grounded_in_notes([], [n1])
     assert not value_is_grounded_in_notes({}, [n1])
 
-    # Grounded scalar, float within 1e-2 tolerance, boolean, and structured dict pass
     assert value_is_grounded_in_notes("payments-db", [n1])
     assert value_is_grounded_in_notes(6.42, [n2])
     assert value_is_grounded_in_notes(True, [n1])
@@ -320,7 +309,6 @@ def test_i1_certified_value_groundedness_checks(tmp_path: Path) -> None:
         {"service": "payments-db", "shard": "shard_01", "traces": 15}, [n1]
     )
 
-    # Empty result note grounds "none" / "none_verified" / []
     empty_note = Note(
         note_id="n_empty",
         certification="CERTIFIED",
@@ -336,11 +324,10 @@ def test_i1_certified_value_groundedness_checks(tmp_path: Path) -> None:
 
 def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
     store, valid_art = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
-    # 1. Missing artifact_id not in NoteStore -> I1
     with pytest.raises(PatchValidationError) as exc_missing:
-        validate_and_merge_patch(
+        _merge(
             board,
             {
                 "three_way_root_cause": {
@@ -353,9 +340,8 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     assert exc_missing.value.invariant == "I1"
 
-    # 2. Unlinked artifact_id (exists in NoteStore on n_0004, but field only cites n_0001) -> I1
     with pytest.raises(PatchValidationError) as exc_unlinked:
-        validate_and_merge_patch(
+        _merge(
             board,
             {
                 "logs_retry_spike": {
@@ -368,7 +354,6 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     assert exc_unlinked.value.invariant == "I1"
 
-    # 3. Untrusted artifact (produced_by_verifier=False) -> I1
     untrusted_art = _make_png_artifact(
         tmp_path, "art_untrusted", produced_by_verifier=False
     )
@@ -382,7 +367,7 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     )
     with pytest.raises(PatchValidationError) as exc_untrusted:
-        validate_and_merge_patch(
+        _merge(
             board,
             {
                 "plot_check": {
@@ -395,7 +380,6 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     assert exc_untrusted.value.invariant == "I1"
 
-    # 4. Empty sha256 digest -> I1
     no_sha_art = _make_png_artifact(tmp_path, "art_no_sha", sha256="")
     store.append(
         Note(
@@ -407,7 +391,7 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     )
     with pytest.raises(PatchValidationError) as exc_nosha:
-        validate_and_merge_patch(
+        _merge(
             board,
             {
                 "sha_check": {
@@ -420,7 +404,6 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     assert exc_nosha.value.invariant == "I1"
 
-    # 5. Missing file on disk rejected when verify_artifact_files=True, accepted when False
     ghost_art = _make_png_artifact(tmp_path, "art_ghost", create_file=False)
     store.append(
         Note(
@@ -432,7 +415,7 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     )
     with pytest.raises(PatchValidationError) as exc_ghost:
-        validate_and_merge_patch(
+        _merge(
             board,
             {
                 "ghost_check": {
@@ -446,7 +429,7 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
         )
     assert exc_ghost.value.invariant == "I1"
 
-    board_ghost_ok, _ = validate_and_merge_patch(
+    board_ghost_ok, _ = _merge(
         board,
         {
             "ghost_check": {
@@ -460,8 +443,7 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
     )
     assert board_ghost_ok.fields["ghost_check"].artifact_ids == ["art_ghost"]
 
-    # 6. Valid verifier PNG artifact accepted AND auto-collected when omitted in FieldPatch
-    board_ok, _ = validate_and_merge_patch(
+    board_ok, _ = _merge(
         board,
         {"three_way_root_cause": {"value": "payments-db", "sources": ["n_0004"]}},
         store,
@@ -471,18 +453,12 @@ def test_i1_multimodal_artifact_provenance_enforcement(tmp_path: Path) -> None:
     assert board_ok.fields["three_way_root_cause"].artifact_ids == [valid_art.artifact_id]
 
 
-# ---------------------------------------------------------------------------
-# 3. Invariant I2: Monotonic / Weakest-Link Certification & Deduplication
-# ---------------------------------------------------------------------------
-
-
 def test_i2_rejects_illegal_certification_upgrade(tmp_path: Path) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
-    # Claiming status="certified" when citing UNCERTIFIED n_0003 -> I2 error
     with pytest.raises(PatchValidationError) as exc_info:
-        validate_and_merge_patch(
+        _merge(
             board,
             BoardPatch(
                 updates={
@@ -498,9 +474,8 @@ def test_i2_rejects_illegal_certification_upgrade(tmp_path: Path) -> None:
     assert exc_info.value.invariant == "I2"
     assert exc_info.value.field_name == "pool_saturation"
 
-    # Raw dict with uppercase "CERTIFIED" on mixed CERTIFIED + UNCERTIFIED notes -> I2 error
     with pytest.raises(PatchValidationError) as exc_mixed:
-        validate_and_merge_patch(
+        _merge(
             board,
             {
                 "updates": {
@@ -518,39 +493,35 @@ def test_i2_rejects_illegal_certification_upgrade(tmp_path: Path) -> None:
 
 def test_i2_weakest_link_and_same_field_merge_semantics(tmp_path: Path) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
     assert compute_weakest_status([], store) == "unknown"
     assert compute_weakest_status(["n_0001", "n_0002"], store) == "certified"
     assert compute_weakest_status(["n_0001", "n_0003"], store) == "uncertified"
 
-    # Mixed CERTIFIED + UNCERTIFIED notes compute status="uncertified"
-    board, _ = validate_and_merge_patch(
+    board, _ = _merge(
         board,
         {"mixed_signal": {"value": "payments-db", "sources": ["n_0001", "n_0003"]}},
         store,
     )
     assert board.fields["mixed_signal"].status == "uncertified"
 
-    # Certify logs_retry_spike with n_0001
-    board, _ = validate_and_merge_patch(
+    board, _ = _merge(
         board,
         {"logs_retry_spike": {"value": "payments-db", "sources": ["n_0001"]}},
         store,
     )
     assert board.fields["logs_retry_spike"].status == "certified"
 
-    # Attempt to overwrite certified logs_retry_spike with conflicting value from UNCERTIFIED n_0003 -> I2
     with pytest.raises(PatchValidationError) as exc_conflict:
-        validate_and_merge_patch(
+        _merge(
             board,
             {"logs_retry_spike": {"value": "auth-service", "sources": ["n_0003"]}},
             store,
         )
     assert exc_conflict.value.invariant == "I2"
 
-    # Merging SAME value onto logs_retry_spike with UNCERTIFIED n_0003 unions sources & applies weakest-link
-    board, _ = validate_and_merge_patch(
+    board, _ = _merge(
         board,
         {"logs_retry_spike": {"value": "payments-db", "sources": ["n_0003"]}},
         store,
@@ -558,14 +529,13 @@ def test_i2_weakest_link_and_same_field_merge_semantics(tmp_path: Path) -> None:
     assert board.fields["logs_retry_spike"].sources == ["n_0001", "n_0003"]
     assert board.fields["logs_retry_spike"].status == "uncertified"
 
-    # Replacing an uncertified hunch with strictly CERTIFIED verifier note upgrades cleanly
-    board, _ = validate_and_merge_patch(
+    board, _ = _merge(
         board,
         {"hunch_service": {"value": "auth-service", "sources": ["n_0003"]}},
         store,
     )
     assert board.fields["hunch_service"].status == "uncertified"
-    board, _ = validate_and_merge_patch(
+    board, _ = _merge(
         board,
         {"hunch_service": {"value": "payments-db", "sources": ["n_0001"]}},
         store,
@@ -579,10 +549,9 @@ def test_i2_deduplicates_alias_fields_with_union_sources_and_weakest_cert(
     tmp_path: Path,
 ) -> None:
     store, png_art = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
-    # Seed canonical pivotal fields + one non-canonical certified field
-    board, report1 = validate_and_merge_patch(
+    board, report1 = _merge(
         board,
         {
             "logs_retry_spike": {"value": "payments-db", "sources": ["n_0001"]},
@@ -598,10 +567,7 @@ def test_i2_deduplicates_alias_fields_with_union_sources_and_weakest_cert(
     assert board.fields["culprit_cluster"].status == "certified"
     assert board.fields["culprit_cluster"].artifact_ids == [png_art.artifact_id]
 
-    # Introduce two duplicate aliases:
-    # 1) exact (value, sources) alias of logs_retry_spike
-    # 2) complex dict value alias of culprit_cluster citing UNCERTIFIED n_0003 -> unions sources & weakest status!
-    board2, report2 = validate_and_merge_patch(
+    board2, report2 = _merge(
         board,
         {
             "retry_spike_alias": {"value": "payments-db", "sources": ["n_0001"]},
@@ -616,16 +582,13 @@ def test_i2_deduplicates_alias_fields_with_union_sources_and_weakest_cert(
     assert set(report2.deduplicated_fields) == {"retry_spike_alias", "culprit_cluster_dup"}
     assert "retry_spike_alias" not in board2.fields
     assert "culprit_cluster_dup" not in board2.fields
-    # Canonical pivotal fields were NOT collapsed into each other
     assert "logs_retry_spike" in board2.fields
     assert "metrics_zscore_breach" in board2.fields
-    # culprit_cluster took union of sources + union of artifact_ids + weakest certification
     merged_cluster = board2.fields["culprit_cluster"]
     assert merged_cluster.sources == ["n_0004", "n_0003"]
     assert merged_cluster.artifact_ids == [png_art.artifact_id]
     assert merged_cluster.status == "uncertified"
 
-    # Direct helper check on shared-source scalar alias
     direct_fields = {
         "db_finding": BoardField(
             value="payments-db", status="certified", sources=["n_0001"]
@@ -641,32 +604,25 @@ def test_i2_deduplicates_alias_fields_with_union_sources_and_weakest_cert(
     assert deduped["db_finding"].status == "uncertified"
 
 
-# ---------------------------------------------------------------------------
-# 4. Invariant I3: NoteStore Immutability, Deterministic Rebuild & Drift
-# ---------------------------------------------------------------------------
-
-
 def test_i3_notestore_immutability_and_deterministic_rebuild_drift(tmp_path: Path) -> None:
     store, png_art = _seed_store(tmp_path)
     note1 = store.get("n_0001")
 
-    # Note is frozen/immutable
     with pytest.raises(ValidationError):
         note1.certification = "UNCERTIFIED"  # type: ignore[misc]
 
-    # NoteStore is append-only (rejects duplicate note_id)
     with pytest.raises(ValueError, match="already exists"):
         store.append(note1)
 
-    # Deterministic patch extraction covers all verifiers + generic note
-    det_patch = deterministic_patch_from_notes(store.snapshot())
+    det_patch = deterministic_patch_from_notes(
+        store.snapshot(), note_extractor=extract_incident_note_fields
+    )
     assert det_patch.updates["logs_retry_spike"].value == "payments-db"
     assert det_patch.updates["metrics_zscore_breach"].value == "payments-db"
     assert det_patch.updates["three_way_root_cause"].value == "payments-db"
     assert det_patch.updates["three_way_root_cause"].artifact_ids == [png_art.artifact_id]
     assert "note_ad_hoc_pool_check" in det_patch.updates
 
-    # Multi-candidate and empty-candidate deterministic extraction
     multi_and_empty = [
         Note(
             note_id="n_multi",
@@ -683,18 +639,30 @@ def test_i3_notestore_immutability_and_deterministic_rebuild_drift(tmp_path: Pat
             evidence={"candidates": []},
         ),
     ]
-    det_me = deterministic_patch_from_notes(multi_and_empty)
+    det_me = deterministic_patch_from_notes(
+        multi_and_empty, note_extractor=extract_incident_note_fields
+    )
     assert det_me.updates["traces_error_cluster"].value == ["auth-service", "payments-db"]
     assert det_me.updates["logs_retry_spike"].value == "none"
 
-    # Rebuild from NoteStore is bit-for-bit deterministic across runs
-    rebuilt_a = rebuild_board_from_notes(store, _sample_questions())
-    rebuilt_b = rebuild_board_from_notes(store, _sample_questions())
+    rebuilt_a = rebuild_board_from_notes(
+        store,
+        _sample_questions(),
+        seed_fields=INCIDENT_PIVOTAL_FIELDS,
+        protected_fields=INCIDENT_PIVOTAL_FIELDS,
+        note_extractor=extract_incident_note_fields,
+    )
+    rebuilt_b = rebuild_board_from_notes(
+        store,
+        _sample_questions(),
+        seed_fields=INCIDENT_PIVOTAL_FIELDS,
+        protected_fields=INCIDENT_PIVOTAL_FIELDS,
+        note_extractor=extract_incident_note_fields,
+    )
     assert rebuilt_a.model_dump() == rebuilt_b.model_dump()
 
-    # Clean fusion patch yields board_drift == 0.0
-    board = create_initial_board(_sample_questions())
-    board, report = validate_and_merge_patch(
+    board = _new_board()
+    board, report = _merge(
         board,
         {
             "logs_retry_spike": {"value": "payments-db", "sources": ["n_0001"]},
@@ -709,34 +677,30 @@ def test_i3_notestore_immutability_and_deterministic_rebuild_drift(tmp_path: Pat
     assert report.board_drift == 0.0
     assert compute_board_drift(board, rebuilt_a) == 0.0
 
-    # Tamper 1: illegally flip uncertified field status to "certified" -> drift > 0.0
     tampered_status = board.model_copy(deep=True)
     tampered_status.fields["pool_hunch"].status = "certified"
     assert compute_board_drift(tampered_status, rebuilt_a) > 0.0
 
-    # Tamper 2: mutate certified canonical field value to contradict rebuilt -> drift > 0.0
     tampered_val = board.model_copy(deep=True)
     tampered_val.fields["logs_retry_spike"].value = "inventory-db"
     assert compute_board_drift(tampered_val, rebuilt_a) > 0.0
 
-    # Tamper 3: inject phantom source ID not present in NoteStore/rebuilt -> drift > 0.0
     tampered_src = board.model_copy(deep=True)
     tampered_src.fields["logs_retry_spike"].sources = ["n_phantom"]
     assert compute_board_drift(tampered_src, rebuilt_a) > 0.0
 
 
 def test_i3_end_to_end_with_micro_bench_verifiers(tmp_path: Path) -> None:
-    """Integration check against real MicroBenchDomain Parquet shards + verifiers."""
     data_dir = tmp_path / "haystack"
     art_dir = tmp_path / "artifacts"
     domain = MicroBenchDomain()
     domain.generate(str(data_dir), size_gb=0.001, seed=7)
-    needle = domain.needle_menu()[0]  # multi_clue_join case
+    needle = domain.needle_menu()[0]
     truth = domain.plant(str(data_dir), needle)
 
     registry = InMemoryVerifierRegistry()
     domain.register_verifiers(registry)
-    runner = DuckDBTrustedRunner(str(data_dir))
+    backend = DuckDBBackend(str(data_dir))
     store = NoteStore()
 
     for vname in (
@@ -745,7 +709,7 @@ def test_i3_end_to_end_with_micro_bench_verifiers(tmp_path: Path) -> None:
         "verify_trace_error_cluster",
         "verify_three_way_root_cause",
     ):
-        runner.execute_verifier(
+        backend.execute_verifier(
             registry,
             vname,
             params={"artifact_dir": str(art_dir)},
@@ -753,76 +717,92 @@ def test_i3_end_to_end_with_micro_bench_verifiers(tmp_path: Path) -> None:
             note_store=store,
         )
 
-    board = create_initial_board(domain.decision_questions())
-    patch = deterministic_patch_from_notes(store.snapshot())
-    fused_board, report = validate_and_merge_patch(board, patch, store)
+    board = create_initial_board(
+        domain.decision_questions(), seed_fields=domain.pivotal_fields()
+    )
+    patch = deterministic_patch_from_notes(
+        store.snapshot(), note_extractor=domain.extract_field_patches_from_note
+    )
+    fused_board, report = validate_and_merge_patch(
+        board,
+        patch,
+        store,
+        seed_fields=domain.pivotal_fields(),
+        protected_fields=domain.pivotal_fields(),
+        note_extractor=domain.extract_field_patches_from_note,
+    )
 
     assert report.board_drift == 0.0
     assert fused_board.fields["three_way_root_cause"].status == "certified"
-    assert fused_board.fields["three_way_root_cause"].value == truth.root_cause_component
+    assert fused_board.fields["three_way_root_cause"].value == truth.primary_target
     assert len(fused_board.fields["three_way_root_cause"].artifact_ids) >= 1
 
 
 def test_i2_i3_under_determined_and_decoy_cases_preserve_honest_certification(
     tmp_path: Path,
 ) -> None:
-    """Verify decoy pruning and honest UNCERTIFIED status on under-determined cases."""
     domain = MicroBenchDomain()
     menu = domain.needle_menu()
     decoy_needle = next(n for n in menu if n.category == "look_alike_decoy")
     under_needle = next(n for n in menu if n.category == "under_determined")
 
-    # 1. Look-alike decoy case: 3-way verifier isolates true root cause over decoy
     decoy_dir = tmp_path / "decoy_case"
     domain.generate(str(decoy_dir), size_gb=0.001, seed=11)
     decoy_truth = domain.plant(str(decoy_dir), decoy_needle)
     reg = InMemoryVerifierRegistry()
     domain.register_verifiers(reg)
-    decoy_runner = DuckDBTrustedRunner(str(decoy_dir))
+    decoy_backend = DuckDBBackend(str(decoy_dir))
     decoy_store = NoteStore()
     for vname in reg.list_verifiers():
-        decoy_runner.execute_verifier(reg, vname, note_store=decoy_store)
+        decoy_backend.execute_verifier(reg, vname, note_store=decoy_store)
 
     decoy_board, decoy_rep = validate_and_merge_patch(
-        create_initial_board(domain.decision_questions()),
-        deterministic_patch_from_notes(decoy_store.snapshot()),
+        create_initial_board(
+            domain.decision_questions(), seed_fields=domain.pivotal_fields()
+        ),
+        deterministic_patch_from_notes(
+            decoy_store.snapshot(), note_extractor=domain.extract_field_patches_from_note
+        ),
         decoy_store,
+        seed_fields=domain.pivotal_fields(),
+        protected_fields=domain.pivotal_fields(),
+        note_extractor=domain.extract_field_patches_from_note,
     )
     assert decoy_rep.board_drift == 0.0
     assert decoy_board.fields["three_way_root_cause"].status == "certified"
-    assert decoy_board.fields["three_way_root_cause"].value == decoy_truth.root_cause_component
-    assert decoy_board.fields["three_way_root_cause"].value != decoy_truth.decoy_component
+    assert decoy_board.fields["three_way_root_cause"].value == decoy_truth.primary_target
+    assert decoy_board.fields["three_way_root_cause"].value != decoy_truth.decoy_target
 
-    # 2. Under-determined case: 3-way verifier must remain UNCERTIFIED ("none")
     under_dir = tmp_path / "under_case"
     domain.generate(str(under_dir), size_gb=0.001, seed=19)
     domain.plant(str(under_dir), under_needle)
-    under_runner = DuckDBTrustedRunner(str(under_dir))
+    under_backend = DuckDBBackend(str(under_dir))
     under_store = NoteStore()
     for vname in reg.list_verifiers():
-        under_runner.execute_verifier(reg, vname, note_store=under_store)
+        under_backend.execute_verifier(reg, vname, note_store=under_store)
 
     under_board, under_rep = validate_and_merge_patch(
-        create_initial_board(domain.decision_questions()),
-        deterministic_patch_from_notes(under_store.snapshot()),
+        create_initial_board(
+            domain.decision_questions(), seed_fields=domain.pivotal_fields()
+        ),
+        deterministic_patch_from_notes(
+            under_store.snapshot(), note_extractor=domain.extract_field_patches_from_note
+        ),
         under_store,
+        seed_fields=domain.pivotal_fields(),
+        protected_fields=domain.pivotal_fields(),
+        note_extractor=domain.extract_field_patches_from_note,
     )
     assert under_rep.board_drift == 0.0
     assert under_board.fields["three_way_root_cause"].status == "uncertified"
     assert under_board.fields["three_way_root_cause"].value == "none"
 
 
-# ---------------------------------------------------------------------------
-# 5. Invariant I5: Staleness Tracking (`requested_under`)
-# ---------------------------------------------------------------------------
-
-
 def test_i5_tracks_stale_note_arrivals_and_versions(tmp_path: Path) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
-    # Advance board to version 2 via two initial rounds
-    board, r1 = validate_and_merge_patch(
+    board, r1 = _merge(
         board,
         {"logs_retry_spike": {"value": "payments-db", "sources": ["n_0001"]}},
         store,
@@ -839,7 +819,7 @@ def test_i5_tracks_stale_note_arrivals_and_versions(tmp_path: Path) -> None:
         evidence={"candidates": [{"service": "payments-db"}]},
     )
     store.append(fresh_note)
-    board, r2 = validate_and_merge_patch(
+    board, r2 = _merge(
         board,
         {"traces_error_cluster": {"value": "payments-db", "sources": ["n_fresh_v1"]}},
         store,
@@ -847,8 +827,7 @@ def test_i5_tracks_stale_note_arrivals_and_versions(tmp_path: Path) -> None:
     assert r2.board_version == 2
     assert r2.stale_fields == []
 
-    # Now board_version == 2, and n_0002 was requested_under == 0 -> STALE arrival!
-    board, r3 = validate_and_merge_patch(
+    board, r3 = _merge(
         board,
         {"metrics_zscore_breach": {"value": "payments-db", "sources": ["n_0002"]}},
         store,
@@ -860,21 +839,14 @@ def test_i5_tracks_stale_note_arrivals_and_versions(tmp_path: Path) -> None:
     assert fld.last_updated_version == 3
 
 
-# ---------------------------------------------------------------------------
-# 6. Invariant I7: Bounded Active Board & Low-Influence Archiving
-# ---------------------------------------------------------------------------
-
-
 def test_i7_archives_low_influence_after_two_stale_rounds_and_caps_at_12(
     tmp_path: Path,
 ) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
-    # Give an unknown field high VoI so we verify it is protected from archiving
+    board = _new_board()
     board.fields["traces_error_cluster"].voi = 0.45
 
-    # Round 1: add low-influence distractor + high-influence clue + pivotal clue
-    board, r1 = validate_and_merge_patch(
+    board, r1 = _merge(
         board,
         {
             "logs_retry_spike": {"value": "payments-db", "sources": ["n_0001"]},
@@ -884,12 +856,11 @@ def test_i7_archives_low_influence_after_two_stale_rounds_and_caps_at_12(
         store,
     )
     assert r1.archived_fields == []
-    board.fields["logs_retry_spike"].influence = 0.005  # pivotal -> protected!
-    board.fields["low_inf_distractor"].influence = 0.01  # < 0.02
-    board.fields["high_inf_clue"].influence = 0.35  # >= 0.02
+    board.fields["logs_retry_spike"].influence = 0.005
+    board.fields["low_inf_distractor"].influence = 0.01
+    board.fields["high_inf_clue"].influence = 0.35
 
-    # Round 2 (stale round 1 for low_inf_distractor -> not yet archived)
-    board, r2 = validate_and_merge_patch(
+    board, r2 = _merge(
         board,
         {"metrics_zscore_breach": {"value": "payments-db", "sources": ["n_0002"]}},
         store,
@@ -897,8 +868,7 @@ def test_i7_archives_low_influence_after_two_stale_rounds_and_caps_at_12(
     assert r2.archived_fields == []
     assert board.fields["low_inf_distractor"].stale_rounds == 1
 
-    # Round 3 (stale round 2 for low_inf_distractor -> ARCHIVED!)
-    board, r3 = validate_and_merge_patch(
+    board, r3 = _merge(
         board,
         {"three_way_root_cause": {"value": "payments-db", "sources": ["n_0004"]}},
         store,
@@ -906,14 +876,11 @@ def test_i7_archives_low_influence_after_two_stale_rounds_and_caps_at_12(
     assert r3.archived_fields == ["low_inf_distractor"]
     assert "low_inf_distractor" not in board.fields
     assert "low_inf_distractor" in board.archived_fields
-    # Pivotal field with influence < 0.02 and unknown field with VoI were preserved
     assert "logs_retry_spike" in board.fields
     assert "traces_error_cluster" in board.fields
     assert "high_inf_clue" in board.fields
-    # Underlying note in NoteStore remains intact (I3)
     assert store.exists("n_0001")
 
-    # Hard cap check: add 12 extra non-pivotal fields -> active board capped at <= 12
     many_updates: dict[str, dict[str, object]] = {}
     for idx in range(12):
         nid = f"n_extra_{idx:02d}"
@@ -930,33 +897,28 @@ def test_i7_archives_low_influence_after_two_stale_rounds_and_caps_at_12(
             "sources": [nid],
         }
 
-    capped_board, r_cap = validate_and_merge_patch(board, many_updates, store)
+    capped_board, r_cap = _merge(board, many_updates, store)
     assert len(capped_board.fields) <= 12
     assert len(r_cap.archived_fields) >= 5
     assert r_cap.board_drift == 0.0
-    # All 4 canonical pivotal fields and high_inf_clue (influence=0.35) survived eviction
-    for piv in DEFAULT_PIVOTAL_FIELDS:
+    for piv in INCIDENT_PIVOTAL_FIELDS:
         assert piv in capped_board.fields
     assert "high_inf_clue" in capped_board.fields
 
-    # Direct archive_low_influence_fields helper call
     after_helper, helper_archived = archive_low_influence_fields(
-        capped_board, max_active_fields=10
+        capped_board,
+        protected_fields=INCIDENT_PIVOTAL_FIELDS,
+        max_active_fields=10,
     )
     assert len(after_helper.fields) <= 10
     assert len(helper_archived) == 2
-
-
-# ---------------------------------------------------------------------------
-# 7. Non-Strict Partial Merge Mode & Raw Dict Patch Formats
-# ---------------------------------------------------------------------------
 
 
 def test_non_strict_mode_skips_invalid_fields_and_merges_valid_ones(
     tmp_path: Path,
 ) -> None:
     store, _ = _seed_store(tmp_path)
-    board = create_initial_board(_sample_questions())
+    board = _new_board()
 
     raw_patch = {
         "fields": {
@@ -974,9 +936,7 @@ def test_non_strict_mode_skips_invalid_fields_and_merges_valid_ones(
         "rationale": "Mixed batch with hallucinated and valid fields",
     }
 
-    merged_board, report = validate_and_merge_patch(
-        board, raw_patch, store, strict=False
-    )
+    merged_board, report = _merge(board, raw_patch, store, strict=False)
 
     assert isinstance(report, PatchReport)
     assert report.board_version == 1

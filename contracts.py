@@ -1,10 +1,11 @@
-"""Shared data contracts for the ARES Hackathon harness.
+"""Shared narrow-waist data contracts and pluggable protocols for ARES.
 
-Defines the narrow-waist data types shared between:
-- Domain plug-ins (`domain/`)
-- ARES verifiers and execution runner
-- Model providers (`gemini-4-hydrogen`, `gemini-4-carbon`, `gemini-decision-1`)
-- Fusion board state & invariant enforcement (`fusion/patch.py`)
+Strictly modality-, backend-, and domain-agnostic:
+- Core ARES primitives (`Note`, `ArtifactRef`, `HypothesisSpec`, `CostEstimate`,
+  `VerifierResult`, `VerifierRegistry`, `ExecutionBackend`)
+- Bounded InvestigationBoard contracts (`InvestigationBoard`, `BoardField`, `BoardDecision`)
+- Pluggable `Domain` interface (`environment_description`, `create_backend`,
+  `register_verifiers`, `decision_questions`, `pivotal_fields`, `required_signal_fields`)
 """
 
 from __future__ import annotations
@@ -18,10 +19,13 @@ from pydantic import BaseModel, ConfigDict, Field
 CertificationStatus = Literal["CERTIFIED", "UNCERTIFIED"]
 FieldStatus = Literal["certified", "uncertified", "unknown"]
 CaseCategory = Literal["multi_clue_join", "look_alike_decoy", "under_determined"]
-RecommendedAction = Literal["rollback", "restart", "scale_pool", "escalate"]
 SubtletyLevel = Literal["low", "medium", "high"]
 QuestionType = Literal["multiple_choice", "yes_no", "bounded_score"]
 ArtifactKind = Literal["plot_png", "image", "table_slice"]
+
+
+class GuardValidationError(ValueError):
+    """Raised when an automated magnet/query violates sandbox or cost root guards (Invariant I6)."""
 
 
 class ArtifactRef(BaseModel):
@@ -74,7 +78,7 @@ class InvestigationBoard(BaseModel):
 
 
 class Note(BaseModel):
-    """Immutable, append-only evidence record produced by ARES verifiers."""
+    """Immutable, append-only evidence record produced by ARES queries or verifiers."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -84,8 +88,8 @@ class Note(BaseModel):
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     verifier_name: str | None = None
     hypothesis_family: str = ""
-    query_sql: str = ""
-    query_hash: str = ""
+    query: str = ""
+    content_hash: str = ""
     requested_under: int = Field(default=0, ge=0)
     summary: str = ""
     evidence: dict[str, Any] = Field(default_factory=dict)
@@ -95,61 +99,68 @@ class Note(BaseModel):
     )
 
 
-class HypothesisQuerySpec(BaseModel):
-    """Structured SQL hypothesis emitted by parallel swarm workers."""
+class HypothesisSpec(BaseModel):
+    """Backend-agnostic structured hypothesis magnet emitted by parallel swarm workers."""
 
-    query_sql: str
-    hypothesis_family: str
-    expected_signal: str
+    query: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+    hypothesis_family: str = ""
+    expected_signal: str = ""
     target_fields: list[str] = Field(default_factory=list)
     verifier_name: str | None = None
     requested_under: int = Field(default=0, ge=0)
 
 
+class CostEstimate(BaseModel):
+    """Backend-agnostic pre-execution cost estimate (rows, AST nodes, solver steps, bytes)."""
+
+    estimated_units: int = Field(default=0, ge=0)
+    estimated_bytes: int = Field(default=0, ge=0)
+    plan_summary: str = ""
+    within_budget: bool = True
+    rejection_reason: str | None = None
+
+
 class DecisionQuestion(BaseModel):
-    """Closed-set question evaluated by gemini-decision-1."""
+    """Closed-set question evaluated by `gemini-decision-1`."""
 
     question_id: str
     question: str
     options: list[str]
     question_type: QuestionType = "multiple_choice"
+    instructions: str = ""
+    option_criteria: dict[str, str] = Field(default_factory=dict)
 
 
 class NeedleSpec(BaseModel):
-    """Specification for a planted incident needle (benchmark & live judge menu)."""
+    """Modality-agnostic specification for a planted benchmark needle."""
 
     case_id: str
     category: CaseCategory
-    fault_type: str
-    service: str
-    upstream_service: str
-    onset_ts: str
-    window_seconds: int = Field(default=120, gt=0)
+    scenario_type: str
+    target_entity: str
+    decoy_entity: str | None = None
+    missing_signal: str | None = None
     subtlety: SubtletyLevel = "medium"
     description: str = ""
-    recommended_action: RecommendedAction = "escalate"
-    decoy_service: str | None = None
-    decoy_upstream_service: str | None = None
-    missing_clue: Literal["logs", "metrics", "traces"] | None = None
+    expected_decisions: dict[str, str] = Field(default_factory=dict)
     seed: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GroundTruth(BaseModel):
-    """Ground-truth label and metadata for scoring a planted needle."""
+    """Modality-agnostic ground-truth label and metadata for scoring a benchmark case."""
 
     case_id: str
     category: CaseCategory
-    root_cause_component: str | None
-    recommended_action: RecommendedAction
+    primary_target: str | None
+    expected_decisions: dict[str, str] = Field(default_factory=dict)
     is_sufficiently_verified: bool
     expected_status: CertificationStatus
-    pivotal_clues: list[str] = Field(default_factory=list)
-    decoy_component: str | None = None
-    onset_ts: str
-    end_ts: str
-    shard_id: str
-    shared_trace_ids: list[str] = Field(default_factory=list)
-    planted_files: list[str] = Field(default_factory=list)
+    pivotal_fields: list[str] = Field(default_factory=list)
+    decoy_target: str | None = None
+    planted_artifacts: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class VerifierResult(BaseModel):
@@ -189,7 +200,7 @@ class VerifierRegistry(Protocol):
 
 
 class InMemoryVerifierRegistry:
-    """Simple concrete VerifierRegistry for standalone domain use and testing."""
+    """Concrete VerifierRegistry for standalone domain use and testing."""
 
     def __init__(self) -> None:
         self._verifiers: dict[str, Callable[..., VerifierResult]] = {}
@@ -219,37 +230,109 @@ class InMemoryVerifierRegistry:
 
 
 @runtime_checkable
+class ExecutionBackend(Protocol):
+    """Pluggable magnet & verifier execution adapter (tabular, AST, simulator, solver)."""
+
+    def validate_query(self, query: str) -> str:
+        """Validate read-only/sandbox safety under Invariant I6; raise GuardValidationError on failure."""
+        ...
+
+    def compute_content_hash(
+        self,
+        query: str,
+        *,
+        hypothesis_family: str = "",
+        verifier_name: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> str:
+        """Return a canonical SHA-256 content hash for deduplication (Invariant I6)."""
+        ...
+
+    def estimate_cost(self, query: str) -> CostEstimate:
+        """Estimate execution cost before dispatch for budget enforcement & cheapest-first sorting."""
+        ...
+
+    def execute_query(
+        self,
+        query: str,
+        *,
+        params: dict[str, Any] | None = None,
+        requested_under: int = 0,
+        hypothesis_family: str = "",
+        content_hash: str = "",
+        note_store: Any | None = None,
+    ) -> tuple[Any, Note]:
+        """Execute an exploratory read-only magnet query, always emitting an UNCERTIFIED Note."""
+        ...
+
+    def execute_verifier(
+        self,
+        registry: VerifierRegistry,
+        verifier_name: str,
+        *,
+        params: dict[str, Any] | None = None,
+        requested_under: int = 0,
+        hypothesis_family: str = "",
+        query: str = "",
+        content_hash: str = "",
+        note_store: Any | None = None,
+    ) -> tuple[VerifierResult, Note]:
+        """Execute a deterministic verifier enforcing Invariant I4 and I2 taint discipline."""
+        ...
+
+
+@runtime_checkable
 class Domain(Protocol):
-    """Domain-agnostic plug-in protocol (ARES Plan §6)."""
+    """Modality- and backend-agnostic domain plug-in protocol."""
 
     name: str
 
     def generate(self, out_dir: str, size_gb: float, seed: int) -> None:
-        """Write background haystack as partitioned Parquet shards."""
+        """Materialize a deterministic background haystack inside `out_dir`."""
         ...
 
     def plant(self, out_dir: str, needle: NeedleSpec) -> GroundTruth:
-        """Append a fresh Parquet shard containing the needle (used in benchmark & live demo)."""
+        """Plant a specific benchmark case into `out_dir` and return GroundTruth."""
         ...
 
     def needle_menu(self) -> list[NeedleSpec]:
-        """Return selectable needle definitions for the live judge menu."""
+        """Return selectable benchmark / live-demo needle definitions."""
         ...
 
-    def schema_description(self) -> str:
-        """Tables, columns, join keys, and semantics for Hydrogen/Carbon prompts."""
+    def environment_description(self) -> str:
+        """Describe haystack structure, schemas, entities, and semantics for worker prompts."""
+        ...
+
+    def magnet_rules(self) -> str:
+        """Return backend-specific syntax and safety rules for worker magnet authoring."""
+        ...
+
+    def create_backend(self, workspace_dir: str) -> ExecutionBackend | None:
+        """Instantiate the domain's ExecutionBackend for `workspace_dir` (or None for pure-Python)."""
         ...
 
     def register_verifiers(self, registry: VerifierRegistry) -> None:
-        """Register deterministic TRUSTED DuckDB verifiers (no LLM calls)."""
+        """Register deterministic TRUSTED verifiers (no LLM calls)."""
         ...
 
     def decision_questions(self) -> list[DecisionQuestion]:
-        """Closed-set questions the board must answer."""
+        """Closed-set questions the investigation board must answer."""
         ...
 
     def hypothesis_families(self) -> list[str]:
-        """Initial failure/signal families for parallel swarm exploration."""
+        """Initial hypothesis/signal families for parallel swarm exploration."""
+        ...
+
+    def pivotal_fields(self) -> list[str]:
+        """Canonical board field names seeded at version 0 and protected from eviction."""
+        ...
+
+    def required_signal_fields(self) -> tuple[str, ...]:
+        """Independent signal fields that must all be certified to confirm a hypothesis."""
+        ...
+
+    def extract_field_patches_from_note(self, note: Note) -> dict[str, Any] | None:
+        """Optional deterministic mapping from a verifier Note to `{field_name: value}`."""
         ...
 
     def score(self, board: dict[str, Any], truth: GroundTruth) -> dict[str, Any]:
@@ -264,17 +347,19 @@ __all__ = [
     "BoardField",
     "CaseCategory",
     "CertificationStatus",
+    "CostEstimate",
     "DecisionQuestion",
     "Domain",
+    "ExecutionBackend",
     "FieldStatus",
     "GroundTruth",
-    "HypothesisQuerySpec",
+    "GuardValidationError",
+    "HypothesisSpec",
     "InMemoryVerifierRegistry",
     "InvestigationBoard",
     "NeedleSpec",
     "Note",
     "QuestionType",
-    "RecommendedAction",
     "SubtletyLevel",
     "VerifierRegistry",
     "VerifierResult",

@@ -1,7 +1,7 @@
 """Immutable, append-only NoteStore for ARES (Invariant I3).
 
-Provides thread-safe note appending, sequential note ID generation, content-hash
-deduplication lookups, and artifact index lookups for multimodal provenance checks.
+100% modality- and backend-agnostic: provides thread-safe note appending, sequential
+note ID generation, content-hash deduplication lookups, and artifact provenance lookups.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ class NoteStore:
         self._lock = threading.Lock()
         self._notes: list[Note] = []
         self._by_id: dict[str, Note] = {}
-        self._by_query_hash: dict[str, Note] = {}
+        self._by_content_hash: dict[str, Note] = {}
         self._artifacts: dict[str, ArtifactRef] = {}
         self._counter: int = 0
 
@@ -38,8 +38,8 @@ class NoteStore:
                 raise ValueError(f"Note ID already exists (append-only store): {note.note_id}")
             self._notes.append(note)
             self._by_id[note.note_id] = note
-            if note.query_hash and note.query_hash not in self._by_query_hash:
-                self._by_query_hash[note.query_hash] = note
+            if note.content_hash and note.content_hash not in self._by_content_hash:
+                self._by_content_hash[note.content_hash] = note
             for art in note.artifacts:
                 self._artifacts[art.artifact_id] = art
             return note
@@ -54,19 +54,19 @@ class NoteStore:
         with self._lock:
             return note_id in self._by_id
 
-    def has_query_hash(self, query_hash: str) -> bool:
-        """Return True if a Note with the given normalized query_hash is already stored."""
-        if not query_hash:
+    def has_content_hash(self, content_hash: str) -> bool:
+        """Return True if a Note with the given content_hash is already stored."""
+        if not content_hash:
             return False
         with self._lock:
-            return query_hash in self._by_query_hash
+            return content_hash in self._by_content_hash
 
-    def get_by_query_hash(self, query_hash: str) -> Note | None:
-        """Return the first Note matching query_hash, or None."""
-        if not query_hash:
+    def get_by_content_hash(self, content_hash: str) -> Note | None:
+        """Return the first Note matching content_hash, or None."""
+        if not content_hash:
             return None
         with self._lock:
-            return self._by_query_hash.get(query_hash)
+            return self._by_content_hash.get(content_hash)
 
     def has_artifact(self, artifact_id: str) -> bool:
         """Return True if an ArtifactRef with artifact_id is attached to any stored Note."""

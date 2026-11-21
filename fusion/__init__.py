@@ -1,8 +1,6 @@
-"""Fusion layer for ARES InvestigationBoard state, invariant enforcement, replay, and loop."""
+"""Backend- and domain-agnostic Fusion layer for ARES InvestigationBoard state & loop."""
 
 from fusion.loop import (
-    CANONICAL_VERIFIER_FIELDS,
-    REQUIRED_SIGNAL_FIELDS,
     LoopConfig,
     LoopRunResult,
     RoundTelemetry,
@@ -10,10 +8,9 @@ from fusion.loop import (
     run_investigation_loop,
 )
 from fusion.patch import (
-    CANONICAL_PIVOTAL_FIELDS,
-    DEFAULT_PIVOTAL_FIELDS,
     BoardPatch,
     FieldPatch,
+    NoteExtractorFn,
     PatchReport,
     PatchValidationError,
     archive_low_influence_fields,
@@ -29,15 +26,12 @@ from fusion.patch import (
 
 __all__ = [
     "BoardPatch",
-    "CANONICAL_PIVOTAL_FIELDS",
-    "CANONICAL_VERIFIER_FIELDS",
-    "DEFAULT_PIVOTAL_FIELDS",
     "FieldPatch",
     "LoopConfig",
     "LoopRunResult",
+    "NoteExtractorFn",
     "PatchReport",
     "PatchValidationError",
-    "REQUIRED_SIGNAL_FIELDS",
     "RoundTelemetry",
     "TerminationReason",
     "archive_low_influence_fields",

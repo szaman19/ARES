@@ -1,11 +1,11 @@
-"""Calibrated decision probe, leave-one-out 'unknown' ablation, and VoI client (`gemini-decision-1`).
+"""Backend- and domain-agnostic calibrated decision probe, 'unknown' ablation, and VoI client.
 
 Enforces ARES Plan §4 hard invariants:
 1. Strictly ONE board state per `decisions.create` API call (never multi-board prompts).
 2. Explicit `"unknown"` ablation (`ablate_board_fields` sets `value="unknown"`, `status="unknown"`
    and NEVER deletes keys from `board.fields`).
 3. Excludes prior `decision` answers/influences from serialized input to prevent self-confirming bias.
-4. Symmetric choice rubrics for `root_cause` (`none_verified` vs components) and `recommended_action`.
+4. Supports domain-supplied `DecisionQuestion` instructions/criteria with clean generic fallbacks.
 """
 
 from __future__ import annotations
@@ -16,11 +16,10 @@ import json
 import os
 import random
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-from google import genai
 from pydantic import BaseModel, Field
 
 from contracts import (
@@ -32,6 +31,10 @@ from contracts import (
     InvestigationBoard,
 )
 from models.gemini_provider import ModelTelemetry, extract_telemetry
+
+_ABSTAIN_TOKENS: frozenset[str] = frozenset(
+    {"none_verified", "insufficient_evidence", "unknown", "abstain", "undetermined", "escalate"}
+)
 
 
 class QuestionEvaluation(BaseModel):
@@ -66,14 +69,9 @@ class ProbeResult(BaseModel):
     telemetry: ModelTelemetry = Field(default_factory=ModelTelemetry)
 
 
-# ----------------------------------------------------------------------
-# Pure Board Transformation & Serialization Helpers (ARES Plan §4)
-# ----------------------------------------------------------------------
-
-
 def ablate_board_fields(
     board: InvestigationBoard,
-    field_names: list[str],
+    field_names: Sequence[str],
 ) -> InvestigationBoard:
     """Set target fields to explicit `value='unknown'`, `status='unknown'` WITHOUT deleting keys."""
     ablated = board.model_copy(deep=True)
@@ -111,12 +109,7 @@ def serialize_board_for_decision(
     *,
     shuffle_seed: int | None = None,
 ) -> str:
-    """Serialize ONLY ONE board's active field evidence for `gemini-decision-1`.
-
-    Excludes prior `decision`, `decisions`, `influence`, and `voi` metadata so
-    `gemini-decision-1` evaluates strictly from empirical field values and statuses
-    without self-confirming bias. Preserves shuffled key order when `shuffle_seed` is set.
-    """
+    """Serialize ONLY ONE board's active field evidence for `gemini-decision-1`."""
     keys = list(board.fields.keys())
     if shuffle_seed is not None:
         rng = random.Random(shuffle_seed)
@@ -134,7 +127,6 @@ def serialize_board_for_decision(
         "board_version": board.board_version,
         "fields": fields_payload,
     }
-    # Do NOT pass sort_keys=True so optional shuffle_seed ordering is preserved.
     return json.dumps(single_board_payload, indent=2, default=str)
 
 
@@ -150,88 +142,49 @@ def total_variation_distance(
     return max(0.0, min(1.0, tvd))
 
 
-# ----------------------------------------------------------------------
-# Symmetric Calibration Rubrics for `gemini-decision-1`
-# ----------------------------------------------------------------------
-
-
-def _build_choice_question_spec(q: DecisionQuestion) -> dict[str, Any]:
+def _build_choice_question_spec(
+    q: DecisionQuestion,
+    required_signal_fields: Sequence[str] = (),
+) -> dict[str, Any]:
     options = list(q.options)
-    criteria: dict[str, str] = {}
-
-    if "none_verified" in options:
-        instructions = (
-            f"{q.question} Evaluate strictly from the board's `fields` (`value` and `status`). "
-            "The three required deterministic signal fields are `logs_retry_spike`, "
-            "`metrics_zscore_breach`, and `traces_error_cluster` (a signal field may hold either "
-            "a single service string or a list of candidate services when a partial 2-of-3 decoy "
-            "co-exists with a 3-of-3 root cause). "
-            "A component is verified if and only if ALL THREE required signal fields "
-            "(`logs_retry_spike`, `metrics_zscore_breach`, `traces_error_cluster`) have "
-            "`status='certified'` and that component appears in all three (even if unrelated "
-            "exploratory fields on the board have `status='uncertified'`)."
-        )
-        for opt in options:
-            if opt == "none_verified":
-                criteria[opt] = (
-                    "Select if ANY of the three required signal fields (`logs_retry_spike`, "
-                    "`metrics_zscore_breach`, `traces_error_cluster`) is missing, has "
-                    "status != 'certified' (i.e. 'unknown' or 'uncertified'), or has value in "
-                    "('unknown', 'none'), OR if no single component appears in all three."
-                )
-            else:
-                criteria[opt] = (
-                    f"Select if all three required signal fields (`logs_retry_spike`, "
-                    f"`metrics_zscore_breach`, `traces_error_cluster`) have status='certified' "
-                    f"(with none 'unknown', 'uncertified', or 'none') and '{opt}' is present in "
-                    f"ALL THREE required signal fields (as the string value or inside the candidate list)."
-                )
+    if q.option_criteria:
+        criteria = {
+            opt: q.option_criteria.get(
+                opt,
+                f"Select when certified board fields directly verify '{opt}'.",
+            )
+            for opt in options
+        }
         return {
             "type": "choice",
-            "instructions": instructions,
+            "instructions": q.instructions or q.question,
             "criteria": criteria,
         }
 
-    if "escalate" in options:
-        instructions = (
-            f"{q.question} Select a concrete remediation ONLY when a single root cause component "
-            "appears across all three `status='certified'` required signal fields "
-            "(`logs_retry_spike`, `metrics_zscore_breach`, `traces_error_cluster`); otherwise "
-            "select 'escalate'. Inspect `metric_anomaly_type` (for that verified 3-of-3 component) "
-            "to distinguish pool exhaustion vs lock/latency regressions."
+    req_list = list(required_signal_fields)
+    abstain_opts = [opt for opt in options if opt.lower() in _ABSTAIN_TOKENS]
+    criteria = {}
+
+    if req_list and abstain_opts:
+        req_str = ", ".join(f"`{r}`" for r in req_list)
+        instructions = q.instructions or (
+            f"{q.question} Evaluate strictly from the board's `fields` (`value` and `status`). "
+            f"All required signal fields ({req_str}) must have `status='certified'` and corroborate "
+            "the same candidate entity (either as a string value or inside a candidate list) before "
+            "selecting a concrete option; otherwise select the abstention/escalation option."
         )
-        action_rubrics = {
-            "escalate": (
-                "Select when ANY of `logs_retry_spike`, `metrics_zscore_breach`, or "
-                "`traces_error_cluster` is missing, has status != 'certified', or has value in "
-                "('unknown', 'none'), or when no single component appears in all three."
-            ),
-            "rollback": (
-                "Select ONLY when a component is certified across all three required signals and "
-                "certified evidence (`metric_anomaly_type`, `fault_type`, or `candidate_remediation`) "
-                "for that verified component indicates a deployment/token regression or payments-db "
-                "lock regression warranting rollback (e.g. auth-svc with p99_latency_ms / "
-                "auth_token_drift, payments-db with lock_wait_ms, or candidate_remediation='rollback')."
-            ),
-            "restart": (
-                "Select ONLY when a component is certified across all three required signals and "
-                "certified evidence (`metric_anomaly_type`, `fault_type`, or `candidate_remediation`) "
-                "for that verified component indicates a transient lock/resource wedge warranting "
-                "restart (e.g. inventory-db with lock_wait_ms or candidate_remediation='restart')."
-            ),
-            "scale_pool": (
-                "Select ONLY when a component is certified across all three required signals and "
-                "certified evidence (`metric_anomaly_type`, `fault_type`, or `candidate_remediation`) "
-                "for that verified component indicates connection pool exhaustion "
-                "(pool_utilization_pct, POOL_EXHAUSTED, pool_exhaustion, or "
-                "candidate_remediation='scale_pool')."
-            ),
-        }
         for opt in options:
-            criteria[opt] = action_rubrics.get(
-                opt,
-                f"Select ONLY when certified 3-signal root-cause evidence specifically supports '{opt}'.",
-            )
+            if opt in abstain_opts:
+                criteria[opt] = (
+                    f"Select if ANY required signal field ({req_str}) is missing, has "
+                    "status != 'certified', or has value in ('unknown', 'none'), OR if no single "
+                    "candidate is corroborated across all required signal fields."
+                )
+            else:
+                criteria[opt] = (
+                    f"Select ONLY when all required signal fields ({req_str}) have "
+                    f"status='certified' and '{opt}' is supported across all of them."
+                )
         return {
             "type": "choice",
             "instructions": instructions,
@@ -239,7 +192,7 @@ def _build_choice_question_spec(q: DecisionQuestion) -> dict[str, Any]:
         }
 
     for opt in options:
-        if opt.lower() in ("unknown", "abstain", "undetermined"):
+        if opt.lower() in _ABSTAIN_TOKENS:
             criteria[opt] = (
                 "Select when the board fields are unknown, uncertified, or insufficient to "
                 "verify any specific option."
@@ -250,30 +203,35 @@ def _build_choice_question_spec(q: DecisionQuestion) -> dict[str, Any]:
             )
     return {
         "type": "choice",
-        "instructions": q.question,
+        "instructions": q.instructions or q.question,
         "criteria": criteria,
     }
 
 
-def _build_questions_payload(questions: list[DecisionQuestion]) -> dict[str, dict[str, Any]]:
+def _build_questions_payload(
+    questions: Sequence[DecisionQuestion],
+    *,
+    required_signal_fields: Sequence[str] = (),
+) -> dict[str, dict[str, Any]]:
     payload: dict[str, dict[str, Any]] = {}
+    req_list = list(required_signal_fields)
+
     for q in questions:
         if q.question_type == "multiple_choice":
-            payload[q.question_id] = _build_choice_question_spec(q)
+            payload[q.question_id] = _build_choice_question_spec(q, req_list)
         elif q.question_type == "yes_no":
-            if q.question_id == "sufficiently_verified" or "verified" in q.question.lower():
+            if q.instructions:
+                inst = q.instructions
+            elif req_list and (
+                q.question_id == "sufficiently_verified" or "verified" in q.question.lower()
+            ):
+                req_str = ", ".join(f"`{r}`" for r in req_list)
                 inst = (
-                    f"{q.question} Evaluate strictly from the three required deterministic signal "
-                    "fields (`logs_retry_spike`, `metrics_zscore_breach`, `traces_error_cluster`). "
-                    "Answer true (noul >= 0.5) when at least one component appears across ALL THREE "
-                    "required signal fields (`logs_retry_spike`, `metrics_zscore_breach`, "
-                    "`traces_error_cluster`) where each of those three required fields has "
-                    "status='certified' (even if a signal list also contains a partial 2-of-3 decoy "
-                    "component, or unrelated exploratory fields on the board have status='uncertified'). "
-                    "Answer false (noul < 0.5) whenever ANY of `logs_retry_spike`, "
-                    "`metrics_zscore_breach`, or `traces_error_cluster` is missing, has "
-                    "status != 'certified', or has value in ('none', 'unknown'), or when no single "
-                    "component appears in all three."
+                    f"{q.question} Evaluate strictly from the required deterministic signal fields "
+                    f"({req_str}). Answer true (noul >= 0.5) iff at least one candidate appears "
+                    f"across ALL required signal fields ({req_str}) where each required field has "
+                    "status='certified'. Answer false (noul < 0.5) whenever ANY required field is "
+                    "missing, has status != 'certified', or has value in ('none', 'unknown')."
                 )
             else:
                 inst = q.question
@@ -284,7 +242,7 @@ def _build_questions_payload(questions: list[DecisionQuestion]) -> dict[str, dic
         elif q.question_type == "bounded_score":
             payload[q.question_id] = {
                 "type": "score",
-                "instructions": q.question,
+                "instructions": q.instructions or q.question,
                 "criteria": list(q.options),
             }
         else:
@@ -298,7 +256,7 @@ def _infer_default_candidates(
     max_candidates: int = 2,
 ) -> list[str]:
     """Infer 2 high-signal candidate values for VoI simulation when not explicitly provided."""
-    excluded = {"none_verified", "unknown", "escalate", "yes", "no", "none"}
+    excluded = {*_ABSTAIN_TOKENS, "yes", "no", "none"}
     allowed_options = [
         opt for opt in (primary_question.options if primary_question else []) if opt not in excluded
     ]
@@ -310,10 +268,14 @@ def _infer_default_candidates(
             continue
         if isinstance(f.value, str) and f.value in allowed_set and f.value not in observed:
             observed.append(f.value)
+        elif isinstance(f.value, list):
+            for item in f.value:
+                if isinstance(item, str) and item in allowed_set and item not in observed:
+                    observed.append(item)
         elif isinstance(f.value, dict):
-            svc = f.value.get("service")
-            if isinstance(svc, str) and svc in allowed_set and svc not in observed:
-                observed.append(svc)
+            for val in f.value.values():
+                if isinstance(val, str) and val in allowed_set and val not in observed:
+                    observed.append(val)
 
     for opt in allowed_options:
         if len(observed) >= max_candidates:
@@ -322,11 +284,6 @@ def _infer_default_candidates(
             observed.append(opt)
 
     return observed[:max_candidates]
-
-
-# ----------------------------------------------------------------------
-# DecisionProbeClient (`v1beta` `gemini-decision-1`)
-# ----------------------------------------------------------------------
 
 
 class DecisionProbeClient:
@@ -345,7 +302,14 @@ class DecisionProbeClient:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            load_dotenv()
+            try:
+                from dotenv import load_dotenv
+
+                load_dotenv()
+            except ImportError:
+                pass
+            from google import genai
+
             key = self._api_key or os.environ.get("GEMINI_API_KEY")
             if key:
                 self._client = genai.Client(
@@ -359,14 +323,17 @@ class DecisionProbeClient:
     def evaluate_board(
         self,
         board: InvestigationBoard,
-        questions: list[DecisionQuestion],
+        questions: Sequence[DecisionQuestion],
         *,
+        required_signal_fields: Sequence[str] = (),
         shuffle_seed: int | None = None,
-        artifact_refs: list[ArtifactRef] | None = None,
+        artifact_refs: Sequence[ArtifactRef] | None = None,
     ) -> BoardEvaluation:
         """Evaluate ONE InvestigationBoard state via a single `decisions.create` call."""
         board_str = serialize_board_for_decision(board, shuffle_seed=shuffle_seed)
-        questions_payload = _build_questions_payload(questions)
+        questions_payload = _build_questions_payload(
+            questions, required_signal_fields=required_signal_fields
+        )
 
         valid_pngs: list[ArtifactRef] = []
         if artifact_refs:
@@ -506,9 +473,8 @@ class DecisionProbeClient:
     def _average_evaluations(
         eval_a: BoardEvaluation,
         eval_b: BoardEvaluation,
-        questions: list[DecisionQuestion],
+        questions: Sequence[DecisionQuestion],
     ) -> BoardEvaluation:
-        """Average two BoardEvaluations (e.g. canonical + shuffled field-order repeat)."""
         merged_answers: dict[str, QuestionEvaluation] = {}
         for q in questions:
             qa = eval_a.answers.get(q.question_id)
@@ -562,28 +528,34 @@ class DecisionProbeClient:
     def probe_board(
         self,
         board: InvestigationBoard,
-        questions: list[DecisionQuestion],
+        questions: Sequence[DecisionQuestion],
         *,
-        primary_question_id: str = "root_cause",
-        candidate_values: list[str] | None = None,
+        primary_question_id: str | None = None,
+        required_signal_fields: Sequence[str] = (),
+        candidate_values: Sequence[str] | None = None,
         run_group_ablations: bool = True,
         contested_confidence_band: tuple[float, float] = (0.45, 0.85),
         max_concurrent: int = 6,
-        artifact_refs: list[ArtifactRef] | None = None,
+        artifact_refs: Sequence[ArtifactRef] | None = None,
     ) -> ProbeResult:
         """Evaluate active board, run parallel single-field 'unknown' ablations, and compute VoI."""
         if not questions:
             raise ValueError("probe_board requires at least one DecisionQuestion.")
 
-        primary_q = next(
-            (q for q in questions if q.question_id == primary_question_id),
-            questions[0],
+        primary_q = (
+            next((q for q in questions if q.question_id == primary_question_id), questions[0])
+            if primary_question_id is not None
+            else questions[0]
         )
         eff_primary_id = primary_q.question_id
         workers = max(1, int(max_concurrent))
 
-        # 1. Base board evaluation (1 API call; +1 shuffled repeat if inside contested band)
-        base_eval = self.evaluate_board(board, questions, artifact_refs=artifact_refs)
+        base_eval = self.evaluate_board(
+            board,
+            questions,
+            required_signal_fields=required_signal_fields,
+            artifact_refs=artifact_refs,
+        )
         total_telemetry = base_eval.telemetry
         api_calls = 1
 
@@ -597,6 +569,7 @@ class DecisionProbeClient:
             shuffled_eval = self.evaluate_board(
                 board,
                 questions,
+                required_signal_fields=required_signal_fields,
                 shuffle_seed=17,
                 artifact_refs=artifact_refs,
             )
@@ -607,7 +580,6 @@ class DecisionProbeClient:
 
         base_probs = primary_base.probabilities
 
-        # 2. Parallel single-field "unknown" ablations for every field with status != "unknown"
         ablation_fields = [
             fname for fname, f in board.fields.items() if f.status != "unknown"
         ]
@@ -620,6 +592,7 @@ class DecisionProbeClient:
                         self.evaluate_board,
                         ablate_board_fields(board, [fname]),
                         questions,
+                        required_signal_fields=required_signal_fields,
                     ): fname
                     for fname in ablation_fields
                 }
@@ -631,13 +604,12 @@ class DecisionProbeClient:
                     abl_probs = abl_eval.answers[eff_primary_id].probabilities
                     raw_swings[fname] = total_variation_distance(base_probs, abl_probs)
 
-        # Optional group ablation fallback ONLY when redundant backup fields mask single-field swings
-        non_abstaining = primary_base.answer not in (
-            "none_verified",
-            "unknown",
+        non_abstaining = primary_base.answer.lower() not in {
+            *_ABSTAIN_TOKENS,
             "no",
-            "escalate",
-        )
+            "none",
+            "",
+        }
         max_single_swing = max((raw_swings[f] for f in ablation_fields), default=0.0)
         if (
             run_group_ablations
@@ -651,11 +623,11 @@ class DecisionProbeClient:
             uncertified_group = [
                 fn for fn in ablation_fields if board.fields[fn].status == "uncertified"
             ]
-            groups_to_test = [g for g in (certified_group, uncertified_group) if g]
-            for grp in groups_to_test:
+            for grp in (g for g in (certified_group, uncertified_group) if g):
                 grp_eval = self.evaluate_board(
                     ablate_board_fields(board, grp),
                     questions,
+                    required_signal_fields=required_signal_fields,
                 )
                 api_calls += 1
                 total_telemetry = total_telemetry.plus(grp_eval.telemetry)
@@ -695,14 +667,12 @@ class DecisionProbeClient:
         cert_share = max(0.0, min(1.0, cert_share))
         uncert_share = max(0.0, min(1.0, uncert_share))
 
-        # 3. Parallel VoI simulation across 2-3 candidate values (1 board per API call)
         unknown_fields = [
             fname for fname, f in board.fields.items() if f.status == "unknown"
         ]
         if unknown_fields:
             voi_targets = unknown_fields
         elif not non_abstaining:
-            # When no 'unknown' fields remain yet decision is still unverified, probe 'uncertified' fields
             voi_targets = [
                 fname for fname, f in board.fields.items() if f.status == "uncertified"
             ]
@@ -725,6 +695,7 @@ class DecisionProbeClient:
                         self.evaluate_board,
                         perturb_board_field(board, fname, cval, status="certified"),
                         questions,
+                        required_signal_fields=required_signal_fields,
                     ): (fname, cval)
                     for fname, cval in voi_jobs
                 }
@@ -742,7 +713,6 @@ class DecisionProbeClient:
         unknown_voi_max = max((field_voi[fn] for fn in voi_targets), default=0.0)
         unknown_voi_max = max(0.0, min(1.0, unknown_voi_max))
 
-        # 4. Populate updated_board copy cleanly
         updated = board.model_copy(deep=True)
         for fname, fobj in updated.fields.items():
             fobj.influence = round(max(0.0, min(1.0, field_influences.get(fname, 0.0))), 6)
@@ -782,6 +752,7 @@ __all__ = [
     "DecisionProbeClient",
     "ProbeResult",
     "QuestionEvaluation",
+    "_build_questions_payload",
     "ablate_board_fields",
     "perturb_board_field",
     "serialize_board_for_decision",

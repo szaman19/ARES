@@ -1,9 +1,9 @@
-"""Eight-step ARES + Fusion + Decision Probe investigation loop (ARES Plan §5.2).
+"""Backend- and domain-agnostic 8-step ARES + Fusion + Decision Probe investigation loop.
 
-Orchestrates:
-1. Seed: Domain verifiers, NoteStore, DuckDBTrustedRunner, TaskGraph, version-0 board
+Orchestrates (ARES Plan §5.2):
+1. Seed: Domain verifiers, optional ExecutionBackend, NoteStore, TaskGraph, version-0 board
 2. Propose (Parallel, Bounded): `gemini-4-hydrogen` swarm workers via `ARESRunner.solve`
-3. Verify (Deterministic, Cheapest-First): guarded SQL + TRUSTED DuckDB verifiers + PNG slices
+3. Verify (Deterministic, Cheapest-First): guarded magnet queries + TRUSTED verifiers + slices
 4. Fuse: multimodal `gemini-4-carbon` synthesis + deterministic canonical verifier grounding
    validated through `validate_and_merge_patch` (Invariants I1–I7)
 5. Decide & 6. Probe: `gemini-decision-1` closed-set evaluation, single-field `"unknown"`
@@ -16,27 +16,28 @@ Orchestrates:
 from __future__ import annotations
 
 import time
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from ares.duckdb_runner import DuckDBTrustedRunner
 from ares.engine import ARESRunner, RunReport, SolveEvent, TaskGraph, TaskSpec
 from ares.store import NoteStore
 from contracts import (
     ArtifactRef,
-    BoardDecision,
+    DecisionQuestion,
     Domain,
-    HypothesisQuerySpec,
+    ExecutionBackend,
+    HypothesisSpec,
     InMemoryVerifierRegistry,
     InvestigationBoard,
     Note,
 )
 from fusion.patch import (
-    CANONICAL_PIVOTAL_FIELDS,
     BoardPatch,
     FieldPatch,
+    NoteExtractorFn,
     compute_board_drift,
     compute_weakest_status,
     create_initial_board,
@@ -55,19 +56,8 @@ TerminationReason = Literal[
     "timeout",
 ]
 
-CANONICAL_VERIFIER_FIELDS: frozenset[str] = frozenset(
-    {
-        "logs_retry_spike",
-        "metrics_zscore_breach",
-        "traces_error_cluster",
-        "three_way_root_cause",
-        "metric_anomaly_type",
-    }
-)
-REQUIRED_SIGNAL_FIELDS: tuple[str, ...] = (
-    "logs_retry_spike",
-    "metrics_zscore_breach",
-    "traces_error_cluster",
+_ABSTAIN_ANSWERS: frozenset[str] = frozenset(
+    {"unknown", "none_verified", "insufficient_evidence", "abstain", "none", ""}
 )
 
 
@@ -89,7 +79,7 @@ class RoundTelemetry(BaseModel):
 
     round_index: int
     board_version: int
-    proposed_queries: int
+    proposed_hypotheses: int
     executed_tasks: int
     skipped_duplicates: int
     rejected_guard: int
@@ -100,7 +90,7 @@ class RoundTelemetry(BaseModel):
     applied_fields: list[str] = Field(default_factory=list)
     rejected_patch_fields: dict[str, str] = Field(default_factory=dict)
     decision_answer: str = "unknown"
-    recommended_action: str = "unknown"
+    decisions_summary: dict[str, str] = Field(default_factory=dict)
     sufficiently_verified: str = "no"
     decision_confidence: float = 0.0
     certified_influence_share: float = 0.0
@@ -127,7 +117,7 @@ class LoopRunResult(BaseModel):
     invariant_violations_caught: int = 0
     ungrounded_fields_on_board: int = 0
     illegal_cert_upgrades_on_board: int = 0
-    sql_queries_executed: int = 0
+    queries_executed: int = 0
     verifiers_executed: int = 0
     skipped_duplicates: int = 0
     rejected_guard: int = 0
@@ -138,7 +128,6 @@ class LoopRunResult(BaseModel):
 
 
 def _collect_verifier_png_artifacts(note_store: NoteStore) -> list[ArtifactRef]:
-    """Collect all deterministic verifier-produced PNG ArtifactRefs in NoteStore."""
     seen: set[str] = set()
     out: list[ArtifactRef] = []
     for note in note_store.snapshot():
@@ -163,7 +152,12 @@ def _collect_all_artifacts(note_store: NoteStore) -> list[ArtifactRef]:
     return out
 
 
-def _rank_voi_fields(board: InvestigationBoard, limit: int = 4) -> list[str]:
+def _rank_voi_fields(
+    board: InvestigationBoard,
+    protected_fields: Collection[str],
+    limit: int = 4,
+) -> list[str]:
+    protected_set = frozenset(protected_fields)
     candidates = [
         (fname, fld.voi)
         for fname, fld in board.fields.items()
@@ -172,7 +166,7 @@ def _rank_voi_fields(board: InvestigationBoard, limit: int = 4) -> list[str]:
     candidates.sort(
         key=lambda item: (
             -item[1],
-            0 if item[0] in CANONICAL_PIVOTAL_FIELDS else 1,
+            0 if item[0] in protected_set else 1,
             item[0],
         )
     )
@@ -182,11 +176,12 @@ def _rank_voi_fields(board: InvestigationBoard, limit: int = 4) -> list[str]:
 def _compute_blocking_fields(
     board: InvestigationBoard,
     termination_reason: TerminationReason,
+    pivotal_fields: Sequence[str],
 ) -> list[str]:
     if termination_reason == "certified_success":
         return []
     blocking: list[str] = []
-    for req in (*REQUIRED_SIGNAL_FIELDS, "three_way_root_cause"):
+    for req in pivotal_fields:
         fld = board.fields.get(req)
         if fld is None or fld.status != "certified" or fld.value in ("unknown", "none"):
             blocking.append(req)
@@ -202,38 +197,28 @@ def _compute_blocking_fields(
 
 
 def _compute_candidates_pruned(
-    note_store: NoteStore,
-    primary_options: list[str],
+    board: InvestigationBoard,
+    primary_options: Sequence[str],
+    required_signal_fields: Sequence[str],
 ) -> int:
-    excluded = {"none_verified", "unknown", "abstain", "escalate", "yes", "no", "none"}
-    candidate_pool = [opt for opt in primary_options if opt not in excluded]
+    candidate_pool = [opt for opt in primary_options if opt not in _ABSTAIN_ANSWERS]
     if not candidate_pool:
         return 0
-
-    notes = note_store.snapshot()
-    three_way_notes = [
-        n for n in notes if n.verifier_name == "verify_three_way_root_cause"
-    ]
-    if three_way_notes:
-        latest = three_way_notes[-1]
-        surviving = latest.evidence.get("verified_root_causes")
-        if isinstance(surviving, list):
-            return max(0, len(candidate_pool) - len(set(str(s) for s in surviving)))
-
-    verifier_notes = [n for n in notes if n.verifier_name is not None]
-    if not verifier_notes:
-        return 0
+    candidate_set = set(candidate_pool)
 
     surviving_sets: list[set[str]] = []
-    for vn in verifier_notes:
-        cands = vn.evidence.get("candidates")
-        if isinstance(cands, list):
-            svcs = {
-                str(c["service"])
-                for c in cands
-                if isinstance(c, dict) and c.get("service") is not None
-            }
-            surviving_sets.append(svcs)
+    target_fields = list(required_signal_fields) if required_signal_fields else list(board.fields.keys())
+    for fname in target_fields:
+        fld = board.fields.get(fname)
+        if fld is None or fld.status == "unknown":
+            continue
+        if isinstance(fld.value, str):
+            matched = {fld.value} & candidate_set
+            surviving_sets.append(matched)
+        elif isinstance(fld.value, list):
+            matched = {str(v) for v in fld.value} & candidate_set
+            surviving_sets.append(matched)
+
     if not surviving_sets:
         return 0
     intersection = set.intersection(*surviving_sets)
@@ -283,33 +268,37 @@ def _merge_canonical_and_carbon_patches(
     new_notes: list[Note],
     carbon_patch: dict[str, Any] | BoardPatch,
     note_store: NoteStore,
+    *,
+    protected_fields: Collection[str],
+    note_extractor: NoteExtractorFn | None = None,
     max_extra_fields: int = 4,
 ) -> BoardPatch:
-    """Combine deterministic canonical verifier patches with Carbon's extra field patches.
-
-    Canonical verifier fields (`logs_retry_spike`, `metrics_zscore_breach`,
-    `traces_error_cluster`, `three_way_root_cause`, `metric_anomaly_type`) always use
-    deterministic verifier-grounded FieldPatches so LLM formatting quirks or mixed
-    uncertified citations never corrupt or taint a certified verifier signal.
-    """
+    """Combine deterministic verifier-extracted patches with Carbon's extra field patches."""
     verifier_notes = [n for n in new_notes if n.verifier_name is not None]
-    det_verifier_patch = deterministic_patch_from_notes(verifier_notes)
+    det_verifier_patch = deterministic_patch_from_notes(
+        verifier_notes, note_extractor=note_extractor
+    )
 
+    canonical_keys = set(det_verifier_patch.updates.keys()) | set(protected_fields)
     merged_updates: dict[str, Any] = {}
     protected_certified_values: list[Any] = []
     protected_certified_sources: set[str] = set()
 
-    for cname in CANONICAL_VERIFIER_FIELDS:
-        if cname in det_verifier_patch.updates:
-            fp = det_verifier_patch.updates[cname]
-            merged_updates[cname] = fp
-            if all(
-                note_store.exists(s) and note_store.get(s).certification == "CERTIFIED"
-                for s in fp.sources
-            ):
-                protected_certified_values.append(fp.value)
-                protected_certified_sources.update(fp.sources)
-        elif cname in board.fields and board.fields[cname].status == "certified":
+    for cname, fp in det_verifier_patch.updates.items():
+        merged_updates[cname] = fp
+        if all(
+            note_store.exists(s) and note_store.get(s).certification == "CERTIFIED"
+            for s in fp.sources
+        ):
+            protected_certified_values.append(fp.value)
+            protected_certified_sources.update(fp.sources)
+
+    for cname in canonical_keys:
+        if (
+            cname not in merged_updates
+            and cname in board.fields
+            and board.fields[cname].status == "certified"
+        ):
             protected_certified_values.append(board.fields[cname].value)
             protected_certified_sources.update(board.fields[cname].sources)
 
@@ -327,13 +316,11 @@ def _merge_canonical_and_carbon_patches(
 
     added_extra = 0
     for fname, raw_fp in raw_carbon_updates.items():
-        if fname in CANONICAL_VERIFIER_FIELDS:
+        if fname in merged_updates:
             continue
-        if added_extra >= max_extra_fields:
+        if fname not in canonical_keys and added_extra >= max_extra_fields:
             break
 
-        # Guard against an uncertified Carbon alias colliding with a certified canonical field
-        # during alias deduplication and tainting its weakest-link status.
         fp_sources: list[str] = []
         fp_val: Any = None
         if isinstance(raw_fp, FieldPatch):
@@ -356,7 +343,8 @@ def _merge_canonical_and_carbon_patches(
                 continue
 
         merged_updates[fname] = raw_fp
-        added_extra += 1
+        if fname not in canonical_keys:
+            added_extra += 1
 
     return BoardPatch(
         updates=merged_updates,
@@ -368,15 +356,15 @@ def _build_execution_tasks_from_specs(
     *,
     round_index: int,
     board_version: int,
-    specs: list[HypothesisQuerySpec],
+    specs: list[HypothesisSpec],
     unexecuted_verifiers: list[str],
     artifact_dir: str,
+    has_query_backend: bool,
 ) -> list[TaskSpec]:
-    """Build ARES sql_query + deterministic verify TaskSpecs for a round."""
+    """Build ARES `query` + deterministic `verify` TaskSpecs for a round."""
     exec_tasks: list[TaskSpec] = []
     scheduled_verifiers: set[str] = set()
 
-    # 1. Always schedule deterministic TRUSTED verifiers requested or not yet executed
     for v_idx, vname in enumerate(unexecuted_verifiers):
         scheduled_verifiers.add(vname)
         exec_tasks.append(
@@ -390,7 +378,6 @@ def _build_execution_tasks_from_specs(
             )
         )
 
-    # 2. Schedule exploratory read-only DuckDB SQL queries proposed by Hydrogen/Carbon
     for q_idx, hspec in enumerate(specs):
         if hspec.verifier_name and hspec.verifier_name not in scheduled_verifiers:
             scheduled_verifiers.add(hspec.verifier_name)
@@ -401,11 +388,11 @@ def _build_execution_tasks_from_specs(
                     requested_under=board_version,
                     priority=0,
                     verifier_name=hspec.verifier_name,
-                    verifier_params={"artifact_dir": artifact_dir},
+                    verifier_params={**hspec.params, "artifact_dir": artifact_dir},
                 )
             )
-        if hspec.query_sql and hspec.query_sql.strip():
-            sql_only_spec = hspec.model_copy(
+        if has_query_backend and hspec.query and hspec.query.strip():
+            query_only_spec = hspec.model_copy(
                 update={
                     "verifier_name": None,
                     "requested_under": board_version,
@@ -413,11 +400,11 @@ def _build_execution_tasks_from_specs(
             )
             exec_tasks.append(
                 TaskSpec(
-                    task_id=f"r{round_index}_sql_{q_idx}",
-                    task_type="sql_query",
+                    task_id=f"r{round_index}_query_{q_idx}",
+                    task_type="query",
                     requested_under=board_version,
                     priority=1,
-                    hypothesis_spec=sql_only_spec,
+                    hypothesis_spec=query_only_spec,
                 )
             )
 
@@ -439,10 +426,24 @@ def _telemetry_from_ares_report(report: RunReport) -> ModelTelemetry:
     )
 
 
+def _find_verification_gate_answer(
+    board: InvestigationBoard,
+    questions: Sequence[DecisionQuestion],
+) -> str:
+    for q in questions:
+        if q.question_type == "yes_no" and (
+            q.question_id == "sufficiently_verified" or "verified" in q.question.lower()
+        ):
+            dec = board.decisions.get(q.question_id)
+            return dec.answer if dec is not None else "no"
+    return "yes"
+
+
 def run_investigation_loop(
     domain: Domain,
-    data_dir: str,
+    workspace_dir: str,
     *,
+    backend: ExecutionBackend | None = None,
     provider: GeminiModelProvider | None = None,
     probe_client: DecisionProbeClient | None = None,
     config: LoopConfig | None = None,
@@ -455,11 +456,11 @@ def run_investigation_loop(
     eff_provider = provider or GeminiModelProvider()
     eff_probe = probe_client or DecisionProbeClient()
 
-    resolved_data_dir = str(Path(data_dir).resolve())
+    resolved_workspace = str(Path(workspace_dir).resolve())
     eff_artifact_dir = (
         str(Path(cfg.artifact_dir).resolve())
         if cfg.artifact_dir
-        else str(Path(resolved_data_dir) / "_artifacts")
+        else str(Path(resolved_workspace) / "_artifacts")
     )
     Path(eff_artifact_dir).mkdir(parents=True, exist_ok=True)
 
@@ -471,29 +472,36 @@ def run_investigation_loop(
         v for v in available_verifiers if registry.metadata(v).get("trusted", True)
     ]
 
-    schema_desc = domain.schema_description()
+    env_desc = domain.environment_description()
+    magnet_rules = domain.magnet_rules()
     decision_questions = domain.decision_questions()
     primary_options = decision_questions[0].options if decision_questions else []
+    pivotal_fields = list(domain.pivotal_fields())
+    required_signals = tuple(domain.required_signal_fields())
+    protected_fields = frozenset(pivotal_fields) | frozenset(required_signals)
+    note_extractor = domain.extract_field_patches_from_note
 
     note_store = NoteStore()
-    duckdb_runner = DuckDBTrustedRunner(resolved_data_dir)
+    eff_backend = backend if backend is not None else domain.create_backend(resolved_workspace)
     propose_proc = eff_provider.make_propose_processor(
-        schema_description=schema_desc,
+        environment_description=env_desc,
+        magnet_rules=magnet_rules,
+        pivotal_fields=pivotal_fields,
         available_verifiers=available_verifiers,
     )
     graph = TaskGraph()
     runner = ARESRunner(
-        duckdb_runner=duckdb_runner,
+        backend=eff_backend,
         registry=registry,
         note_store=note_store,
         processors={"propose": propose_proc},
     )
-    board = create_initial_board(decision_questions)
+    board = create_initial_board(decision_questions, seed_fields=pivotal_fields)
 
     rounds: list[RoundTelemetry] = []
     total_model_telemetry = ModelTelemetry()
     total_probe_calls = 0
-    total_sql_executed = 0
+    total_queries_executed = 0
     total_verifiers_executed = 0
     total_skipped_duplicates = 0
     total_rejected_guard = 0
@@ -526,7 +534,9 @@ def run_investigation_loop(
                         "hypothesis_family": fam,
                         "max_queries": 2,
                         "thinking_level": "low",
-                        "schema_description": schema_desc,
+                        "environment_description": env_desc,
+                        "magnet_rules": magnet_rules,
+                        "pivotal_fields": pivotal_fields,
                         "available_verifiers": available_verifiers,
                         "board": board,
                     },
@@ -543,19 +553,20 @@ def run_investigation_loop(
                 _telemetry_from_ares_report(prop_report)
             )
 
-            proposed_specs: list[HypothesisQuerySpec] = []
+            proposed_specs: list[HypothesisSpec] = []
             for ptask in propose_tasks:
                 node_out = graph.nodes[ptask.task_id].output
                 if isinstance(node_out, list):
                     for item in node_out:
-                        if isinstance(item, HypothesisQuerySpec):
+                        if isinstance(item, HypothesisSpec):
                             proposed_specs.append(item)
         else:
-            high_voi_targets = _rank_voi_fields(board, limit=4)
+            high_voi_targets = _rank_voi_fields(board, protected_fields, limit=4)
             proposed_specs, followup_tel = eff_provider.propose_followup_tasks(
                 board=board,
                 high_voi_fields=high_voi_targets,
-                schema_description=schema_desc,
+                environment_description=env_desc,
+                magnet_rules=magnet_rules,
                 available_verifiers=unexecuted_verifiers or available_verifiers,
                 max_queries=3,
                 thinking_level="low",
@@ -568,6 +579,7 @@ def run_investigation_loop(
             specs=proposed_specs,
             unexecuted_verifiers=unexecuted_verifiers,
             artifact_dir=eff_artifact_dir,
+            has_query_backend=eff_backend is not None,
         )
 
         if not exec_tasks:
@@ -580,7 +592,7 @@ def run_investigation_loop(
             max_concurrent=cfg.max_concurrent_workers,
             on_event=on_ares_event,
         )
-        total_sql_executed += exec_report.usage.sql_queries_executed
+        total_queries_executed += exec_report.usage.queries_executed
         total_verifiers_executed += exec_report.usage.verifiers_executed
         total_skipped_duplicates += exec_report.usage.skipped_duplicate_tasks
         total_rejected_guard += exec_report.usage.rejected_guard_tasks
@@ -594,7 +606,8 @@ def run_investigation_loop(
         carbon_patch, carbon_tel = eff_provider.propose_board_patch(
             board=board,
             new_notes=new_notes,
-            schema_description=schema_desc,
+            environment_description=env_desc,
+            pivotal_fields=pivotal_fields,
             include_images=cfg.include_images_in_fusion,
             thinking_level="low",
         )
@@ -605,11 +618,16 @@ def run_investigation_loop(
             new_notes=new_notes,
             carbon_patch=carbon_patch,
             note_store=note_store,
+            protected_fields=protected_fields,
+            note_extractor=note_extractor,
         )
         board, patch_report = validate_and_merge_patch(
             board,
             merged_patch,
             note_store,
+            protected_fields=protected_fields,
+            seed_fields=pivotal_fields,
+            note_extractor=note_extractor,
             strict=False,
             advance_round=True,
             verify_artifact_files=True,
@@ -622,29 +640,22 @@ def run_investigation_loop(
         probe_res = eff_probe.probe_board(
             board,
             decision_questions,
+            required_signal_fields=required_signals,
             artifact_refs=png_artifacts,
         )
         board = probe_res.updated_board
         total_probe_calls += probe_res.api_calls
         total_model_telemetry = total_model_telemetry.plus(probe_res.telemetry)
 
-        top_voi_fields = _rank_voi_fields(board, limit=4)
-        rec_action = board.decisions.get(
-            "recommended_action",
-            BoardDecision(question_id="recommended_action", question="", answer="escalate"),
-        ).answer
-        suff_ver = board.decisions.get(
-            "sufficiently_verified",
-            BoardDecision(question_id="sufficiently_verified", question="", answer="no"),
-        ).answer
+        top_voi_fields = _rank_voi_fields(board, protected_fields, limit=4)
+        suff_ver = _find_verification_gate_answer(board, decision_questions)
+        decisions_summary = {qid: dec.answer for qid, dec in board.decisions.items()}
 
-        round_artifacts = [
-            art.path for n in new_notes for art in n.artifacts
-        ]
+        round_artifacts = [art.path for n in new_notes for art in n.artifacts]
         round_tel = RoundTelemetry(
             round_index=round_idx,
             board_version=board.board_version,
-            proposed_queries=len(proposed_specs),
+            proposed_hypotheses=len(proposed_specs),
             executed_tasks=exec_report.usage.completed_tasks,
             skipped_duplicates=exec_report.usage.skipped_duplicate_tasks,
             rejected_guard=exec_report.usage.rejected_guard_tasks,
@@ -655,7 +666,7 @@ def run_investigation_loop(
             applied_fields=list(patch_report.applied_fields),
             rejected_patch_fields=dict(patch_report.rejected_fields),
             decision_answer=board.decision.answer,
-            recommended_action=rec_action,
+            decisions_summary=decisions_summary,
             sufficiently_verified=suff_ver,
             decision_confidence=board.decision.confidence,
             certified_influence_share=board.decision.certified_influence_share,
@@ -676,7 +687,7 @@ def run_investigation_loop(
             board.decision.confidence >= cfg.confidence_threshold
             and board.decision.uncertified_influence_share <= cfg.max_uncertified_share
             and board.decision.unknown_voi_max < cfg.max_unknown_voi
-            and board.decision.answer not in ("unknown", "none_verified", "")
+            and board.decision.answer not in _ABSTAIN_ANSWERS
             and suff_ver == "yes"
         )
         if is_certified_success:
@@ -693,9 +704,11 @@ def run_investigation_loop(
         all_trusted_ran = bool(trusted_verifiers) and all(
             v in executed_verifier_names for v in trusted_verifiers
         )
-        missing_certified_signal = any(
-            board.fields.get(req) is None or board.fields[req].status != "certified"
-            for req in (*REQUIRED_SIGNAL_FIELDS, "three_way_root_cause")
+        missing_certified_signal = bool(pivotal_fields) and any(
+            board.fields.get(req) is None
+            or board.fields[req].status != "certified"
+            or board.fields[req].value in ("unknown", "none")
+            for req in pivotal_fields
         )
         if round_idx >= 2 and all_trusted_ran and missing_certified_signal:
             termination_reason = "honest_uncertified"
@@ -705,14 +718,17 @@ def run_investigation_loop(
     rebuilt_board = rebuild_board_from_notes(
         note_store,
         decision_questions,
+        seed_fields=pivotal_fields,
+        protected_fields=protected_fields,
+        note_extractor=note_extractor,
         verify_artifact_files=True,
     )
     final_drift = compute_board_drift(board, rebuilt_board)
     ungrounded_cnt, illegal_upgrades_cnt = _audit_final_board_invariants(
         board, note_store
     )
-    blocking = _compute_blocking_fields(board, termination_reason)
-    pruned_cnt = _compute_candidates_pruned(note_store, primary_options)
+    blocking = _compute_blocking_fields(board, termination_reason, pivotal_fields)
+    pruned_cnt = _compute_candidates_pruned(board, primary_options, required_signals)
 
     return LoopRunResult(
         board=board,
@@ -726,7 +742,7 @@ def run_investigation_loop(
         invariant_violations_caught=invariant_violations_caught,
         ungrounded_fields_on_board=ungrounded_cnt,
         illegal_cert_upgrades_on_board=illegal_upgrades_cnt,
-        sql_queries_executed=total_sql_executed,
+        queries_executed=total_queries_executed,
         verifiers_executed=total_verifiers_executed,
         skipped_duplicates=total_skipped_duplicates,
         rejected_guard=total_rejected_guard,
@@ -738,10 +754,8 @@ def run_investigation_loop(
 
 
 __all__ = [
-    "CANONICAL_VERIFIER_FIELDS",
     "LoopConfig",
     "LoopRunResult",
-    "REQUIRED_SIGNAL_FIELDS",
     "RoundTelemetry",
     "TerminationReason",
     "run_investigation_loop",

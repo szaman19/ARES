@@ -1,25 +1,27 @@
-"""Fast deterministic unit tests for the 8-step investigation loop (`fusion/loop.py`)
-and Part 1 calibration/grounding refinements (`fusion/patch.py`, `models/decision_probe.py`).
-"""
+"""Deterministic unit tests for the 8-step investigation loop (`fusion/loop.py`)."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
-
 from ares.engine import ProcessorResult, SolveEvent, TaskSpec
 from ares.store import NoteStore
+from benchmark.run_micro_bench import build_baseline_board_for_scoring
 from contracts import (
     DecisionQuestion,
-    HypothesisQuerySpec,
+    HypothesisSpec,
     InvestigationBoard,
     Note,
 )
-from domain.micro_bench import MicroBenchDomain
+from domain.micro_bench import (
+    INCIDENT_PIVOTAL_FIELDS,
+    MicroBenchDomain,
+    extract_incident_note_fields,
+)
 from fusion import (
     LoopConfig,
     RoundTelemetry,
@@ -31,11 +33,6 @@ from fusion import (
 from models import DecisionProbeClient
 from models.decision_probe import _build_questions_payload
 from models.gemini_provider import ModelTelemetry
-
-
-# ---------------------------------------------------------------------------
-# Realistic Fast Mock Provider & Mock Decision Probe
-# ---------------------------------------------------------------------------
 
 
 def _candidate_in_field(val: Any, service: str) -> bool:
@@ -76,10 +73,12 @@ class _MockLoopProvider:
     def make_propose_processor(
         self,
         *,
-        schema_description: str,
-        available_verifiers: list[str] | None = None,
+        environment_description: str,
+        magnet_rules: str = "",
+        pivotal_fields: Sequence[str] = (),
+        available_verifiers: Sequence[str] | None = None,
     ) -> Any:
-        del schema_description, available_verifiers
+        del environment_description, magnet_rules, pivotal_fields, available_verifiers
 
         def _proc(spec: TaskSpec, dep_outputs: dict[str, Any]) -> ProcessorResult:
             del dep_outputs
@@ -111,8 +110,8 @@ class _MockLoopProvider:
                 fam,
                 "SELECT service, COUNT(*) AS c FROM service_logs GROUP BY service LIMIT 5",
             )
-            hspec = HypothesisQuerySpec(
-                query_sql=qsql,
+            hspec = HypothesisSpec(
+                query=qsql,
                 hypothesis_family=fam,
                 expected_signal=f"Test {fam}",
                 requested_under=spec.requested_under,
@@ -131,18 +130,18 @@ class _MockLoopProvider:
         *,
         board: InvestigationBoard,
         new_notes: list[Note],
-        schema_description: str = "",
+        environment_description: str = "",
+        pivotal_fields: Sequence[str] = (),
         include_images: bool = True,
         thinking_level: str = "low",
     ) -> tuple[dict[str, Any], ModelTelemetry]:
-        del board, schema_description, include_images, thinking_level
+        del board, environment_description, pivotal_fields, include_images, thinking_level
         self.patch_calls += 1
         updates: dict[str, dict[str, Any]] = {}
 
-        # Add an uncertified exploratory distractor field from ad-hoc SQL notes
-        sql_notes = [n for n in new_notes if n.verifier_name is None and n.row_count > 0]
-        if sql_notes:
-            n0 = sql_notes[0]
+        query_notes = [n for n in new_notes if n.verifier_name is None and n.row_count > 0]
+        if query_notes:
+            n0 = query_notes[0]
             rows = n0.evidence.get("rows", [])
             if rows and isinstance(rows[0], dict):
                 first_val = next(iter(rows[0].values()))
@@ -152,7 +151,6 @@ class _MockLoopProvider:
                     "artifact_ids": [],
                 }
 
-        # Optionally inject an ungrounded claim on a CERTIFIED note to verify invariant guard
         cert_notes = [n for n in new_notes if n.certification == "CERTIFIED"]
         if self.inject_hallucinated_field and cert_notes:
             updates["hallucinated_claim"] = {
@@ -178,16 +176,17 @@ class _MockLoopProvider:
         *,
         board: InvestigationBoard,
         high_voi_fields: list[str],
-        schema_description: str,
-        available_verifiers: list[str] | None = None,
+        environment_description: str,
+        magnet_rules: str = "",
+        available_verifiers: Sequence[str] | None = None,
         max_queries: int = 3,
         thinking_level: str = "low",
-    ) -> tuple[list[HypothesisQuerySpec], ModelTelemetry]:
-        del schema_description, available_verifiers, max_queries, thinking_level
+    ) -> tuple[list[HypothesisSpec], ModelTelemetry]:
+        del environment_description, magnet_rules, available_verifiers, max_queries, thinking_level
         self.followup_calls += 1
         target = high_voi_fields[0] if high_voi_fields else "traces_error_cluster"
-        spec = HypothesisQuerySpec(
-            query_sql=(
+        spec = HypothesisSpec(
+            query=(
                 "SELECT service, status, MAX(duration_ms) AS max_dur "
                 "FROM traces GROUP BY service, status ORDER BY max_dur DESC LIMIT 10"
             ),
@@ -299,11 +298,6 @@ class _MockDecisionBackend:
         return SimpleNamespace(answers=answers, usage=usage)
 
 
-# ---------------------------------------------------------------------------
-# Part 1 Verification Tests: `metric_anomaly_type` & Calibration Rubrics
-# ---------------------------------------------------------------------------
-
-
 def test_deterministic_patch_populates_metric_anomaly_type_single_and_multi() -> None:
     store = NoteStore()
     n_single = store.append(
@@ -325,17 +319,27 @@ def test_deterministic_patch_populates_metric_anomaly_type_single_and_multi() ->
             },
         )
     )
-    patch_single = deterministic_patch_from_notes([n_single])
+    patch_single = deterministic_patch_from_notes(
+        [n_single], note_extractor=extract_incident_note_fields
+    )
     assert patch_single.updates["metric_anomaly_type"].value == "lock_wait_ms"
     assert patch_single.updates["metric_anomaly_type"].sources == ["n_m1"]
 
-    board = create_initial_board(MicroBenchDomain().decision_questions())
-    merged_single, rep_single = validate_and_merge_patch(board, patch_single, store)
+    board = create_initial_board(
+        MicroBenchDomain().decision_questions(), seed_fields=INCIDENT_PIVOTAL_FIELDS
+    )
+    merged_single, rep_single = validate_and_merge_patch(
+        board,
+        patch_single,
+        store,
+        seed_fields=INCIDENT_PIVOTAL_FIELDS,
+        protected_fields=INCIDENT_PIVOTAL_FIELDS,
+        note_extractor=extract_incident_note_fields,
+    )
     assert rep_single.rejected_fields == {}
     assert merged_single.fields["metric_anomaly_type"].status == "certified"
     assert merged_single.fields["metric_anomaly_type"].value == "lock_wait_ms"
 
-    # Multi-candidate decoy metric note
     store_multi = NoteStore()
     n_multi = store_multi.append(
         Note(
@@ -363,35 +367,59 @@ def test_deterministic_patch_populates_metric_anomaly_type_single_and_multi() ->
             },
         )
     )
-    patch_multi = deterministic_patch_from_notes([n_multi])
+    patch_multi = deterministic_patch_from_notes(
+        [n_multi], note_extractor=extract_incident_note_fields
+    )
     assert patch_multi.updates["metric_anomaly_type"].value == {
         "cache-redis": "p99_latency_ms",
         "payments-db": "pool_utilization_pct",
     }
-    merged_multi, rep_multi = validate_and_merge_patch(board, patch_multi, store_multi)
+    merged_multi, rep_multi = validate_and_merge_patch(
+        board,
+        patch_multi,
+        store_multi,
+        seed_fields=INCIDENT_PIVOTAL_FIELDS,
+        protected_fields=INCIDENT_PIVOTAL_FIELDS,
+        note_extractor=extract_incident_note_fields,
+    )
     assert rep_multi.rejected_fields == {}
     assert merged_multi.fields["metric_anomaly_type"].status == "certified"
 
 
-def test_decision_probe_rubrics_handle_signal_lists_and_exploratory_fields() -> None:
-    questions: list[DecisionQuestion] = MicroBenchDomain().decision_questions()
-    payload = _build_questions_payload(questions)
+def test_decision_probe_rubrics_use_domain_supplied_criteria_and_generic_fallbacks() -> None:
+    domain = MicroBenchDomain()
+    questions: list[DecisionQuestion] = domain.decision_questions()
+    payload = _build_questions_payload(
+        questions, required_signal_fields=domain.required_signal_fields()
+    )
 
     sv_inst = payload["sufficiently_verified"]["instructions"]
     assert "logs_retry_spike" in sv_inst
-    assert "metrics_zscore_breach" in sv_inst
-    assert "traces_error_cluster" in sv_inst
     assert "noul >= 0.5" in sv_inst
 
     rc_spec = payload["root_cause"]
-    assert "list of candidate services" in rc_spec["instructions"]
     assert "logs_retry_spike" in rc_spec["criteria"]["none_verified"]
     assert "ALL THREE required signal fields" in rc_spec["criteria"]["payments-db"]
 
-
-# ---------------------------------------------------------------------------
-# Part 2 & 3 End-to-End Loop Tests over Real MicroBenchDomain Parquet Shards
-# ---------------------------------------------------------------------------
+    generic_qs = [
+        DecisionQuestion(
+            question_id="lead_molecule",
+            question="Which molecule passes all filters?",
+            options=["mol_01", "mol_02", "none_verified"],
+        ),
+        DecisionQuestion(
+            question_id="sufficiently_verified",
+            question="Are all chemistry filters verified?",
+            options=["yes", "no"],
+            question_type="yes_no",
+        ),
+    ]
+    generic_payload = _build_questions_payload(
+        generic_qs,
+        required_signal_fields=("pharmacophore_match", "pains_clean", "low_strain_3d"),
+    )
+    assert "pharmacophore_match" in generic_payload["lead_molecule"]["instructions"]
+    assert "low_strain_3d" in generic_payload["sufficiently_verified"]["instructions"]
 
 
 def test_loop_multi_clue_join_certified_success_and_artifacts(tmp_path: Path) -> None:
@@ -422,13 +450,11 @@ def test_loop_multi_clue_join_certified_success_and_artifacts(tmp_path: Path) ->
     assert len(round_callbacks) == 1
     assert len(ares_events) > 0
 
-    # Hallucinated Carbon field was deterministically caught & rejected; final board has 0 violations
     assert res.invariant_violations_caught == 1
     assert res.ungrounded_fields_on_board == 0
     assert res.illegal_cert_upgrades_on_board == 0
     assert res.final_board_drift == 0.0
 
-    # Multimodal PNG artifact generated by verify_three_way_root_cause
     assert len(res.artifacts) >= 1
     assert Path(res.artifacts[0].path).is_file()
     assert res.board.fields["metric_anomaly_type"].value == "lock_wait_ms"
@@ -524,38 +550,39 @@ def test_loop_under_determined_terminates_honest_uncertified_without_false_certa
 def test_build_baseline_board_for_scoring_fairly_credits_and_penalizes(
     tmp_path: Path,
 ) -> None:
-    from benchmark import build_baseline_board_for_scoring
-
     domain = MicroBenchDomain()
     needles = domain.needle_menu()
     mc_needle = next(n for n in needles if n.category == "multi_clue_join")
     ud_needle = next(n for n in needles if n.category == "under_determined")
 
-    # Confident & verified right answer on multi-clue needle -> overall_pass True
     b_board_ok = build_baseline_board_for_scoring(
         {
-            "root_cause": mc_needle.service,
-            "recommended_action": mc_needle.recommended_action,
-            "sufficiently_verified": "yes",
+            "answers": {
+                "root_cause": mc_needle.target_entity,
+                "recommended_action": mc_needle.expected_decisions["recommended_action"],
+                "sufficiently_verified": "yes",
+            },
             "confidence": 0.91,
-        }
+        },
+        domain.decision_questions(),
     )
     mc_truth = domain.plant(str(tmp_path / "mc_score"), mc_needle)
     mc_score = domain.score(b_board_ok, mc_truth)
     assert mc_score["board_certified"] is True
     assert mc_score["overall_pass"] is True
 
-    # Overconfident 'yes' on under-determined needle -> false_certainty True!
     b_board_fc = build_baseline_board_for_scoring(
         {
-            "root_cause": ud_needle.service,
-            "recommended_action": "rollback",
-            "sufficiently_verified": "yes",
+            "answers": {
+                "root_cause": ud_needle.target_entity,
+                "recommended_action": "rollback",
+                "sufficiently_verified": "yes",
+            },
             "confidence": 0.90,
-        }
+        },
+        domain.decision_questions(),
     )
     ud_truth = domain.plant(str(tmp_path / "ud_score"), ud_needle)
     ud_score = domain.score(b_board_fc, ud_truth)
     assert ud_score["false_certainty"] is True
     assert ud_score["overall_pass"] is False
-

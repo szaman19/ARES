@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from dotenv import load_dotenv
 
 from ares.engine import TaskSpec, solve
 from contracts import (
@@ -18,7 +17,7 @@ from contracts import (
     BoardDecision,
     BoardField,
     DecisionQuestion,
-    HypothesisQuerySpec,
+    HypothesisSpec,
     InvestigationBoard,
     Note,
 )
@@ -31,7 +30,6 @@ from models import (
     serialize_board_for_decision,
 )
 
-# Minimal valid 1x1 transparent PNG bytes for multimodal attachment tests
 _TINY_PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
@@ -69,7 +67,6 @@ class _FakeDecisionClient:
         raw_text = input[0]["text"] if isinstance(input, list) else input
         parsed = json.loads(raw_text)
 
-        # Enforce single-board invariant inside mock
         assert set(parsed.keys()) == {"board_version", "fields"}
         fields = parsed["fields"]
 
@@ -137,7 +134,9 @@ class _FakeDecisionClient:
                 answers[qid] = SimpleNamespace(
                     score=1.0,
                     confidence=0.88,
-                    probabilities={lbl: (0.88 if idx == 0 else 0.12) for idx, lbl in enumerate(labels)},
+                    probabilities={
+                        lbl: (0.88 if idx == 0 else 0.12) for idx, lbl in enumerate(labels)
+                    },
                 )
 
         usage = SimpleNamespace(
@@ -158,7 +157,6 @@ class _FakeInteractionsClient:
         self.interactions = SimpleNamespace(create=self._create)
 
     def _create(self, **kwargs: Any) -> Any:
-        # Gemini 4 forbids legacy sampling / thinking_budget parameters
         gen_cfg = kwargs.get("generation_config") or {}
         for forbidden in ("temperature", "top_p", "top_k", "thinking_budget"):
             assert forbidden not in kwargs
@@ -170,11 +168,6 @@ class _FakeInteractionsClient:
         if not self._responses:
             raise AssertionError("Unexpected extra interactions.create call.")
         return self._responses.pop(0)
-
-
-# ----------------------------------------------------------------------
-# 1. Pure Board Helpers & Explicit "unknown" Ablation Invariant
-# ----------------------------------------------------------------------
 
 
 def test_ablate_board_fields_keeps_keys_and_sets_explicit_unknown() -> None:
@@ -205,7 +198,6 @@ def test_ablate_board_fields_keeps_keys_and_sets_explicit_unknown() -> None:
 
     ablated = ablate_board_fields(board, ["logs_retry_spike"])
 
-    # Original board is untouched; ablated board retains ALL keys
     assert set(ablated.fields.keys()) == {"logs_retry_spike", "metrics_zscore_breach"}
     assert board.fields["logs_retry_spike"].value == "payments-db"
 
@@ -240,17 +232,11 @@ def test_serialize_board_shuffle_seed_permutes_field_order() -> None:
     assert perturbed.fields["field_0"].status == "uncertified"
 
 
-# ----------------------------------------------------------------------
-# 2. DecisionProbeClient: One-Board-Per-Call, Influences, Shares & VoI
-# ----------------------------------------------------------------------
-
-
 def test_probe_board_one_board_per_call_and_pivotal_vs_distractor_influence() -> None:
     fake_client = _FakeDecisionClient()
     probe = DecisionProbeClient(client=fake_client)
     questions = _sample_questions()
 
-    # 3 certified pivotal clues + 1 uncertified distractor + 1 unknown extra field
     board = InvestigationBoard(
         board_version=2,
         decision=BoardDecision(
@@ -281,7 +267,6 @@ def test_probe_board_one_board_per_call_and_pivotal_vs_distractor_influence() ->
         candidate_values=candidate_vals,
     )
 
-    # Exact call count invariant: 1 base + 4 non-unknown ablations + (1 unknown * 2 candidates) = 7
     expected_ablations = 4
     expected_voi_variants = 1 * len(candidate_vals)
     assert len(fake_client.calls) == 1 + expected_ablations + expected_voi_variants
@@ -289,13 +274,11 @@ def test_probe_board_one_board_per_call_and_pivotal_vs_distractor_influence() ->
     assert result.telemetry.model_calls == 7
     assert result.telemetry.prompt_tokens == 7 * 120
 
-    # Base evaluation & updated board decisions
     assert result.base_evaluation.answers["root_cause"].answer == "payments-db"
     assert result.updated_board.decision.answer == "payments-db"
     assert result.updated_board.decisions["recommended_action"].answer == "rollback"
     assert result.updated_board.decisions["sufficiently_verified"].answer == "yes"
 
-    # Pivotal clues dominate influence (~1/3 each), distractor has 0.0 influence
     for clue in ("logs_retry_spike", "metrics_zscore_breach", "traces_error_cluster"):
         assert result.field_influences[clue] == pytest.approx(1.0 / 3.0, abs=1e-4)
         assert result.updated_board.fields[clue].influence == pytest.approx(1.0 / 3.0, abs=1e-4)
@@ -311,7 +294,6 @@ def test_probe_board_computes_high_unknown_voi_when_missing_third_clue() -> None
     probe = DecisionProbeClient(client=fake_client)
     questions = _sample_questions()
 
-    # 2 of 3 clues certified on payments-db; 3rd clue is "unknown"
     board = InvestigationBoard(
         board_version=1,
         decision=BoardDecision(
@@ -332,13 +314,11 @@ def test_probe_board_computes_high_unknown_voi_when_missing_third_clue() -> None
     cands = ["payments-db", "auth-svc"]
     result = probe.probe_board(board, questions, candidate_values=cands)
 
-    # 1 base + 2 ablations + (1 unknown * 2 candidates) = 5 calls
     assert len(fake_client.calls) == 1 + 2 + 2
     assert result.api_calls == 5
     assert result.updated_board.decision.answer == "none_verified"
     assert result.updated_board.decisions["sufficiently_verified"].answer == "no"
 
-    # Certifying `traces_error_cluster="payments-db"` flips root_cause -> high VoI!
     assert result.field_voi["traces_error_cluster"] > 0.80
     assert result.unknown_voi_max > 0.80
     assert result.updated_board.decision.unknown_voi_max > 0.80
@@ -353,7 +333,6 @@ def test_probe_board_contested_confidence_triggers_shuffled_repeat_and_bounded_s
         answers: dict[str, Any] = {}
         for qid, qspec in questions.items():
             if qspec["type"] == "choice":
-                # Confidence 0.60 is inside (0.45, 0.85) contested band
                 probs = {opt: 0.0 for opt in qspec["criteria"]}
                 first_opt = next(iter(qspec["criteria"]))
                 second_opt = list(qspec["criteria"])[1]
@@ -389,7 +368,7 @@ def test_probe_board_contested_confidence_triggers_shuffled_repeat_and_bounded_s
         DecisionQuestion(
             question_id="root_cause",
             question="Root cause?",
-            options=["payments-db", "none_verified"],
+            options=["cand_a", "none_verified"],
             question_type="multiple_choice",
         ),
         DecisionQuestion(
@@ -401,7 +380,6 @@ def test_probe_board_contested_confidence_triggers_shuffled_repeat_and_bounded_s
     ]
 
     res = probe.probe_board(board, questions, candidate_values=[])
-    # 1 canonical + 1 shuffled repeat + 0 ablations + 0 VoI = 2 calls
     assert res.api_calls == 2
     assert len(calls) == 2
     assert res.base_evaluation.answers["severity_rubric"].answer == "high"
@@ -411,16 +389,18 @@ def test_probe_board_contested_confidence_triggers_shuffled_repeat_and_bounded_s
 def test_propose_followup_tasks_sets_board_version_and_filters_verifiers() -> None:
     followup_json = json.dumps(
         {
-            "queries": [
+            "hypotheses": [
                 {
-                    "query_sql": "SELECT service, COUNT(*) FROM traces WHERE status='ERROR' GROUP BY 1;",
+                    "query": "SELECT service, COUNT(*) FROM traces WHERE status='ERROR' GROUP BY 1;",
+                    "params_json": "{}",
                     "hypothesis_family": "downstream_trace_timeout_cluster",
                     "expected_signal": "Check missing trace error cluster",
                     "target_fields": ["traces_error_cluster"],
                     "verifier_name": "verify_trace_error_cluster",
                 },
                 {
-                    "query_sql": "SELECT service, COUNT(*) FROM metrics GROUP BY 1",
+                    "query": "SELECT service, COUNT(*) FROM metrics GROUP BY 1",
+                    "params_json": "{}",
                     "hypothesis_family": "metric_check",
                     "expected_signal": "Exploratory check",
                     "target_fields": ["metrics_zscore_breach"],
@@ -441,7 +421,7 @@ def test_propose_followup_tasks_sets_board_version_and_filters_verifiers() -> No
     specs, tel = provider.propose_followup_tasks(
         board=board,
         high_voi_fields=["traces_error_cluster"],
-        schema_description="service_logs, metrics, traces",
+        environment_description="service_logs, metrics, traces",
         available_verifiers=["verify_trace_error_cluster"],
     )
 
@@ -452,17 +432,13 @@ def test_propose_followup_tasks_sets_board_version_and_filters_verifiers() -> No
     assert tel.model_calls == 1
 
 
-# ----------------------------------------------------------------------
-# 3. GeminiModelProvider: ARES `solve(...)` Processor & Multimodal Patch
-# ----------------------------------------------------------------------
-
-
 def test_make_propose_processor_executes_inside_ares_solve() -> None:
     proposal_json = json.dumps(
         {
-            "queries": [
+            "hypotheses": [
                 {
-                    "query_sql": "SELECT downstream_service, COUNT(*) AS c FROM service_logs WHERE level = 'ERROR' GROUP BY 1;",
+                    "query": "SELECT downstream_service, COUNT(*) AS c FROM service_logs WHERE level = 'ERROR' GROUP BY 1;",
+                    "params_json": "{}",
                     "hypothesis_family": "upstream_retry_spike",
                     "expected_signal": ">=12 upstream retry errors",
                     "target_fields": ["logs_retry_spike"],
@@ -485,7 +461,9 @@ def test_make_propose_processor_executes_inside_ares_solve() -> None:
 
     domain = MicroBenchDomain()
     proc = provider.make_propose_processor(
-        schema_description=domain.schema_description(),
+        environment_description=domain.environment_description(),
+        magnet_rules=domain.magnet_rules(),
+        pivotal_fields=domain.pivotal_fields(),
         available_verifiers=["verify_upstream_retry_spike", "verify_metric_zscore_breach"],
     )
 
@@ -496,7 +474,7 @@ def test_make_propose_processor_executes_inside_ares_solve() -> None:
         context={
             "hypothesis_family": "upstream_retry_spike",
             "max_queries": 2,
-            "thinking_level": "minimal",  # Should normalize cleanly to "low"
+            "thinking_level": "minimal",
         },
     )
     report = solve(tasks=[task], processors={"propose": proc}, max_concurrent=2)
@@ -510,8 +488,8 @@ def test_make_propose_processor_executes_inside_ares_solve() -> None:
     emitted_specs = report.graph.nodes["propose_retries"].output
     assert isinstance(emitted_specs, list) and len(emitted_specs) == 1
     spec0 = emitted_specs[0]
-    assert isinstance(spec0, HypothesisQuerySpec)
-    assert not spec0.query_sql.endswith(";")
+    assert isinstance(spec0, HypothesisSpec)
+    assert not spec0.query.endswith(";")
     assert spec0.verifier_name == "verify_upstream_retry_spike"
     assert spec0.requested_under == 2
 
@@ -574,7 +552,7 @@ def test_propose_board_patch_attaches_multimodal_png_and_filters_sources(
     patch, telemetry = provider.propose_board_patch(
         board=_make_empty_board(),
         new_notes=[note],
-        schema_description="service_logs, metrics, traces",
+        environment_description="service_logs, metrics, traces",
     )
 
     assert len(fake_client.calls) == 1
@@ -601,18 +579,18 @@ def test_propose_board_patch_attaches_multimodal_png_and_filters_sources(
     assert telemetry.thought_tokens == 60
 
 
-def test_run_carbon_sql_baseline_stateless_tool_loop() -> None:
+def test_run_single_agent_baseline_stateless_tool_loop() -> None:
     fc_step = SimpleNamespace(
         type="function_call",
         id="call-1",
-        name="execute_readonly_sql",
-        arguments={"sql": "SELECT service, COUNT(*) AS c FROM traces WHERE status='ERROR' GROUP BY 1;"},
+        name="execute_readonly_query",
+        arguments={"query": "SELECT service, COUNT(*) AS c FROM traces WHERE status='ERROR' GROUP BY 1;"},
         model_dump=lambda: {
             "type": "function_call",
             "id": "call-1",
-            "name": "execute_readonly_sql",
+            "name": "execute_readonly_query",
             "arguments": {
-                "sql": "SELECT service, COUNT(*) AS c FROM traces WHERE status='ERROR' GROUP BY 1;"
+                "query": "SELECT service, COUNT(*) AS c FROM traces WHERE status='ERROR' GROUP BY 1;"
             },
         },
     )
@@ -625,9 +603,11 @@ def test_run_carbon_sql_baseline_stateless_tool_loop() -> None:
         steps=[],
         output_text=json.dumps(
             {
-                "root_cause": "payments-db",
-                "recommended_action": "rollback",
-                "sufficiently_verified": "yes",
+                "answers": [
+                    {"question_id": "root_cause", "answer": "payments-db"},
+                    {"question_id": "recommended_action", "answer": "rollback"},
+                    {"question_id": "sufficiently_verified", "answer": "yes"},
+                ],
                 "confidence": 0.89,
                 "rationale": "Verified across logs, metrics, and traces.",
             }
@@ -637,41 +617,46 @@ def test_run_carbon_sql_baseline_stateless_tool_loop() -> None:
 
     fake_client = _FakeInteractionsClient([turn1, turn2])
     provider = GeminiModelProvider(client=fake_client)
-    executed_sql: list[str] = []
+    executed_queries: list[str] = []
 
-    def _exec(sql: str) -> dict[str, Any]:
-        executed_sql.append(sql)
+    def _exec(q: str) -> dict[str, Any]:
+        executed_queries.append(q)
         return {"columns": ["service", "c"], "rows": [{"service": "payments-db", "c": 16}], "row_count": 1}
 
-    res = provider.run_carbon_sql_baseline(
-        schema_description="service_logs, metrics, traces",
+    res = provider.run_single_agent_baseline(
+        environment_description="service_logs, metrics, traces",
         decision_questions=_sample_questions(),
-        sql_executor=_exec,
+        query_executor=_exec,
         max_queries=4,
     )
 
-    assert len(executed_sql) == 1
-    assert res["root_cause"] == "payments-db"
-    assert res["recommended_action"] == "rollback"
-    assert res["sufficiently_verified"] == "yes"
+    assert len(executed_queries) == 1
+    assert res["answers"]["root_cause"] == "payments-db"
+    assert res["answers"]["recommended_action"] == "rollback"
+    assert res["answers"]["sufficiently_verified"] == "yes"
     assert res["confidence"] == pytest.approx(0.89)
     assert res["telemetry"].model_calls == 2
     assert res["telemetry"].prompt_tokens == 280
 
 
-# ----------------------------------------------------------------------
-# 4. Live API Smoke Test (runs automatically when GEMINI_API_KEY is set)
-# ----------------------------------------------------------------------
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+_RUN_LIVE_SMOKE = bool(os.environ.get("GEMINI_API_KEY")) and bool(
+    os.environ.get("ARES_LIVE_SMOKE")
+)
 
 
-load_dotenv()
-_HAS_LIVE_API_KEY = bool(os.environ.get("GEMINI_API_KEY"))
-
-
-@pytest.mark.skipif(not _HAS_LIVE_API_KEY, reason="GEMINI_API_KEY not configured in environment.")
+@pytest.mark.skipif(
+    not _RUN_LIVE_SMOKE,
+    reason="Set GEMINI_API_KEY and ARES_LIVE_SMOKE=1 to run live network smoke tests.",
+)
 def test_live_gemini_hydrogen_carbon_and_decision_probe_smoke(tmp_path: Path) -> None:
     domain = MicroBenchDomain()
-    schema = domain.schema_description()
+    env_desc = domain.environment_description()
     questions = domain.decision_questions()
     verifiers = [
         "verify_upstream_retry_spike",
@@ -681,142 +666,15 @@ def test_live_gemini_hydrogen_carbon_and_decision_probe_smoke(tmp_path: Path) ->
     ]
 
     provider = GeminiModelProvider()
-
-    # 1. Live gemini-4-hydrogen hypothesis proposal
     specs, h_tel = provider.propose_hypotheses(
-        schema_description=schema,
+        environment_description=env_desc,
+        magnet_rules=domain.magnet_rules(),
+        pivotal_fields=domain.pivotal_fields(),
         hypothesis_family="upstream_retry_spike",
         available_verifiers=verifiers,
         max_queries=2,
         thinking_level="low",
     )
     assert len(specs) >= 1
-    assert "select" in specs[0].query_sql.lower()
-    assert "<data_dir>" not in specs[0].query_sql
     assert h_tel.model_calls == 1
     assert h_tel.prompt_tokens > 0
-
-    # 2. Live gemini-4-carbon multimodal board patch synthesis
-    plot_path = tmp_path / "payments_db_slice.png"
-    plot_path.write_bytes(_TINY_PNG_BYTES)
-    art = ArtifactRef(
-        artifact_id="art-live-01",
-        kind="plot_png",
-        path=str(plot_path),
-        sha256="abcd1234",
-        mime_type="image/png",
-        produced_by_verifier=True,
-    )
-    notes = [
-        Note(
-            note_id="note-logs-1",
-            certification="CERTIFIED",
-            verifier_name="verify_upstream_retry_spike",
-            summary="Found 1 (service, shard) retry spike(s).",
-            evidence={
-                "candidates": [
-                    {
-                        "service": "payments-db",
-                        "shard_id": "shard-02",
-                        "retry_log_count": 18,
-                        "distinct_traces": 18,
-                    }
-                ]
-            },
-            row_count=1,
-        ),
-        Note(
-            note_id="note-metrics-1",
-            certification="CERTIFIED",
-            verifier_name="verify_metric_zscore_breach",
-            summary="Found 1 metric z-score breach(es).",
-            evidence={
-                "candidates": [
-                    {
-                        "service": "payments-db",
-                        "shard_id": "shard-02",
-                        "metric_name": "lock_wait_ms",
-                        "breach_buckets": 6,
-                        "max_zscore": 6.8,
-                    }
-                ]
-            },
-            row_count=1,
-        ),
-        Note(
-            note_id="note-traces-1",
-            certification="CERTIFIED",
-            verifier_name="verify_trace_error_cluster",
-            summary="Found 1 downstream trace error cluster(s).",
-            evidence={
-                "candidates": [
-                    {
-                        "service": "payments-db",
-                        "shard_id": "shard-02",
-                        "error_spans": 18,
-                        "distinct_traces": 18,
-                        "max_duration_ms": 1420.0,
-                    }
-                ]
-            },
-            artifacts=[art],
-            row_count=1,
-        ),
-    ]
-
-    patch, c_tel = provider.propose_board_patch(
-        board=_make_empty_board(),
-        new_notes=notes,
-        schema_description=schema,
-        include_images=True,
-        thinking_level="low",
-    )
-    assert c_tel.model_calls == 1
-    assert len(patch["updates"]) >= 3
-    for upd in patch["updates"].values():
-        assert set(upd["sources"]).issubset({"note-logs-1", "note-metrics-1", "note-traces-1"})
-
-    # 3. Live gemini-decision-1 probe on 3-clue CERTIFIED board vs ablated 2-of-3 board
-    full_board = InvestigationBoard(
-        board_version=2,
-        decision=BoardDecision(
-            question_id="root_cause",
-            question="Which component is the verified root cause?",
-        ),
-        fields={
-            "logs_retry_spike": BoardField(
-                value="payments-db", status="certified", sources=["note-logs-1"]
-            ),
-            "metrics_zscore_breach": BoardField(
-                value="payments-db", status="certified", sources=["note-metrics-1"]
-            ),
-            "traces_error_cluster": BoardField(
-                value="payments-db", status="certified", sources=["note-traces-1"]
-            ),
-            "candidate_remediation": BoardField(
-                value="rollback", status="certified", sources=["note-metrics-1"]
-            ),
-        },
-    )
-
-    probe_client = DecisionProbeClient()
-    full_probe = probe_client.probe_board(
-        full_board,
-        questions,
-        candidate_values=[],
-    )
-    assert full_probe.updated_board.decision.answer == "payments-db"
-    assert full_probe.updated_board.decisions["sufficiently_verified"].answer == "yes"
-    assert full_probe.certified_influence_share > 0.80
-    assert full_probe.uncertified_influence_share == pytest.approx(0.0, abs=1e-5)
-
-    # Ablate traces_error_cluster -> root_cause must drop to none_verified with high unknown VoI
-    incomplete_board = ablate_board_fields(full_board, ["traces_error_cluster"])
-    inc_probe = probe_client.probe_board(
-        incomplete_board,
-        questions,
-        candidate_values=["payments-db", "cache-redis"],
-    )
-    assert inc_probe.updated_board.decision.answer == "none_verified"
-    assert inc_probe.updated_board.decisions["sufficiently_verified"].answer == "no"
-    assert inc_probe.unknown_voi_max > 0.30

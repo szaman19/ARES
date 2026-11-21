@@ -1,8 +1,9 @@
-"""Domain plug-in protocol (ARES Plan §6)."""
+"""Domain plug-in protocol re-exports."""
 
 from contracts import (
     DecisionQuestion,
     Domain,
+    ExecutionBackend,
     GroundTruth,
     NeedleSpec,
     VerifierRegistry,
@@ -11,6 +12,7 @@ from contracts import (
 __all__ = [
     "DecisionQuestion",
     "Domain",
+    "ExecutionBackend",
     "GroundTruth",
     "NeedleSpec",
     "VerifierRegistry",

@@ -1,7 +1,8 @@
 """Read-only SQL validation, normalization, content-hash dedup, and DuckDB EXPLAIN cost estimation.
 
-Enforces ARES Invariant I6 (Root Guards & Deduplication) strictly at the narrow-waist
-ARES library layer without any domain or investigation-board coupling.
+Lives inside the pluggable `adapters` layer (`adapters/sql_guard.py`), implementing
+ARES Invariant I6 (Root Guards & Deduplication) for tabular DuckDB + Parquet use cases
+without coupling the core `ares/` library to SQL or DuckDB.
 """
 
 from __future__ import annotations
@@ -15,33 +16,24 @@ from typing import Any
 import duckdb
 from pydantic import BaseModel, Field
 
+from contracts import CostEstimate, GuardValidationError
 
-class SQLValidationError(ValueError):
-    """Raised when a SQL query violates ARES read-only root guards."""
+
+class SQLValidationError(GuardValidationError):
+    """Raised when a SQL query violates read-only root guards."""
 
 
 class SQLGuardConfig(BaseModel):
     """Root-guard limits for automated DuckDB SQL queries (Invariant I6)."""
 
-    max_estimated_rows: int = Field(default=5_000_000, gt=0)
-    max_estimated_bytes: int = Field(default=2_000_000_000, gt=0)
+    max_estimated_rows: int = Field(default=50_000_000, gt=0)
+    max_estimated_bytes: int = Field(default=15_000_000_000, gt=0)
     max_result_rows: int = Field(default=500, gt=0)
     avg_bytes_per_row_fallback: int = Field(default=256, gt=0)
     allowed_data_dir: str | None = None
     allowed_tables: tuple[str, ...] | None = None
 
 
-class QueryCostEstimate(BaseModel):
-    """Estimated DuckDB scan cost produced via EXPLAIN before query execution."""
-
-    estimated_rows: int = Field(ge=0)
-    estimated_bytes: int = Field(ge=0)
-    plan_summary: str = ""
-    within_budget: bool = True
-    rejection_reason: str | None = None
-
-
-# Mutating, DDL, admin, or permission-elevating SQL keywords (forbidden everywhere outside literals)
 _FORBIDDEN_KEYWORDS: frozenset[str] = frozenset(
     {
         "INSERT",
@@ -82,7 +74,6 @@ _FORBIDDEN_KEYWORDS: frozenset[str] = frozenset(
     }
 )
 
-# Forbidden DuckDB table/scalar functions that can leak secrets, hit network, or touch arbitrary FS
 _FORBIDDEN_FUNCTIONS: frozenset[str] = frozenset(
     {
         "getenv",
@@ -91,6 +82,19 @@ _FORBIDDEN_FUNCTIONS: frozenset[str] = frozenset(
         "write_parquet",
         "read_blob",
         "read_text",
+        "read_csv",
+        "read_csv_auto",
+        "sniff_csv",
+        "read_json",
+        "read_json_auto",
+        "read_json_objects",
+        "read_ndjson",
+        "read_ndjson_auto",
+        "read_ndjson_objects",
+        "parquet_metadata",
+        "parquet_schema",
+        "parquet_file_metadata",
+        "parquet_kv_metadata",
         "glob",
         "http_get",
         "http_post",
@@ -109,7 +113,6 @@ _FORBIDDEN_URI_PREFIXES: tuple[str, ...] = (
     "ftp://",
 )
 
-# SQL tokens that are safe to uppercase during normalization (keywords)
 _SQL_KEYWORDS_TO_NORMALIZE: frozenset[str] = frozenset(
     {
         "SELECT",
@@ -209,7 +212,6 @@ def _strip_sql_comments(sql: str) -> str:
             i += 1
             continue
 
-        # Line comment
         if ch == "-" and nxt == "-":
             i += 2
             while i < n and sql[i] != "\n":
@@ -217,7 +219,6 @@ def _strip_sql_comments(sql: str) -> str:
             out.append(" ")
             continue
 
-        # Block comment
         if ch == "/" and nxt == "*":
             i += 2
             while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
@@ -275,12 +276,7 @@ def _split_literals_and_code(sql: str) -> list[tuple[bool, str]]:
 
 
 def normalize_sql(sql: str) -> str:
-    """Produce a canonical normalized SQL string for content-hash deduplication.
-
-    Strips comments, collapses whitespace outside string literals, removes trailing
-    semicolons, and uppercases standard SQL keywords while preserving string literals
-    and identifier case.
-    """
+    """Produce a canonical normalized SQL string for content-hash deduplication."""
     cleaned = _strip_sql_comments(sql).strip()
     while cleaned.endswith(";"):
         cleaned = cleaned[:-1].rstrip()
@@ -303,48 +299,50 @@ def normalize_sql(sql: str) -> str:
     return "".join(normalized_parts).strip()
 
 
-def query_content_hash(
+def sql_content_hash(
     sql: str,
     *,
     hypothesis_family: str = "",
     verifier_name: str | None = None,
+    params: dict[str, Any] | None = None,
 ) -> str:
-    """Compute a deterministic SHA-256 content hash for deduplication (Invariant I6)."""
-    norm = normalize_sql(sql)
+    """Compute a deterministic SHA-256 content hash over normalized SQL + metadata."""
+    norm = normalize_sql(sql) if sql.strip() else ""
     payload = json.dumps(
         {
             "sql": norm,
             "hypothesis_family": hypothesis_family.strip(),
             "verifier_name": verifier_name or "",
+            "params": params or {},
         },
         sort_keys=True,
         separators=(",", ":"),
+        default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _extract_parquet_paths(sql: str) -> list[str]:
     """Extract string-literal paths passed to read_parquet(...) or parquet_scan(...)."""
-    pattern = re.compile(
-        r"\b(?:read_parquet|parquet_scan)\s*\(\s*'([^']+)'",
+    call_pattern = re.compile(
+        r"\b(?:read_parquet|parquet_scan)\s*\(([^)]*)\)",
         re.IGNORECASE,
     )
-    return pattern.findall(sql)
+    paths: list[str] = []
+    for args_str in call_pattern.findall(sql):
+        paths.extend(re.findall(r"'([^']*)'", args_str))
+    return paths
 
 
 def validate_readonly_sql(
     sql: str,
     config: SQLGuardConfig | None = None,
 ) -> str:
-    """Validate that SQL is a single read-only SELECT/WITH statement safe under root guards.
-
-    Returns the normalized SQL string on success; raises SQLValidationError otherwise.
-    """
+    """Validate that SQL is a single read-only SELECT/WITH statement safe under root guards."""
     if not isinstance(sql, str) or not sql.strip():
         raise SQLValidationError("SQL query must be a non-empty string.")
 
     cleaned = _strip_sql_comments(sql).strip()
-    # Strip trailing semicolons only; any remaining semicolon outside literals is multi-statement
     while cleaned.endswith(";"):
         cleaned = cleaned[:-1].rstrip()
 
@@ -353,7 +351,6 @@ def validate_readonly_sql(
 
     segments = _split_literals_and_code(cleaned)
 
-    # Reject unclosed quotes
     if segments and segments[-1][0]:
         last_lit = segments[-1][1]
         if len(last_lit) < 2 or last_lit[0] != last_lit[-1]:
@@ -362,13 +359,23 @@ def validate_readonly_sql(
     code_only = " ".join(text for is_lit, text in segments if not is_lit)
     if ";" in code_only:
         raise SQLValidationError("Multi-statement SQL is forbidden.")
+    if re.search(r"\$[A-Za-z0-9_]*\$", code_only):
+        raise SQLValidationError("Dollar-quoted strings are forbidden in guarded SQL.")
 
-    # Must begin with SELECT or WITH
+    code_with_slits = "".join(
+        " __SLIT__ " if (is_lit and text.startswith("'")) else text
+        for is_lit, text in segments
+    )
+    if re.search(r"\b(?:FROM|JOIN)\s+__SLIT__", code_with_slits, re.IGNORECASE):
+        raise SQLValidationError(
+            "Direct file replacement scans (FROM/JOIN '...') are forbidden; "
+            "query registered table views or read_parquet(...) within allowed_data_dir."
+        )
+
     first_token_match = re.match(r"^\s*([A-Za-z_]+)", code_only)
     if not first_token_match or first_token_match.group(1).upper() not in ("SELECT", "WITH"):
         raise SQLValidationError("Only read-only SELECT or WITH queries are permitted.")
 
-    # Scan all identifier/keyword tokens in non-literal code
     tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", code_only)
     for tok in tokens:
         up = tok.upper()
@@ -377,7 +384,6 @@ def validate_readonly_sql(
         if tok.lower() in _FORBIDDEN_FUNCTIONS:
             raise SQLValidationError(f"Forbidden DuckDB function detected: {tok}")
 
-    # Check URI schemes inside literals (no remote network fetches)
     for is_lit, lit_text in segments:
         if not is_lit:
             continue
@@ -386,11 +392,9 @@ def validate_readonly_sql(
             if inner.startswith(prefix):
                 raise SQLValidationError(f"Remote URI access is forbidden in SQL: {prefix}")
 
-    # Sandbox read_parquet paths if allowed_data_dir is configured
     if config and config.allowed_data_dir:
         allowed_root = Path(config.allowed_data_dir).resolve()
         for raw_path in _extract_parquet_paths(cleaned):
-            # Strip glob wildcards to resolve the parent directory
             non_glob = raw_path.split("*")[0].split("?")[0]
             candidate = Path(non_glob)
             if not candidate.is_absolute():
@@ -408,7 +412,6 @@ def validate_readonly_sql(
 
 
 def _walk_explain_json(node: Any, cardinalities: list[int], ops: list[str]) -> None:
-    """Recursively collect operator names and estimated cardinalities from DuckDB EXPLAIN JSON."""
     if isinstance(node, list):
         for item in node:
             _walk_explain_json(item, cardinalities, ops)
@@ -420,7 +423,6 @@ def _walk_explain_json(node: Any, cardinalities: list[int], ops: list[str]) -> N
     if isinstance(name, str):
         ops.append(name.strip())
 
-    # DuckDB EXPLAIN (FORMAT JSON) stores cardinality in extra_info["Estimated Cardinality"]
     extra = node.get("extra_info")
     if isinstance(extra, dict):
         est = extra.get("Estimated Cardinality")
@@ -442,7 +444,6 @@ def _walk_explain_json(node: Any, cardinalities: list[int], ops: list[str]) -> N
 
 
 def _estimate_dir_parquet_bytes(data_dir: str | None) -> int:
-    """Return total on-disk bytes of Parquet files under data_dir (0 if unavailable)."""
     if not data_dir:
         return 0
     root = Path(data_dir)
@@ -457,7 +458,7 @@ def estimate_query_cost(
     *,
     data_dir: str | None = None,
     config: SQLGuardConfig | None = None,
-) -> QueryCostEstimate:
+) -> CostEstimate:
     """Estimate rows and bytes scanned using DuckDB EXPLAIN before executing a query."""
     cfg = config or SQLGuardConfig()
     norm_sql = validate_readonly_sql(sql, cfg)
@@ -474,17 +475,13 @@ def estimate_query_cost(
                 _walk_explain_json(parsed, cardinalities, ops)
         plan_summary = " -> ".join(ops[:10])
     except Exception:
-        # Fallback to plain text EXPLAIN if JSON format is unsupported on a query shape
         text_rows = con.execute(f"EXPLAIN {norm_sql}").fetchall()
         plan_text = "\n".join(str(r[1]) for r in text_rows if len(r) > 1)
         for match in re.findall(r"~?(\d+)\s+Rows", plan_text, re.IGNORECASE):
             cardinalities.append(int(match))
         plan_summary = plan_text[:240]
 
-    # Peak operator cardinality is a safe proxy for rows scanned across the plan
     estimated_rows = max(cardinalities) if cardinalities else 0
-
-    # Estimate bytes: scale by avg row size, bounded upward if parquet files are known
     estimated_bytes = estimated_rows * cfg.avg_bytes_per_row_fallback
     if estimated_bytes == 0 and data_dir:
         estimated_bytes = _estimate_dir_parquet_bytes(data_dir)
@@ -502,8 +499,8 @@ def estimate_query_cost(
             f"Estimated bytes ({estimated_bytes}) exceed guard cap ({cfg.max_estimated_bytes})."
         )
 
-    return QueryCostEstimate(
-        estimated_rows=estimated_rows,
+    return CostEstimate(
+        estimated_units=estimated_rows,
         estimated_bytes=estimated_bytes,
         plan_summary=plan_summary,
         within_budget=within_budget,
@@ -512,11 +509,10 @@ def estimate_query_cost(
 
 
 __all__ = [
-    "QueryCostEstimate",
     "SQLGuardConfig",
     "SQLValidationError",
     "estimate_query_cost",
     "normalize_sql",
-    "query_content_hash",
+    "sql_content_hash",
     "validate_readonly_sql",
 ]

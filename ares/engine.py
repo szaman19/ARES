@@ -1,15 +1,18 @@
-"""Domain-agnostic ARES Task DAG engine and parallel solve(graph=...) runner.
+"""Backend- and domain-agnostic ARES Task DAG engine and parallel `solve(graph=...)` runner.
 
 Respects the ARES Narrow-Waist Boundary Rule (ARES Plan §3.2):
 - Provides TaskSpec, TaskGraph, solve(graph=...), max_concurrent parallel dispatch,
-  streaming/progress callbacks, populated UsageReport, root-guard validation,
-  content-hash deduplication, and cheapest-first DuckDB execution.
-- Completely unaware of investigation boards, fusion patches, or domain-specific schemas.
+  streaming/progress callbacks, populated UsageReport, pluggable ExecutionBackend
+  guard & cheapest-first cost sorting, content-hash deduplication, and standalone
+  or backend-backed TRUSTED verifier execution.
+- Completely unaware of board state, patch merging, domain schemas, or
+  any specific query language / storage engine.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import threading
 import time
@@ -18,18 +21,20 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from ares.duckdb_runner import DuckDBTrustedRunner
-from ares.sql_guard import (
-    QueryCostEstimate,
-    SQLValidationError,
-    query_content_hash,
-    validate_readonly_sql,
-)
 from ares.store import NoteStore
-from contracts import HypothesisQuerySpec, Note, VerifierRegistry
+from contracts import (
+    CertificationStatus,
+    CostEstimate,
+    ExecutionBackend,
+    GuardValidationError,
+    HypothesisSpec,
+    Note,
+    VerifierRegistry,
+    VerifierResult,
+)
 
 
-TaskType = Literal["propose", "sql_query", "verify", "custom"]
+TaskType = Literal["propose", "query", "verify", "custom"]
 TaskStatus = Literal[
     "pending",
     "running",
@@ -48,6 +53,41 @@ EventType = Literal[
 ]
 
 
+def canonical_content_hash(
+    query: str = "",
+    *,
+    hypothesis_family: str = "",
+    verifier_name: str | None = None,
+    params: dict[str, Any] | None = None,
+) -> str:
+    """Compute a modality-agnostic SHA-256 content hash for deduplication (Invariant I6)."""
+    payload = json.dumps(
+        {
+            "query": query.strip(),
+            "hypothesis_family": hypothesis_family.strip(),
+            "verifier_name": verifier_name or "",
+            "params": params or {},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def is_verifier_trusted(registry: VerifierRegistry, verifier_name: str) -> bool:
+    """Return True if a registered verifier is marked `trusted=True`."""
+    meta_fn = getattr(registry, "metadata", None)
+    if callable(meta_fn):
+        try:
+            meta = meta_fn(verifier_name)
+            if isinstance(meta, dict) and "trusted" in meta:
+                return bool(meta["trusted"])
+        except Exception:
+            return False
+    return True
+
+
 class TaskSpec(BaseModel):
     """Generic unit of work submitted through the ARES narrow waist."""
 
@@ -58,7 +98,7 @@ class TaskSpec(BaseModel):
     priority: int = 0
     # Proposal context only (Invariant I4: never passed to TRUSTED verifiers)
     context: dict[str, Any] = Field(default_factory=dict)
-    hypothesis_spec: HypothesisQuerySpec | None = None
+    hypothesis_spec: HypothesisSpec | None = None
     verifier_name: str | None = None
     verifier_params: dict[str, Any] = Field(default_factory=dict)
     processor_name: str | None = None
@@ -70,8 +110,8 @@ class TaskNode(BaseModel):
 
     spec: TaskSpec
     status: TaskStatus = "pending"
-    query_hash: str = ""
-    cost_estimate: QueryCostEstimate | None = None
+    content_hash: str = ""
+    cost_estimate: CostEstimate | None = None
     note_ids: list[str] = Field(default_factory=list)
     output: Any = None
     error: str | None = None
@@ -79,7 +119,7 @@ class TaskNode(BaseModel):
 
 
 class ProcessorResult(BaseModel):
-    """Optional structured return type for custom/propose stateless processors."""
+    """Structured return type for custom/propose stateless processors."""
 
     output: Any = None
     notes: list[Note] = Field(default_factory=list)
@@ -89,14 +129,14 @@ class ProcessorResult(BaseModel):
 
 
 class UsageReport(BaseModel):
-    """Populated execution & resource telemetry returned by solve()."""
+    """Populated execution & resource telemetry returned by `solve()`."""
 
     total_tasks: int = Field(default=0, ge=0)
     completed_tasks: int = Field(default=0, ge=0)
     failed_tasks: int = Field(default=0, ge=0)
     skipped_duplicate_tasks: int = Field(default=0, ge=0)
     rejected_guard_tasks: int = Field(default=0, ge=0)
-    sql_queries_executed: int = Field(default=0, ge=0)
+    queries_executed: int = Field(default=0, ge=0)
     verifiers_executed: int = Field(default=0, ge=0)
     notes_emitted: int = Field(default=0, ge=0)
     certified_notes: int = Field(default=0, ge=0)
@@ -109,7 +149,7 @@ class UsageReport(BaseModel):
 
 
 class SolveEvent(BaseModel):
-    """Streaming progress event emitted during solve()."""
+    """Streaming progress event emitted during `solve()`."""
 
     event_type: EventType
     task_id: str
@@ -148,7 +188,7 @@ class TaskGraph:
         return [self.add_task(s) for s in specs]
 
     def _has_cycle(self) -> bool:
-        state: dict[str, int] = {}  # 0=unvisited, 1=visiting, 2=visited
+        state: dict[str, int] = {}
 
         def _dfs(tid: str) -> bool:
             state[tid] = 1
@@ -202,7 +242,7 @@ class TaskGraph:
 
 
 class RunReport(BaseModel):
-    """Structured report returned by ARES solve()."""
+    """Structured report returned by ARES `solve()`."""
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -216,17 +256,17 @@ ProcessorFn = Callable[[TaskSpec, dict[str, Any]], Any]
 
 
 class ARESRunner:
-    """Stateless parallel TaskGraph executor for ARES."""
+    """Stateless, backend-agnostic parallel TaskGraph executor for ARES."""
 
     def __init__(
         self,
         *,
-        duckdb_runner: DuckDBTrustedRunner | None = None,
+        backend: ExecutionBackend | None = None,
         registry: VerifierRegistry | None = None,
         note_store: NoteStore | None = None,
         processors: dict[str, ProcessorFn] | None = None,
     ) -> None:
-        self.duckdb_runner = duckdb_runner
+        self.backend = backend
         self.registry = registry
         self.note_store = note_store if note_store is not None else NoteStore()
         self.processors: dict[str, ProcessorFn] = dict(processors or {})
@@ -236,28 +276,92 @@ class ARESRunner:
         if spec.dedup_key:
             return spec.dedup_key
 
-        if spec.task_type == "sql_query" and spec.hypothesis_spec is not None:
-            return query_content_hash(
-                spec.hypothesis_spec.query_sql,
+        hasher = (
+            self.backend.compute_content_hash
+            if self.backend is not None
+            else canonical_content_hash
+        )
+
+        if spec.task_type == "query" and spec.hypothesis_spec is not None:
+            effective_vname = (
+                spec.hypothesis_spec.verifier_name if self.registry is not None else None
+            )
+            return hasher(
+                spec.hypothesis_spec.query,
                 hypothesis_family=spec.hypothesis_spec.hypothesis_family,
-                verifier_name=spec.hypothesis_spec.verifier_name,
+                verifier_name=effective_vname,
+                params=spec.hypothesis_spec.params,
             )
 
         if spec.task_type == "verify":
             vname = spec.verifier_name or (
                 spec.hypothesis_spec.verifier_name if spec.hypothesis_spec else ""
             )
-            qsql = spec.hypothesis_spec.query_sql if spec.hypothesis_spec else ""
+            q_str = spec.hypothesis_spec.query if spec.hypothesis_spec else ""
             hfam = spec.hypothesis_spec.hypothesis_family if spec.hypothesis_spec else ""
-            params_repr = json.dumps(spec.verifier_params, sort_keys=True, default=str)
-            base = qsql if qsql.strip() else f"VERIFIER:{vname}:{params_repr}"
-            return query_content_hash(
-                base,
+            merged_params = {
+                **(spec.hypothesis_spec.params if spec.hypothesis_spec else {}),
+                **spec.verifier_params,
+            }
+            return hasher(
+                q_str,
                 hypothesis_family=hfam,
                 verifier_name=vname or None,
+                params=merged_params,
             )
 
         return ""
+
+    def _execute_standalone_verifier(
+        self,
+        verifier_name: str,
+        *,
+        params: dict[str, Any] | None = None,
+        requested_under: int = 0,
+        hypothesis_family: str = "",
+        query: str = "",
+        content_hash: str = "",
+    ) -> tuple[VerifierResult, Note]:
+        """Execute a pure-Python VerifierRegistry function when `backend is None`.
+
+        Enforces Invariant I4 (only explicit `params` are passed; never `spec.context`)
+        and Invariant I2 taint discipline (untrusted or failing verifiers emit UNCERTIFIED).
+        """
+        assert self.registry is not None
+        verifier_fn = self.registry.get(verifier_name)
+        trusted = is_verifier_trusted(self.registry, verifier_name)
+        effective_params = dict(params) if params else {}
+        effective_hash = content_hash or canonical_content_hash(
+            query,
+            hypothesis_family=hypothesis_family,
+            verifier_name=verifier_name,
+            params=effective_params,
+        )
+
+        result: VerifierResult = verifier_fn(effective_params)
+
+        certification: CertificationStatus = (
+            result.certification if (trusted and result.passed) else "UNCERTIFIED"
+        )
+        if certification != result.certification:
+            result = result.model_copy(update={"certification": certification})
+
+        note = Note(
+            note_id=self.note_store.next_note_id(),
+            certification=certification,
+            sources=[f"verifier:{verifier_name}"],
+            artifacts=list(result.artifacts),
+            verifier_name=verifier_name,
+            hypothesis_family=hypothesis_family,
+            query=query,
+            content_hash=effective_hash,
+            requested_under=requested_under,
+            summary=result.summary,
+            evidence=dict(result.evidence),
+            row_count=result.row_count,
+        )
+        self.note_store.append(note)
+        return result, note
 
     def solve(
         self,
@@ -268,15 +372,7 @@ class ARESRunner:
         on_event: Callable[[SolveEvent], None] | None = None,
         cost_sort: bool = True,
     ) -> RunReport:
-        """Execute pending tasks in `graph` (optionally extending with `tasks`).
-
-        Supports:
-        - Extending an existing TaskGraph across rounds via `solve(graph=g, tasks=...)`
-        - Bounded parallel dispatch (`max_concurrent`)
-        - Read-only SQL root guards & EXPLAIN cost estimation (cheapest-first)
-        - Content-hash deduplication against NoteStore and prior tasks in the graph
-        - Streaming progress callbacks (`on_event`)
-        """
+        """Execute pending tasks in `graph` (optionally extending with `tasks`)."""
         t_start = time.perf_counter()
         active_graph = graph if graph is not None else TaskGraph()
         if tasks:
@@ -287,10 +383,9 @@ class ARESRunner:
         seen_keys_lock = threading.Lock()
         seen_dedup_keys: set[str] = set()
 
-        # Pre-seed seen keys from already completed/skipped nodes in an extended graph
         for existing in active_graph.nodes.values():
-            if existing.status in ("completed", "skipped_duplicate") and existing.query_hash:
-                seen_dedup_keys.add(existing.query_hash)
+            if existing.status in ("completed", "skipped_duplicate") and existing.content_hash:
+                seen_dedup_keys.add(existing.content_hash)
 
         new_notes: list[Note] = []
         notes_lock = threading.Lock()
@@ -311,26 +406,31 @@ class ARESRunner:
             if not ready:
                 break
 
-            # Pre-flight phase for ready batch: validate guards, dedup, and EXPLAIN cost-sort
             dispatchable: list[tuple[int, int, int, int, TaskNode]] = []
 
             for idx, node in enumerate(ready):
                 spec = node.spec
                 usage.total_tasks += 1
 
-                # 1. Read-only SQL guard & EXPLAIN cost estimation for SQL tasks
-                if spec.task_type == "sql_query":
+                # 1. Pluggable root-guard validation for automated magnet queries (Invariant I6)
+                if spec.task_type == "query":
                     if spec.hypothesis_spec is None:
                         node.status = "rejected_guard"
-                        node.error = "sql_query task missing hypothesis_spec."
+                        node.error = "query task missing hypothesis_spec."
+                        errors[spec.task_id] = node.error
+                        usage.rejected_guard_tasks += 1
+                        _emit("task_rejected", spec.task_id, reason=node.error)
+                        continue
+                    if self.backend is None:
+                        node.status = "rejected_guard"
+                        node.error = "query task requires an ExecutionBackend."
                         errors[spec.task_id] = node.error
                         usage.rejected_guard_tasks += 1
                         _emit("task_rejected", spec.task_id, reason=node.error)
                         continue
                     try:
-                        cfg = self.duckdb_runner.guard_config if self.duckdb_runner else None
-                        validate_readonly_sql(spec.hypothesis_spec.query_sql, cfg)
-                    except SQLValidationError as exc:
+                        self.backend.validate_query(spec.hypothesis_spec.query)
+                    except GuardValidationError as exc:
                         node.status = "rejected_guard"
                         node.error = str(exc)
                         errors[spec.task_id] = node.error
@@ -341,59 +441,60 @@ class ARESRunner:
                 # 2. Content-hash deduplication (Invariant I6)
                 dkey = self._compute_dedup_key(spec)
                 if dkey:
-                    node.query_hash = dkey
+                    node.content_hash = dkey
                     with seen_keys_lock:
-                        already_seen = dkey in seen_dedup_keys or self.note_store.has_query_hash(dkey)
+                        already_seen = (
+                            dkey in seen_dedup_keys or self.note_store.has_content_hash(dkey)
+                        )
                         if already_seen:
                             node.status = "skipped_duplicate"
                             usage.skipped_duplicate_tasks += 1
-                            existing_note = self.note_store.get_by_query_hash(dkey)
+                            existing_note = self.note_store.get_by_content_hash(dkey)
                             if existing_note is not None:
                                 node.note_ids.append(existing_note.note_id)
                             _emit(
                                 "task_skipped",
                                 spec.task_id,
                                 reason="duplicate_content_hash",
-                                query_hash=dkey,
+                                content_hash=dkey,
                             )
                             continue
                         seen_dedup_keys.add(dkey)
 
-                # 3. EXPLAIN cost estimation for cheapest-first ordering
+                # 3. Pluggable pre-execution cost estimation for cheapest-first ordering
                 est_bytes = 0
-                est_rows = 0
+                est_units = 0
                 if (
                     cost_sort
-                    and spec.task_type == "sql_query"
+                    and spec.task_type == "query"
                     and spec.hypothesis_spec is not None
-                    and self.duckdb_runner is not None
+                    and self.backend is not None
                 ):
                     try:
-                        cost = self.duckdb_runner.estimate_cost(spec.hypothesis_spec.query_sql)
+                        cost = self.backend.estimate_cost(spec.hypothesis_spec.query)
                         node.cost_estimate = cost
                         if not cost.within_budget:
                             node.status = "rejected_guard"
-                            node.error = cost.rejection_reason or "Query exceeded EXPLAIN cost cap."
+                            node.error = cost.rejection_reason or "Query exceeded cost guard cap."
                             errors[spec.task_id] = node.error
                             usage.rejected_guard_tasks += 1
                             _emit("task_rejected", spec.task_id, reason=node.error)
                             continue
                         est_bytes = cost.estimated_bytes
-                        est_rows = cost.estimated_rows
+                        est_units = cost.estimated_units
                     except Exception as exc:
                         node.status = "rejected_guard"
-                        node.error = f"EXPLAIN failed: {exc}"
+                        node.error = f"Cost estimation failed: {exc}"
                         errors[spec.task_id] = node.error
                         usage.rejected_guard_tasks += 1
                         _emit("task_rejected", spec.task_id, reason=node.error)
                         continue
 
-                dispatchable.append((spec.priority, est_bytes, est_rows, idx, node))
+                dispatchable.append((spec.priority, est_bytes, est_units, idx, node))
 
             if not dispatchable:
                 continue
 
-            # Cheapest-first within equal priority
             dispatchable.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
             ordered_nodes = [item[4] for item in dispatchable]
 
@@ -403,39 +504,42 @@ class ARESRunner:
                 _emit("task_started", spec.task_id, task_type=spec.task_type)
                 t0 = time.perf_counter()
                 delta = {
-                    "sql_queries": 0,
+                    "queries": 0,
                     "verifiers": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "model_calls": 0,
                 }
                 try:
-                    if spec.task_type == "sql_query":
-                        if self.duckdb_runner is None:
-                            raise RuntimeError("sql_query task requires duckdb_runner.")
+                    if spec.task_type == "query":
+                        if self.backend is None:
+                            raise RuntimeError("query task requires an ExecutionBackend.")
                         hspec = spec.hypothesis_spec
                         assert hspec is not None
+                        merged_params = {**hspec.params, **spec.verifier_params}
                         if hspec.verifier_name and self.registry is not None:
-                            vres, note = self.duckdb_runner.execute_verifier(
+                            vres, note = self.backend.execute_verifier(
                                 self.registry,
                                 hspec.verifier_name,
-                                params=spec.verifier_params,
+                                params=merged_params,
                                 requested_under=spec.requested_under,
                                 hypothesis_family=hspec.hypothesis_family,
-                                query_sql=hspec.query_sql,
-                                query_hash=node.query_hash,
+                                query=hspec.query,
+                                content_hash=node.content_hash,
                                 note_store=self.note_store,
                             )
                             delta["verifiers"] += 1
                             node.output = vres
                         else:
-                            qres, note = self.duckdb_runner.execute_readonly_query(
-                                hspec.query_sql,
+                            qres, note = self.backend.execute_query(
+                                hspec.query,
+                                params=merged_params,
                                 requested_under=spec.requested_under,
                                 hypothesis_family=hspec.hypothesis_family,
+                                content_hash=node.content_hash,
                                 note_store=self.note_store,
                             )
-                            delta["sql_queries"] += 1
+                            delta["queries"] += 1
                             node.output = qres
                         node.note_ids.append(note.note_id)
                         with notes_lock:
@@ -449,32 +553,43 @@ class ARESRunner:
                         )
 
                     elif spec.task_type == "verify":
-                        if self.duckdb_runner is None or self.registry is None:
-                            raise RuntimeError(
-                                "verify task requires both duckdb_runner and registry."
-                            )
+                        if self.registry is None:
+                            raise RuntimeError("verify task requires a VerifierRegistry.")
                         vname = spec.verifier_name or (
                             spec.hypothesis_spec.verifier_name if spec.hypothesis_spec else None
                         )
                         if not vname:
                             raise ValueError("verify task missing verifier_name.")
-                        # Invariant I4: never pass spec.context to TRUSTED verifiers
-                        vres, note = self.duckdb_runner.execute_verifier(
-                            self.registry,
-                            vname,
-                            params=spec.verifier_params,
-                            requested_under=spec.requested_under,
-                            hypothesis_family=(
-                                spec.hypothesis_spec.hypothesis_family
-                                if spec.hypothesis_spec
-                                else ""
-                            ),
-                            query_sql=(
-                                spec.hypothesis_spec.query_sql if spec.hypothesis_spec else ""
-                            ),
-                            query_hash=node.query_hash,
-                            note_store=self.note_store,
+
+                        hfam = (
+                            spec.hypothesis_spec.hypothesis_family if spec.hypothesis_spec else ""
                         )
+                        q_str = spec.hypothesis_spec.query if spec.hypothesis_spec else ""
+                        merged_params = {
+                            **(spec.hypothesis_spec.params if spec.hypothesis_spec else {}),
+                            **spec.verifier_params,
+                        }
+                        # Invariant I4: never pass spec.context to TRUSTED verifiers
+                        if self.backend is not None:
+                            vres, note = self.backend.execute_verifier(
+                                self.registry,
+                                vname,
+                                params=merged_params,
+                                requested_under=spec.requested_under,
+                                hypothesis_family=hfam,
+                                query=q_str,
+                                content_hash=node.content_hash,
+                                note_store=self.note_store,
+                            )
+                        else:
+                            vres, note = self._execute_standalone_verifier(
+                                vname,
+                                params=merged_params,
+                                requested_under=spec.requested_under,
+                                hypothesis_family=hfam,
+                                query=q_str,
+                                content_hash=node.content_hash,
+                            )
                         delta["verifiers"] += 1
                         node.output = vres
                         node.note_ids.append(note.note_id)
@@ -489,7 +604,6 @@ class ARESRunner:
                         )
 
                     else:
-                        # "propose" or "custom" stateless processor
                         pname = spec.processor_name or spec.task_type
                         proc = self.processors.get(pname)
                         if proc is None:
@@ -540,13 +654,12 @@ class ARESRunner:
                         usage.failed_tasks += 1
                         if finished_node.error:
                             errors[finished_node.spec.task_id] = finished_node.error
-                    usage.sql_queries_executed += delta["sql_queries"]
+                    usage.queries_executed += delta["queries"]
                     usage.verifiers_executed += delta["verifiers"]
                     usage.total_prompt_tokens += delta["prompt_tokens"]
                     usage.total_completion_tokens += delta["completion_tokens"]
                     usage.model_calls += delta["model_calls"]
 
-        # Populate note & artifact telemetry
         usage.notes_emitted = len(new_notes)
         usage.certified_notes = sum(1 for n in new_notes if n.certification == "CERTIFIED")
         usage.uncertified_notes = sum(1 for n in new_notes if n.certification == "UNCERTIFIED")
@@ -565,7 +678,7 @@ def solve(
     tasks: list[TaskSpec] | None = None,
     *,
     graph: TaskGraph | None = None,
-    duckdb_runner: DuckDBTrustedRunner | None = None,
+    backend: ExecutionBackend | None = None,
     registry: VerifierRegistry | None = None,
     note_store: NoteStore | None = None,
     processors: dict[str, ProcessorFn] | None = None,
@@ -575,7 +688,7 @@ def solve(
 ) -> RunReport:
     """Narrow-waist functional entry point for ARES parallel TaskGraph execution."""
     runner = ARESRunner(
-        duckdb_runner=duckdb_runner,
+        backend=backend,
         registry=registry,
         note_store=note_store,
         processors=processors,
@@ -602,5 +715,7 @@ __all__ = [
     "TaskStatus",
     "TaskType",
     "UsageReport",
+    "canonical_content_hash",
+    "is_verifier_trusted",
     "solve",
 ]

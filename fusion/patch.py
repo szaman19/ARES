@@ -1,6 +1,7 @@
 """Deterministic InvestigationBoard fusion, patch validation, and invariant enforcement.
 
-Enforces all hard board invariants (ARES Plan §3.3, Invariants I1–I7):
+100% modality-, backend-, and domain-agnostic. Enforces all hard board invariants
+(ARES Plan §3.3, Invariants I1–I7):
 - I1: Strict provenance, certified value groundedness, and multimodal artifact verification.
 - I2: Monotonic / weakest-link certification and alias field deduplication.
 - I3: Immutable NoteStore source-of-truth rebuild (`rebuild_board_from_notes`) and `board_drift`.
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -30,16 +31,8 @@ from contracts import (
 )
 
 
-DEFAULT_PIVOTAL_FIELDS: list[str] = [
-    "logs_retry_spike",
-    "metrics_zscore_breach",
-    "traces_error_cluster",
-    "three_way_root_cause",
-]
-CANONICAL_PIVOTAL_FIELDS: frozenset[str] = frozenset(DEFAULT_PIVOTAL_FIELDS)
-
 _EMPTY_RESULT_SENTINELS: frozenset[str] = frozenset(
-    {"none", "none_verified", "no_match", "absent", "false"}
+    {"none", "none_verified", "no_match", "absent", "false", "insufficient_evidence"}
 )
 _STATUS_RANK: dict[FieldStatus, int] = {
     "unknown": 0,
@@ -47,8 +40,18 @@ _STATUS_RANK: dict[FieldStatus, int] = {
     "certified": 2,
 }
 _METADATA_EVIDENCE_KEYS: frozenset[str] = frozenset(
-    {"truncated", "estimated_rows", "estimated_bytes", "duration_ms", "columns"}
+    {
+        "truncated",
+        "estimated_units",
+        "estimated_rows",
+        "estimated_bytes",
+        "duration_ms",
+        "columns",
+    }
 )
+
+
+NoteExtractorFn = Callable[[Note], dict[str, Any] | None]
 
 
 class PatchValidationError(ValueError):
@@ -99,11 +102,6 @@ class PatchReport(BaseModel):
     board_drift: float = 0.0
 
 
-# ---------------------------------------------------------------------------
-# Internal Utilities
-# ---------------------------------------------------------------------------
-
-
 def _dedup_preserve_order(items: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -115,7 +113,6 @@ def _dedup_preserve_order(items: Iterable[str]) -> list[str]:
 
 
 def _normalize_patch_value(value: Any) -> Any:
-    """Normalize None or case-variant 'unknown' to canonical 'unknown'."""
     if value is None:
         return "unknown"
     if isinstance(value, str) and value.strip().lower() == "unknown":
@@ -124,7 +121,6 @@ def _normalize_patch_value(value: Any) -> Any:
 
 
 def _canonical_json_key(value: Any) -> str:
-    """Deterministic structural representation for equality and deduplication."""
     if isinstance(value, str):
         return json.dumps(value.strip())
     try:
@@ -135,7 +131,12 @@ def _canonical_json_key(value: Any) -> str:
 
 def _values_equal(a: Any, b: Any) -> bool:
     if type(a) is not type(b):
-        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
+        if (
+            isinstance(a, (int, float))
+            and isinstance(b, (int, float))
+            and not isinstance(a, bool)
+            and not isinstance(b, bool)
+        ):
             return math.isclose(float(a), float(b), abs_tol=1e-6)
         return False
     if isinstance(a, str) and isinstance(b, str):
@@ -150,7 +151,6 @@ def _extract_leaves(
     num_leaves: list[float],
     bool_leaves: set[bool],
 ) -> None:
-    """Recursively collect scalar leaves from evidence dictionaries/lists."""
     if obj is None:
         return
     if isinstance(obj, bool):
@@ -166,11 +166,15 @@ def _extract_leaves(
         return
     if isinstance(obj, dict):
         for v in obj.values():
-            _extract_leaves(v, str_leaves=str_leaves, num_leaves=num_leaves, bool_leaves=bool_leaves)
+            _extract_leaves(
+                v, str_leaves=str_leaves, num_leaves=num_leaves, bool_leaves=bool_leaves
+            )
         return
     if isinstance(obj, (list, tuple, set, frozenset)):
         for item in obj:
-            _extract_leaves(item, str_leaves=str_leaves, num_leaves=num_leaves, bool_leaves=bool_leaves)
+            _extract_leaves(
+                item, str_leaves=str_leaves, num_leaves=num_leaves, bool_leaves=bool_leaves
+            )
 
 
 def _note_has_zero_candidates(note: Note) -> bool:
@@ -183,15 +187,10 @@ def _note_has_zero_candidates(note: Note) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Board Initialization
-# ---------------------------------------------------------------------------
-
-
 def create_initial_board(
-    decision_questions: list[DecisionQuestion],
+    decision_questions: Sequence[DecisionQuestion],
     *,
-    seed_fields: list[str] | None = None,
+    seed_fields: Sequence[str] = (),
 ) -> InvestigationBoard:
     """Create a fresh version-0 InvestigationBoard from domain DecisionQuestions."""
     decisions: dict[str, BoardDecision] = {}
@@ -202,22 +201,19 @@ def create_initial_board(
             answer="unknown",
         )
 
-    if "root_cause" in decisions:
-        primary = decisions["root_cause"].model_copy(deep=True)
-    elif decision_questions:
+    if decision_questions:
         first_qid = decision_questions[0].question_id
         primary = decisions[first_qid].model_copy(deep=True)
     else:
         primary = BoardDecision(
-            question_id="root_cause",
-            question="Which component is the verified root cause?",
+            question_id="primary_decision",
+            question="What is the verified conclusion?",
             answer="unknown",
         )
-        decisions["root_cause"] = primary.model_copy(deep=True)
+        decisions[primary.question_id] = primary.model_copy(deep=True)
 
-    effective_seeds = list(DEFAULT_PIVOTAL_FIELDS) if seed_fields is None else list(seed_fields)
     fields: dict[str, BoardField] = {}
-    for fname in _dedup_preserve_order(effective_seeds):
+    for fname in _dedup_preserve_order(seed_fields):
         fields[fname] = BoardField(
             value="unknown",
             status="unknown",
@@ -237,11 +233,6 @@ def create_initial_board(
         fields=fields,
         archived_fields=[],
     )
-
-
-# ---------------------------------------------------------------------------
-# Invariant Helpers (I1, I2, I7)
-# ---------------------------------------------------------------------------
 
 
 def compute_weakest_status(
@@ -411,19 +402,18 @@ def deduplicate_fields(
     fields: dict[str, BoardField],
     note_store: NoteStore,
     *,
-    candidate_names: set[str] | frozenset[str] | None = None,
+    candidate_names: Collection[str] | None = None,
+    protected_fields: Collection[str] = (),
 ) -> tuple[dict[str, BoardField], list[str], dict[str, str]]:
-    """Merge non-canonical duplicate alias fields using union of sources and weakest status (I2).
-
-    Returns `(deduped_fields, deduplicated_alias_names, alias_to_target_map)`.
-    """
+    """Merge non-protected duplicate alias fields using union of sources and weakest status (I2)."""
+    protected_set = frozenset(protected_fields)
     surviving: dict[str, BoardField] = {}
     deduplicated: list[str] = []
     alias_to_target: dict[str, str] = {}
 
     for fname, field in fields.items():
         can_be_alias = (
-            fname not in CANONICAL_PIVOTAL_FIELDS
+            fname not in protected_set
             and field.status != "unknown"
             and (candidate_names is None or fname in candidate_names)
         )
@@ -438,14 +428,21 @@ def deduplicate_fields(
             if not _values_equal(field.value, target_field.value):
                 continue
 
+            if (
+                target_name in protected_set
+                and target_field.status == "certified"
+                and field.status != "certified"
+            ):
+                continue
+
             same_sources = frozenset(field.sources) == frozenset(target_field.sources)
             identical_complex = isinstance(field.value, (dict, list)) and len(field.value) > 0
-            shared_sources_non_canonical = (
-                target_name not in CANONICAL_PIVOTAL_FIELDS
+            shared_sources_non_protected = (
+                target_name not in protected_set
                 and bool(set(field.sources) & set(target_field.sources))
             )
 
-            if same_sources or identical_complex or shared_sources_non_canonical:
+            if same_sources or identical_complex or shared_sources_non_protected:
                 matched_target = target_name
                 break
 
@@ -482,13 +479,16 @@ def deduplicate_fields(
 def archive_low_influence_fields(
     board: InvestigationBoard,
     *,
-    updated_fields: set[str] | frozenset[str] = frozenset(),
+    updated_fields: Collection[str] = (),
+    protected_fields: Collection[str] = (),
     advance_round: bool = True,
     archive_influence_threshold: float = 0.02,
     archive_min_stale_rounds: int = 2,
     max_active_fields: int = 12,
 ) -> tuple[InvestigationBoard, list[str]]:
     """Enforce Invariant I7: archive stale low-influence fields and cap active board size."""
+    protected_set = frozenset(protected_fields)
+    updated_set = frozenset(updated_fields)
     new_fields: dict[str, BoardField] = {
         k: v.model_copy(deep=True) for k, v in board.fields.items()
     }
@@ -499,7 +499,7 @@ def archive_low_influence_fields(
         for fname, fld in list(new_fields.items()):
             if fld.status == "unknown":
                 continue
-            if fname in updated_fields:
+            if fname in updated_set:
                 new_fields[fname] = fld.model_copy(update={"stale_rounds": 0})
             elif fld.influence < archive_influence_threshold:
                 new_fields[fname] = fld.model_copy(
@@ -511,7 +511,7 @@ def archive_low_influence_fields(
     for fname, fld in list(new_fields.items()):
         if fld.status == "unknown":
             continue
-        if fname in CANONICAL_PIVOTAL_FIELDS:
+        if fname in protected_set:
             continue
         if (
             fld.influence < archive_influence_threshold
@@ -531,7 +531,7 @@ def archive_low_influence_fields(
         if non_unknown_candidates:
             non_unknown_candidates.sort(
                 key=lambda item: (
-                    item[0] in CANONICAL_PIVOTAL_FIELDS,
+                    item[0] in protected_set,
                     item[1].influence,
                     item[1].voi,
                     item[1].last_updated_version,
@@ -543,7 +543,7 @@ def archive_low_influence_fields(
             evictable_unknown = [
                 (fname, fld)
                 for fname, fld in new_fields.items()
-                if fname not in CANONICAL_PIVOTAL_FIELDS
+                if fname not in protected_set
                 and fld.voi < archive_influence_threshold
             ]
             if not evictable_unknown:
@@ -569,11 +569,6 @@ def archive_low_influence_fields(
         }
     )
     return updated_board, newly_archived
-
-
-# ---------------------------------------------------------------------------
-# Patch Coercion & Core Validation / Merge
-# ---------------------------------------------------------------------------
 
 
 def _extract_raw_updates(patch: BoardPatch | dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -649,6 +644,9 @@ def validate_and_merge_patch(
     patch: BoardPatch | dict[str, Any],
     note_store: NoteStore,
     *,
+    protected_fields: Collection[str] = (),
+    seed_fields: Sequence[str] = (),
+    note_extractor: NoteExtractorFn | None = None,
     strict: bool = True,
     advance_round: bool = True,
     archive_influence_threshold: float = 0.02,
@@ -659,6 +657,7 @@ def validate_and_merge_patch(
 ) -> tuple[InvestigationBoard, PatchReport]:
     """Validate and merge a BoardPatch into InvestigationBoard enforcing Invariants I1–I7."""
     raw_updates, _ = _extract_raw_updates(patch)
+    eff_protected = frozenset(protected_fields) | frozenset(seed_fields)
 
     working_fields: dict[str, BoardField] = {
         k: v.model_copy(deep=True) for k, v in board.fields.items()
@@ -688,7 +687,6 @@ def validate_and_merge_patch(
             patch_sources = _dedup_preserve_order(fp.sources)
             existing = working_fields.get(field_name)
 
-            # --- Handle explicit "unknown" field patch ---
             if norm_val == "unknown":
                 if patch_sources or fp.artifact_ids:
                     raise PatchValidationError(
@@ -737,7 +735,6 @@ def validate_and_merge_patch(
                 applied_fields.append(field_name)
                 continue
 
-            # --- I1: Non-unknown provenance ---
             if not patch_sources:
                 raise PatchValidationError(
                     "I1",
@@ -755,7 +752,6 @@ def validate_and_merge_patch(
 
             cited_notes = [note_store.get(nid) for nid in patch_sources]
 
-            # --- I2: Weakest-link status & explicit upgrade check ---
             patch_status = compute_weakest_status(
                 patch_sources, note_store, field_name=field_name
             )
@@ -767,7 +763,6 @@ def validate_and_merge_patch(
                     f"but cited sources only support '{patch_status}'.",
                 )
 
-            # --- I1: Multimodal artifact provenance ---
             validated_artifacts = _validate_and_collect_artifacts(
                 fp.artifact_ids,
                 cited_notes,
@@ -776,7 +771,6 @@ def validate_and_merge_patch(
                 verify_artifact_files=verify_artifact_files,
             )
 
-            # --- I1: Certified value integrity ---
             if patch_status == "certified":
                 if not value_is_grounded_in_notes(norm_val, cited_notes):
                     raise PatchValidationError(
@@ -785,7 +779,6 @@ def validate_and_merge_patch(
                         f"Ungrounded value {norm_val!r} for certified note(s) {patch_sources}.",
                     )
 
-            # --- I5: Staleness tracking ---
             if fp.requested_under is not None:
                 if fp.requested_under < 0:
                     raise PatchValidationError(
@@ -798,7 +791,6 @@ def validate_and_merge_patch(
             if board.board_version > eff_req:
                 stale_fields.append(field_name)
 
-            # --- I2: Merge with existing field if present ---
             if existing is None or existing.status == "unknown":
                 merged_sources = patch_sources
                 merged_artifacts = validated_artifacts
@@ -833,9 +825,7 @@ def validate_and_merge_patch(
                 merged_influence = existing.influence
                 merged_voi = 0.0
             else:
-                # existing.status == "uncertified" and conflicting value
                 if patch_status == "certified":
-                    # Replace uncertified hunch with strictly CERTIFIED verifier provenance
                     merged_sources = patch_sources
                     merged_artifacts = validated_artifacts
                     merged_status = "certified"
@@ -874,11 +864,11 @@ def validate_and_merge_patch(
                 raise
             rejected_fields[str(field_name)] = str(exc)
 
-    # --- I2: Cross-field alias deduplication ---
     deduped_fields, deduplicated_aliases, alias_to_target = deduplicate_fields(
         working_fields,
         note_store,
         candidate_names=newly_added_names,
+        protected_fields=eff_protected,
     )
 
     updated_targets: set[str] = {
@@ -892,10 +882,10 @@ def validate_and_merge_patch(
         }
     )
 
-    # --- I7: Active board archiving & hard size cap ---
     final_board, archived_now = archive_low_influence_fields(
         intermediate_board,
         updated_fields=updated_targets,
+        protected_fields=eff_protected,
         advance_round=advance_round,
         archive_influence_threshold=archive_influence_threshold,
         archive_min_stale_rounds=archive_min_stale_rounds,
@@ -910,6 +900,9 @@ def validate_and_merge_patch(
     if compute_drift:
         rebuilt = rebuild_board_from_notes(
             note_store,
+            seed_fields=seed_fields,
+            protected_fields=eff_protected,
+            note_extractor=note_extractor,
             verify_artifact_files=verify_artifact_files,
         )
         drift = compute_board_drift(final_board, rebuilt)
@@ -924,38 +917,6 @@ def validate_and_merge_patch(
         board_drift=drift,
     )
     return final_board, report
-
-
-# ---------------------------------------------------------------------------
-# Deterministic Rebuild & Board Drift (Invariant I3)
-# ---------------------------------------------------------------------------
-
-
-def _extract_candidate_services_value(note: Note) -> str | list[str]:
-    candidates = note.evidence.get("candidates")
-    if note.row_count == 0 or not isinstance(candidates, list) or len(candidates) == 0:
-        return "none"
-    services = [
-        str(c["service"])
-        for c in candidates
-        if isinstance(c, dict) and c.get("service") is not None
-    ]
-    if not services:
-        return "none"
-    if note.row_count == 1 or len(services) == 1:
-        return services[0]
-    return services
-
-
-def _extract_three_way_value(note: Note) -> str | list[str]:
-    roots = note.evidence.get("verified_root_causes")
-    if isinstance(roots, list):
-        if len(roots) == 0 or note.row_count == 0:
-            return "none"
-        if len(roots) == 1:
-            return str(roots[0])
-        return [str(r) for r in roots]
-    return _extract_candidate_services_value(note)
 
 
 def _extract_generic_note_value(note: Note) -> Any:
@@ -981,8 +942,6 @@ def _extract_generic_note_value(note: Note) -> Any:
     if isinstance(candidates, list) and candidates:
         first_cand = candidates[0]
         if isinstance(first_cand, dict):
-            if "service" in first_cand and first_cand["service"] is not None:
-                return first_cand["service"]
             for val in first_cand.values():
                 if isinstance(val, (str, int, float, bool)) and val is not None:
                     return val
@@ -998,16 +957,63 @@ def _extract_generic_note_value(note: Note) -> Any:
     return note.summary if note.summary else note.row_count
 
 
-_VERIFIER_TO_FIELD: dict[str, str] = {
-    "verify_upstream_retry_spike": "logs_retry_spike",
-    "verify_metric_zscore_breach": "metrics_zscore_breach",
-    "verify_trace_error_cluster": "traces_error_cluster",
-    "verify_three_way_root_cause": "three_way_root_cause",
-}
+def _merge_note_field_update(
+    updates: dict[str, FieldPatch],
+    field_cert: dict[str, bool],
+    *,
+    field_name: str,
+    value: Any,
+    note: Note,
+    valid_art_ids: list[str],
+) -> None:
+    is_cert = note.certification == "CERTIFIED"
+    prev = updates.get(field_name)
+    if prev is None:
+        updates[field_name] = FieldPatch(
+            value=value,
+            sources=[note.note_id],
+            artifact_ids=valid_art_ids,
+            requested_under=note.requested_under,
+        )
+        field_cert[field_name] = is_cert
+        return
+
+    prev_cert = field_cert[field_name]
+    if is_cert and not prev_cert:
+        updates[field_name] = FieldPatch(
+            value=value,
+            sources=[note.note_id],
+            artifact_ids=valid_art_ids,
+            requested_under=note.requested_under,
+        )
+        field_cert[field_name] = True
+    elif is_cert == prev_cert and _values_equal(value, prev.value):
+        updates[field_name] = FieldPatch(
+            value=value,
+            sources=_dedup_preserve_order([*prev.sources, note.note_id]),
+            artifact_ids=_dedup_preserve_order([*prev.artifact_ids, *valid_art_ids]),
+            requested_under=min(
+                prev.requested_under
+                if prev.requested_under is not None
+                else note.requested_under,
+                note.requested_under,
+            ),
+        )
+    elif is_cert and prev_cert:
+        updates[field_name] = FieldPatch(
+            value=value,
+            sources=_dedup_preserve_order([*prev.sources, note.note_id]),
+            artifact_ids=_dedup_preserve_order([*prev.artifact_ids, *valid_art_ids]),
+            requested_under=note.requested_under,
+        )
 
 
-def deterministic_patch_from_notes(notes: Sequence[Note]) -> BoardPatch:
-    """Deterministically map immutable Notes into canonical FieldPatches (no LLM)."""
+def deterministic_patch_from_notes(
+    notes: Sequence[Note],
+    *,
+    note_extractor: NoteExtractorFn | None = None,
+) -> BoardPatch:
+    """Deterministically map immutable Notes into FieldPatches (zero LLM calls)."""
     updates: dict[str, FieldPatch] = {}
     field_cert: dict[str, bool] = {}
 
@@ -1017,108 +1023,31 @@ def deterministic_patch_from_notes(notes: Sequence[Note]) -> BoardPatch:
             for art in note.artifacts
             if art.produced_by_verifier and bool(art.sha256 and art.sha256.strip())
         ]
-        is_cert = note.certification == "CERTIFIED"
-
-        if note.verifier_name in _VERIFIER_TO_FIELD:
-            fname = _VERIFIER_TO_FIELD[note.verifier_name]
-            if note.verifier_name == "verify_three_way_root_cause":
-                val = _extract_three_way_value(note)
-            else:
-                val = _extract_candidate_services_value(note)
-
-            prev = updates.get(fname)
-            if prev is None:
-                updates[fname] = FieldPatch(
+        extracted = note_extractor(note) if note_extractor is not None else None
+        if extracted:
+            for fname, val in extracted.items():
+                _merge_note_field_update(
+                    updates,
+                    field_cert,
+                    field_name=fname,
                     value=val,
-                    sources=[note.note_id],
-                    artifact_ids=valid_art_ids,
-                    requested_under=note.requested_under,
+                    note=note,
+                    valid_art_ids=valid_art_ids,
                 )
-                field_cert[fname] = is_cert
-            else:
-                prev_cert = field_cert[fname]
-                if is_cert and not prev_cert:
-                    updates[fname] = FieldPatch(
-                        value=val,
-                        sources=[note.note_id],
-                        artifact_ids=valid_art_ids,
-                        requested_under=note.requested_under,
-                    )
-                    field_cert[fname] = True
-                elif is_cert == prev_cert and _values_equal(val, prev.value):
-                    updates[fname] = FieldPatch(
-                        value=val,
-                        sources=_dedup_preserve_order([*prev.sources, note.note_id]),
-                        artifact_ids=_dedup_preserve_order([*prev.artifact_ids, *valid_art_ids]),
-                        requested_under=min(
-                            prev.requested_under
-                            if prev.requested_under is not None
-                            else note.requested_under,
-                            note.requested_under,
-                        ),
-                    )
-                elif is_cert and prev_cert:
-                    updates[fname] = FieldPatch(
-                        value=val,
-                        sources=_dedup_preserve_order([*prev.sources, note.note_id]),
-                        artifact_ids=_dedup_preserve_order([*prev.artifact_ids, *valid_art_ids]),
-                        requested_under=note.requested_under,
-                    )
-
-            if note.verifier_name == "verify_metric_zscore_breach" and is_cert:
-                candidates = note.evidence.get("candidates")
-                if isinstance(candidates, list) and len(candidates) > 0:
-                    anom_val: Any = None
-                    if len(candidates) == 1:
-                        c0 = candidates[0]
-                        if isinstance(c0, dict) and c0.get("metric_name") is not None:
-                            anom_val = str(c0["metric_name"])
-                    else:
-                        mapped = {
-                            str(c["service"]): str(c["metric_name"])
-                            for c in candidates
-                            if isinstance(c, dict)
-                            and c.get("service") is not None
-                            and c.get("metric_name") is not None
-                        }
-                        if mapped:
-                            anom_val = mapped
-                    if anom_val is not None:
-                        updates["metric_anomaly_type"] = FieldPatch(
-                            value=anom_val,
-                            sources=[note.note_id],
-                            artifact_ids=valid_art_ids,
-                            requested_under=note.requested_under,
-                        )
-                        field_cert["metric_anomaly_type"] = True
         else:
-            base_name = f"note_{note.hypothesis_family or note.note_id}"
+            base_name = f"note_{note.hypothesis_family or note.verifier_name or note.note_id}"
             val = _extract_generic_note_value(note)
             fname = base_name
             if fname in updates and not _values_equal(val, updates[fname].value):
                 fname = f"note_{note.note_id}"
-
-            prev = updates.get(fname)
-            if prev is None:
-                updates[fname] = FieldPatch(
-                    value=val,
-                    sources=[note.note_id],
-                    artifact_ids=valid_art_ids,
-                    requested_under=note.requested_under,
-                )
-                field_cert[fname] = is_cert
-            elif is_cert == field_cert[fname] and _values_equal(val, prev.value):
-                updates[fname] = FieldPatch(
-                    value=val,
-                    sources=_dedup_preserve_order([*prev.sources, note.note_id]),
-                    artifact_ids=_dedup_preserve_order([*prev.artifact_ids, *valid_art_ids]),
-                    requested_under=min(
-                        prev.requested_under
-                        if prev.requested_under is not None
-                        else note.requested_under,
-                        note.requested_under,
-                    ),
-                )
+            _merge_note_field_update(
+                updates,
+                field_cert,
+                field_name=fname,
+                value=val,
+                note=note,
+                valid_art_ids=valid_art_ids,
+            )
 
     return BoardPatch(
         updates=updates,
@@ -1128,17 +1057,20 @@ def deterministic_patch_from_notes(notes: Sequence[Note]) -> BoardPatch:
 
 def rebuild_board_from_notes(
     note_store: NoteStore,
-    decision_questions: list[DecisionQuestion] | None = None,
+    decision_questions: Sequence[DecisionQuestion] | None = None,
     *,
+    seed_fields: Sequence[str] = (),
+    protected_fields: Collection[str] = (),
+    note_extractor: NoteExtractorFn | None = None,
     verify_artifact_files: bool = False,
 ) -> InvestigationBoard:
     """Reconstruct the canonical InvestigationBoard from immutable NoteStore records alone (I3)."""
-    board = create_initial_board(decision_questions or [])
+    board = create_initial_board(decision_questions or (), seed_fields=seed_fields)
     notes = note_store.snapshot()
     if not notes:
         return board
 
-    patch = deterministic_patch_from_notes(notes)
+    patch = deterministic_patch_from_notes(notes, note_extractor=note_extractor)
     if not patch.updates:
         return board
 
@@ -1146,6 +1078,9 @@ def rebuild_board_from_notes(
         board,
         patch,
         note_store,
+        protected_fields=frozenset(protected_fields) | frozenset(seed_fields),
+        seed_fields=seed_fields,
+        note_extractor=note_extractor,
         strict=False,
         advance_round=False,
         verify_artifact_files=verify_artifact_files,
@@ -1155,7 +1090,6 @@ def rebuild_board_from_notes(
 
 
 def _values_compatible(patched_val: Any, rebuilt_val: Any) -> bool:
-    """Check whether `patched_val` agrees with canonical `rebuilt_val` without contradiction."""
     if _values_equal(patched_val, rebuilt_val):
         return True
 
@@ -1191,7 +1125,6 @@ def compute_board_drift(
         k: f for k, f in rebuilt_board.fields.items() if f.status != "unknown"
     }
 
-    # Build note-level certification map from rebuilt_board
     rebuilt_note_status: dict[str, FieldStatus] = {}
     for rf in rebuilt_active.values():
         for nid in rf.sources:
@@ -1219,7 +1152,6 @@ def compute_board_drift(
             disagreements.append(1.0)
             continue
         if any(nid not in rebuilt_note_status for nid in pf.sources):
-            # Allow notes that were archived out of rebuilt_board due to >12 cap only if rebuilt archived
             if not rebuilt_board.archived_fields:
                 disagreements.append(1.0)
                 continue
@@ -1248,7 +1180,11 @@ def compute_board_drift(
             if set(pf.sources) == set(rf.sources) and not _values_compatible(pf.value, rf.value):
                 disagreements.append(1.0)
                 continue
-            if pf.status == "certified" and rf.status == "certified" and not _values_compatible(pf.value, rf.value):
+            if (
+                pf.status == "certified"
+                and rf.status == "certified"
+                and not _values_compatible(pf.value, rf.value)
+            ):
                 if set(pf.sources).issuperset(set(rf.sources)):
                     disagreements.append(1.0)
                     continue
@@ -1263,9 +1199,8 @@ def compute_board_drift(
 
 __all__ = [
     "BoardPatch",
-    "CANONICAL_PIVOTAL_FIELDS",
-    "DEFAULT_PIVOTAL_FIELDS",
     "FieldPatch",
+    "NoteExtractorFn",
     "PatchReport",
     "PatchValidationError",
     "archive_low_influence_fields",
