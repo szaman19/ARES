@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import queue
 import shutil
 import sys
 import tempfile
@@ -27,7 +28,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import duckdb
 
@@ -71,13 +72,26 @@ class ObservatoryDemoState:
         self.base_stats = self._count_haystack_stats(self.base_dir)
         self.active_case: NeedleSpec | None = None
         self.active_truth: GroundTruth | None = None
-        self.cached_bench_results = self._load_cached_benchmark()
+        self.exoplanet_benchmark = self._load_json_file(
+            REPO_ROOT / "benchmark" / "results" / "exoplanet_tess_stage1.json"
+        )
+        self.incident_benchmark = self._load_json_file(
+            REPO_ROOT / "benchmark" / "results" / "micro_bench_stage1.json"
+        )
+        self.cached_bench_results = self.exoplanet_benchmark
+        self.exoplanet_baseline_by_case: dict[str, dict[str, Any]] = {}
+        if self.exoplanet_benchmark:
+            for c in self.exoplanet_benchmark.get("cases", []):
+                cid = c.get("case_id")
+                base = c.get("baseline")
+                if cid and isinstance(base, dict):
+                    self.exoplanet_baseline_by_case[str(cid)] = base
 
-    def _load_cached_benchmark(self) -> dict[str, Any] | None:
-        p = REPO_ROOT / "benchmark" / "results" / "exoplanet_tess_stage1.json"
-        if p.is_file():
+    @staticmethod
+    def _load_json_file(path: Path) -> dict[str, Any] | None:
+        if path.is_file():
             try:
-                return json.loads(p.read_text())
+                return json.loads(path.read_text())
             except Exception:
                 return None
         return None
@@ -249,9 +263,32 @@ class ObservatoryDemoState:
                 "masked_ccd_artifacts": masked_cards,
             }
 
-    def run_live_ares(self, case_id: str, include_baseline: bool = True) -> dict[str, Any]:
-        """Execute live Gemini 4 + Decision-1 ARES loop (and optional Carbon baseline)."""
+    def run_live_ares(
+        self,
+        case_id: str,
+        include_baseline: bool = False,
+        progress_cb: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Execute fast (<35s) live Gemini 4 + Decision-1 ARES loop with optional SSE progress."""
+        def _emit(payload: dict[str, Any]) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(payload)
+                except Exception:
+                    pass
+
+        _emit({"stage": "plant", "message": f"Planting real NASA TESS shard for {case_id}..."})
         plant_info = self.plant_case(case_id)
+        _emit(
+            {
+                "stage": "perceive",
+                "message": (
+                    f"Swarm active: gemini-4-hydrogen writing SQL magnets over "
+                    f"{plant_info['sector_stats']['cadence_rows']:,} cadences..."
+                ),
+            }
+        )
+
         with self.lock:
             assert self.active_truth is not None
             truth = self.active_truth
@@ -261,17 +298,67 @@ class ObservatoryDemoState:
             provider = GeminiModelProvider()
             probe = DecisionProbeClient()
             cfg = LoopConfig(
-                max_rounds=3,
+                max_rounds=2,
                 max_concurrent_workers=4,
-                wall_clock_budget_s=150.0,
+                wall_clock_budget_s=55.0,
                 artifact_dir=str(case_art_dir),
             )
+
+            seen_stages: set[str] = set()
+
+            def _on_ares_event(ev: Any) -> None:
+                tid = str(getattr(ev, "task_id", ""))
+                etype = str(getattr(ev, "event_type", ""))
+                if "_propose_" in tid and "perceive" not in seen_stages:
+                    seen_stages.add("perceive")
+                    _emit(
+                        {
+                            "stage": "perceive",
+                            "task_id": tid,
+                            "message": "gemini-4-hydrogen branching parallel SQL hypotheses...",
+                        }
+                    )
+                elif ("_verify_" in tid or "_query_" in tid) and "verify" not in seen_stages:
+                    seen_stages.add("verify")
+                    _emit(
+                        {
+                            "stage": "verify",
+                            "task_id": tid,
+                            "message": "Running TRUSTED DuckDB physics & 11x11 CCD verifiers...",
+                        }
+                    )
+                elif etype == "task_completed" and "_verify_" in tid and "fuse" not in seen_stages:
+                    seen_stages.add("fuse")
+                    _emit(
+                        {
+                            "stage": "fuse",
+                            "task_id": tid,
+                            "message": "gemini-4-carbon fusing board & enforcing Invariants I1-I7...",
+                        }
+                    )
+
+            def _on_round(round_tel: Any, _board: Any) -> None:
+                _emit(
+                    {
+                        "stage": "probe",
+                        "round_index": getattr(round_tel, "round_index", 1),
+                        "decision_answer": getattr(round_tel, "decision_answer", "unknown"),
+                        "confidence": getattr(round_tel, "decision_confidence", 0.0),
+                        "message": (
+                            f"Round {getattr(round_tel, 'round_index', 1)} complete · "
+                            f"gemini-decision-1 counterfactual reliance & VoI scored."
+                        ),
+                    }
+                )
+
             ares_res = run_investigation_loop(
                 self.domain,
                 str(self.active_dir),
                 provider=provider,
                 probe_client=probe,
                 config=cfg,
+                on_round=_on_round,
+                on_ares_event=_on_ares_event,
             )
             ares_score = self.domain.score(ares_res.board.model_dump(), truth)
 
@@ -305,7 +392,12 @@ class ObservatoryDemoState:
                     "query_count": b_raw["query_count"],
                     "wall_clock_ms": b_ms,
                     "score": b_score,
+                    "pre_recorded": False,
                 }
+            elif case_id in self.exoplanet_baseline_by_case:
+                cached_b = dict(self.exoplanet_baseline_by_case[case_id])
+                cached_b["pre_recorded"] = True
+                baseline_payload = cached_b
 
             artifact_urls, masked_cards = self._render_ui_cards(
                 case_id, case_art_dir, ares_res.artifacts
@@ -399,8 +491,53 @@ def make_handler(state: ObservatoryDemoState):
                         "base_sector_stats": state.base_stats,
                         "cases": cases_out,
                         "cached_benchmark": state.cached_bench_results,
+                        "exoplanet_benchmark": state.exoplanet_benchmark,
+                        "incident_benchmark": state.incident_benchmark,
                     }
                 )
+                return
+
+            if path.startswith("/api/stream_ares/"):
+                case_id = urllib.parse.unquote(path[len("/api/stream_ares/") :])
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+
+                ev_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+                def _worker() -> None:
+                    try:
+                        res = state.run_live_ares(
+                            case_id,
+                            include_baseline=False,
+                            progress_cb=lambda p: ev_q.put(p),
+                        )
+                        ev_q.put({"stage": "complete", "result": res})
+                    except Exception as exc:
+                        ev_q.put({"stage": "error", "error": str(exc)})
+                    finally:
+                        ev_q.put(None)
+
+                t = threading.Thread(target=_worker, daemon=True)
+                t.start()
+
+                try:
+                    while True:
+                        try:
+                            item = ev_q.get(timeout=1.0)
+                        except queue.Empty:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            continue
+                        if item is None:
+                            break
+                        payload = json.dumps(item, default=str).encode("utf-8")
+                        self.wfile.write(b"data: " + payload + b"\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
 
             if path.startswith("/api/reveal/"):
@@ -444,7 +581,7 @@ def make_handler(state: ObservatoryDemoState):
                     return
                 if parsed.path == "/api/investigate":
                     cid = str(body["case_id"])
-                    inc_base = bool(body.get("include_baseline", True))
+                    inc_base = bool(body.get("include_baseline", False))
                     self._send_json(state.run_live_ares(cid, include_baseline=inc_base))
                     return
                 self._send_json({"error": f"Unknown route {parsed.path}"}, status=404)

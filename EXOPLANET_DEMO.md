@@ -13,7 +13,7 @@ Flagship real-data domain plug-in (`ExoplanetTriageDomain`) built strictly on to
   3. `verify_keplerian_density_consistency` — Kepler's 3rd Law transit-implied stellar density vs. Gaia/TIC host density (`[0.18x, 5.5x]`).
   4. `verify_ccd_centroid_lock` — Sub-pixel `diff_snr^2`-weighted centroid lock (`<= 0.45 px`) and aperture isolation (`CROWDSAP >= 0.80`).
   5. `verify_exoplanet_confirmation` — Compound 4-way confirmation gate + deterministic SHA-256 2×2 dark-mode Observatory PNG card emission (`domain/exoplanet_artifacts.py`).
-- **Live Stage Observatory UI (`app/observatory_server.py` + `app/static/index.html`):** Blinded Judge Sector Menu, instant deterministic scan, full Gemini 4 + Decision-1 + Baseline runner, counterfactual CCD stamp ablation toggle, and official NASA Exoplanet Archive ground-truth reveal.
+- **Live Stage Observatory UI (`app/observatory_server.py` + `app/static/index.html`):** Material Design 3 Dark Tonal 2-tab UI featuring a `<30s` SSE-streamed **Live Stage Demo** (3 one-click scenarios, live 4-stage pipeline bar, 2×2 NASA TESS vetting cards, CCD `"unknown"` ablation toggle, 4-gate self-check plan checklist, and Official NASA Archive ground-truth reveal) plus a **Proof It Works (18-Case Evidence)** view comparing ARES against the single-agent `gemini-4-carbon` SQL baseline across both NASA TESS and Incident Logs, honest optical/physical failure boundaries, and deterministic Invariant I1–I7 self-checks.
 
 ---
 

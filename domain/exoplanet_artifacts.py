@@ -4,7 +4,7 @@ Generates deterministic, SHA-256-pinned multimodal PNG cards directly from real
 NASA TESS Parquet shards (`lightcurves`, `stellar_catalog`, `pixel_stamps`) using
 thread-safe `FigureCanvasAgg` (zero LLM calls, zero global `pyplot` state).
 
-Visual layout matches the `#0B0F19` dark observatory palette of `video/ares_explainer.py`:
+Visual layout matches the Material Design 3 Dark tonal palette (`video/m3_theme.py`):
   1. Top-Left: Phase-Folded TESS 2-Minute Light Curve (ppm relative flux)
   2. Top-Right: Real 11x11 NASA CCD Difference Stamp + Aperture + Centroid Shift Vector
   3. Bottom-Left: Odd vs. Even Transit Depth Overlay & Secondary Occultation Check
@@ -30,18 +30,18 @@ from contracts import ArtifactRef
 
 matplotlib.use("Agg")
 
-# Dark Observatory Palette (matches video/ares_explainer.py)
-BG_DARK = "#0B0F19"
-SURFACE = "#131B2E"
-BORDER = "#2B3B5E"
-TEXT_MAIN = "#F8FAFC"
-TEXT_MUTED = "#94A3B8"
-CYAN = "#38BDF8"
-GREEN_CERT = "#10B981"
-AMBER_WARN = "#F59E0B"
-RED_ALERT = "#EF4444"
-VIOLET = "#A78BFA"
-GOLD = "#FBBF24"
+# Material Design 3 Dark Observatory Palette (synced with video/m3_theme.py & index.html)
+BG_DARK = "#191C22"
+SURFACE = "#22262F"
+BORDER = "#3B4250"
+TEXT_MAIN = "#E3E6ED"
+TEXT_MUTED = "#9AA2B2"
+CYAN = "#A8C7FA"
+GREEN_CERT = "#8ED5B9"
+AMBER_WARN = "#E5B586"
+RED_ALERT = "#F2B8B5"
+VIOLET = "#CBC3E8"
+GOLD = "#E8C58E"
 
 
 def _parquet_glob(data_dir: str, table: str) -> str:
