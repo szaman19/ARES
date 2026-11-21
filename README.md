@@ -11,6 +11,7 @@ ARES executes parallel SQL hypothesis generation (`gemini-4-hydrogen`), determin
 - `domain/` — Domain plug-ins (`MicroBenchDomain` 9-case Stage 1 incident benchmark, `TRUSTED` DuckDB verifiers, deterministic 3-panel candidate PNG slice plots).
 - `tests/` — Unit and integration test suites (`pytest`).
 - `ARES_plan.md` & `ARES_MULTIMODAL_ADDENDUM.md` — Full architecture, invariants (I1–I7), and multimodal perception specification.
+- `NEW_USE_CASE_GUIDE.md` — Agentic playbook for building new tasks and domains with 100% reuse of `ares/` and `contracts.py`.
 
 ## Quickstart
 
