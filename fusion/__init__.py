@@ -1,0 +1,53 @@
+"""Fusion layer for ARES InvestigationBoard state, invariant enforcement, replay, and loop."""
+
+from fusion.loop import (
+    CANONICAL_VERIFIER_FIELDS,
+    REQUIRED_SIGNAL_FIELDS,
+    LoopConfig,
+    LoopRunResult,
+    RoundTelemetry,
+    TerminationReason,
+    run_investigation_loop,
+)
+from fusion.patch import (
+    CANONICAL_PIVOTAL_FIELDS,
+    DEFAULT_PIVOTAL_FIELDS,
+    BoardPatch,
+    FieldPatch,
+    PatchReport,
+    PatchValidationError,
+    archive_low_influence_fields,
+    compute_board_drift,
+    compute_weakest_status,
+    create_initial_board,
+    deduplicate_fields,
+    deterministic_patch_from_notes,
+    rebuild_board_from_notes,
+    validate_and_merge_patch,
+    value_is_grounded_in_notes,
+)
+
+__all__ = [
+    "BoardPatch",
+    "CANONICAL_PIVOTAL_FIELDS",
+    "CANONICAL_VERIFIER_FIELDS",
+    "DEFAULT_PIVOTAL_FIELDS",
+    "FieldPatch",
+    "LoopConfig",
+    "LoopRunResult",
+    "PatchReport",
+    "PatchValidationError",
+    "REQUIRED_SIGNAL_FIELDS",
+    "RoundTelemetry",
+    "TerminationReason",
+    "archive_low_influence_fields",
+    "compute_board_drift",
+    "compute_weakest_status",
+    "create_initial_board",
+    "deduplicate_fields",
+    "deterministic_patch_from_notes",
+    "rebuild_board_from_notes",
+    "run_investigation_loop",
+    "validate_and_merge_patch",
+    "value_is_grounded_in_notes",
+]
