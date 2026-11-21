@@ -664,8 +664,11 @@ def run_live_nyc_search(
     keyword: str | None = None,
     street_only: bool = True,
     include_solo_baseline: bool = True,
-    round1_k: int = 6,
-    round2_k: int = 3,
+    round1_k: int = 12,
+    round2_k: int = 6,
+    center_lat: float | None = None,
+    center_lon: float | None = None,
+    radius_m: float | None = None,
     out_dir: str | Path = "benchmark/results/nyc_live",
     snapshot_dir: str | Path | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -693,25 +696,54 @@ def run_live_nyc_search(
     img_dir = dest / "frames"
     img_dir.mkdir(parents=True, exist_ok=True)
 
+    use_geo = center_lat is not None and center_lon is not None
+    eff_area = "all" if use_geo else area
+
     snapshot_frames: dict[str, Path] = {}
     if snapshot_dir is not None:
-        _emit("catalog", f"Loading saved NYC street snapshot from {snapshot_dir} (area={area})...")
+        _emit("catalog", f"Loading saved NYC street snapshot from {snapshot_dir} (area={eff_area})...")
         cameras, snapshot_frames = load_snapshot_catalog(
-            snapshot_dir, area=area, keyword=keyword
+            snapshot_dir, area=eff_area, keyword=keyword
         )
         if not cameras:
             raise ValueError(
-                f"No saved snapshot cameras found in {snapshot_dir} for area={area!r}, keyword={keyword!r}."
+                f"No saved snapshot cameras found in {snapshot_dir} for area={eff_area!r}, keyword={keyword!r}."
             )
-        _emit("catalog_done", f"Loaded {len(cameras)} saved street cameras in {area}.")
+        _emit("catalog_done", f"Loaded {len(cameras)} saved street cameras.")
     else:
-        _emit("catalog", f"GET {NYC_CAMERAS_API} (filtering {area}, street_only={street_only})...")
-        cameras = fetch_camera_catalog(area=area, keyword=keyword, street_only=street_only)
+        _emit("catalog", f"GET {NYC_CAMERAS_API} (area={eff_area}, street_only={street_only})...")
+        cameras = fetch_camera_catalog(area=eff_area, keyword=keyword, street_only=street_only)
         if not cameras:
             raise ValueError(
-                f"No online NYC cameras found for area={area!r}, keyword={keyword!r}, street_only={street_only}."
+                f"No online NYC cameras found for area={eff_area!r}, keyword={keyword!r}, street_only={street_only}."
             )
-        _emit("catalog_done", f"Found {len(cameras)} online street intersection cameras in {area}.")
+        if use_geo and center_lat is not None and center_lon is not None:
+            ranked_geo = sorted(
+                cameras,
+                key=lambda c: haversine_m(center_lat, center_lon, c.latitude, c.longitude),
+            )
+            eff_radius = float(radius_m) if radius_m is not None else 350.0
+            in_radius = [
+                c
+                for c in ranked_geo
+                if haversine_m(center_lat, center_lon, c.latitude, c.longitude) <= eff_radius
+            ]
+            if len(in_radius) >= max(3, min(round1_k, 6)):
+                cameras = in_radius
+                _emit(
+                    "catalog_done",
+                    f"Found {len(cameras)} live street cameras within {int(eff_radius)}m of your pin.",
+                )
+            else:
+                # Auto-expand to nearest street cameras if pin is in a sparse spot
+                cameras = ranked_geo[: max(round1_k + round2_k, 12)]
+                farthest = int(haversine_m(center_lat, center_lon, cameras[-1].latitude, cameras[-1].longitude))
+                _emit(
+                    "catalog_done",
+                    f"Only {len(in_radius)} cams inside {int(eff_radius)}m → expanded to {len(cameras)} nearest street cameras (up to {farthest}m).",
+                )
+        else:
+            _emit("catalog_done", f"Found {len(cameras)} online street intersection cameras in {area}.")
 
     client = genai.Client(api_key=api_key)
     note_store = NoteStore()
@@ -811,7 +843,14 @@ def run_live_nyc_search(
             inspected_lock_items.append((round_num, i + 1, cam, art, note, obs, dist_m))
 
     # --- Pre-fetch Round 1 JPEGs once so ARES & Gemini Solo start at the EXACT same instant ---
-    r1_cams = select_spread_cameras(cameras, k=round1_k)
+    if use_geo and center_lat is not None and center_lon is not None:
+        # In pin/radius mode, Round 1 checks the closest cameras right around the user's pin
+        r1_cams = sorted(
+            cameras,
+            key=lambda c: haversine_m(center_lat, center_lon, c.latitude, c.longitude),
+        )[:round1_k]
+    else:
+        r1_cams = select_spread_cameras(cameras, k=round1_k)
     _emit("prefetch", f"Pre-fetching {len(r1_cams)} live street JPEGs in parallel for both ARES & Gemini Solo...")
     prefetched_r1: dict[str, ArtifactRef] = {}
 

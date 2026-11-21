@@ -38,6 +38,9 @@ class LiveSearchRequest(BaseModel):
     use_snapshot: bool = False
     round1_k: int = Field(default=12, ge=2, le=24)
     round2_k: int = Field(default=6, ge=0, le=12)
+    center_lat: float | None = None
+    center_lon: float | None = None
+    radius_m: float | None = None
 
 
 class AblateRequest(BaseModel):
@@ -68,6 +71,9 @@ def api_search(req: LiveSearchRequest) -> dict[str, Any]:
             include_solo_baseline=True,
             round1_k=req.round1_k,
             round2_k=req.round2_k,
+            center_lat=req.center_lat,
+            center_lon=req.center_lon,
+            radius_m=req.radius_m,
             out_dir=run_dir,
             snapshot_dir=DEFAULT_SNAPSHOT_DIR if req.use_snapshot else None,
         )
@@ -87,6 +93,9 @@ def api_search_stream(
     use_snapshot: bool = Query(default=False),
     round1_k: int = Query(default=12, ge=2, le=24),
     round2_k: int = Query(default=6, ge=0, le=12),
+    center_lat: float | None = Query(default=None),
+    center_lon: float | None = Query(default=None),
+    radius_m: float | None = Query(default=None),
 ) -> StreamingResponse:
     run_id = uuid.uuid4().hex[:10]
     run_dir = RUN_ROOT / run_id
@@ -105,6 +114,9 @@ def api_search_stream(
                 include_solo_baseline=True,
                 round1_k=round1_k,
                 round2_k=round2_k,
+                center_lat=center_lat,
+                center_lon=center_lon,
+                radius_m=radius_m,
                 out_dir=run_dir,
                 snapshot_dir=DEFAULT_SNAPSHOT_DIR if use_snapshot else None,
                 on_event=_on_event,
@@ -186,6 +198,8 @@ HTML_PAGE = """<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ARES Live NYC Street-Camera Search</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   :root {
     --bg: #0f1419; --card: #182028; --border: #2a3642;
@@ -287,6 +301,20 @@ HTML_PAGE = """<!doctype html>
   .mode-btn.active-live { background: rgba(27,158,119,0.25); color: #5eead4; }
   .mode-btn.active-off { background: rgba(117,112,179,0.28); color: #ddd6fe; }
   .header-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+  .map-panel {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 12px; margin-bottom: 12px;
+  }
+  .map-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+  .map-btns { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .chip-btn {
+    background: #10161d; color: var(--text); border: 1px solid var(--border); border-radius: 7px;
+    padding: 5px 10px; font-size: 11.5px; font-weight: 600; cursor: pointer;
+  }
+  .chip-btn:hover { border-color: var(--green); }
+  .chip-btn.geo { border-color: #38bdf8; color: #7dd3fc; }
+  #nycMap { width: 100%; height: 245px; border-radius: 9px; border: 1px solid var(--border); background: #0b0f14; }
+  #nycMap .leaflet-tile-pane { filter: invert(92%) hue-rotate(180deg) brightness(92%) contrast(92%); }
   .cam-body { padding: 10px 12px; flex: 1; display: flex; flex-direction: column; gap: 6px; }
   .cam-title { font-weight: 700; font-size: 13px; }
   .cam-desc { font-size: 12px; color: var(--muted); flex: 1; }
@@ -312,6 +340,26 @@ HTML_PAGE = """<!doctype html>
       <button id="modeLiveBtn" class="mode-btn active-live" onclick="setMode(false)">● LIVE NYC DOT</button>
       <button id="modeOffBtn" class="mode-btn" onclick="setMode(true)">📦 OFFLINE SNAPSHOT (36)</button>
     </div>
+  </div>
+
+  <div class="map-panel">
+    <div class="map-bar">
+      <div><b>Pick location on map:</b> click anywhere in NYC to drop your pin (<span id="pinLabel">SoHo · 40.7233, -73.9985</span>)</div>
+      <div class="map-btns">
+        <button class="chip-btn geo" onclick="useMyLocation()">📍 Use My Location</button>
+        <button class="chip-btn" onclick="jumpTo(40.7233, -73.9985, 'SoHo')">SoHo</button>
+        <button class="chip-btn" onclick="jumpTo(40.7549, -73.9840, 'Midtown')">Midtown</button>
+        <button class="chip-btn" onclick="jumpTo(40.7265, -73.9815, 'East Village')">East Village</button>
+        <button class="chip-btn" onclick="jumpTo(40.7143, -73.9614, 'Williamsburg')">Williamsburg</button>
+        <select id="radiusSelect" onchange="updateMapCircle()" style="width:auto;padding:5px 8px;font-size:11.5px;">
+          <option value="220">~2 blocks (220m)</option>
+          <option value="450" selected>~4 blocks (450m)</option>
+          <option value="900">~8 blocks (900m)</option>
+          <option value="0">Whole Borough</option>
+        </select>
+      </div>
+    </div>
+    <div id="nycMap"></div>
   </div>
 
   <div class="controls" style="grid-template-columns: 140px 1fr 140px 115px auto;">
@@ -359,9 +407,9 @@ HTML_PAGE = """<!doctype html>
       <div class="pipe-stages">
         <div class="stage" id="st_catalog"><div class="st-title">1. Filter</div><div class="st-sub" id="st_catalog_sub">waiting...</div></div>
         <span class="arrow">→</span>
-        <div class="stage" id="st_r1"><div class="st-title">2. Sweep (×6)</div><div class="st-sub" id="st_r1_sub">parallel</div></div>
+        <div class="stage" id="st_r1"><div class="st-title" id="st_r1_title">2. Sweep (×12)</div><div class="st-sub" id="st_r1_sub">parallel</div></div>
         <span class="arrow">→</span>
-        <div class="stage" id="st_r2"><div class="st-title">3. GPS Zoom (×3)</div><div class="st-sub" id="st_r2_sub">nearest streets</div></div>
+        <div class="stage" id="st_r2"><div class="st-title" id="st_r2_title">3. GPS Zoom (×6)</div><div class="st-sub" id="st_r2_sub">nearest streets</div></div>
         <span class="arrow">→</span>
         <div class="stage" id="st_fusion"><div class="st-title">4. Rules</div><div class="st-sub" id="st_fusion_sub">patch.py</div></div>
         <span class="arrow">→</span>
@@ -371,7 +419,7 @@ HTML_PAGE = """<!doctype html>
     <div class="pipe-row">
       <div class="pipe-label solo">Gemini Solo</div>
       <div class="pipe-stages">
-        <div class="stage" id="st_solo_in"><div class="st-title">1. Same 6 R1 Photos</div><div class="st-sub" id="st_solo_in_sub">no Round-2 zoom</div></div>
+        <div class="stage" id="st_solo_in"><div class="st-title" id="st_solo_title">1. Same 12 R1 Photos</div><div class="st-sub" id="st_solo_in_sub">no Round-2 zoom</div></div>
         <span class="arrow">→</span>
         <div class="stage" id="st_solo_out"><div class="st-title">2. 1-Shot Guess</div><div class="st-sub" id="st_solo_out_sub">no rules / no probe</div></div>
       </div>
@@ -390,7 +438,7 @@ HTML_PAGE = """<!doctype html>
       <div id="aresMeta" class="meta"></div>
     </div>
     <div class="panel solo">
-      <span class="badge orange">GEMINI SOLO (6 R1 PHOTOS · NO ZOOM)</span>
+      <span class="badge orange" id="soloBadge">GEMINI SOLO (12 R1 PHOTOS · NO ZOOM)</span>
       <div id="soloVerdict" class="verdict"></div>
       <div id="soloMeta" class="meta"></div>
     </div>
@@ -405,6 +453,100 @@ let currentRunId = null;
 let currentData = null;
 let hiddenFields = new Set();
 let useSnapshotMode = false;
+let pinLat = 40.7233;
+let pinLon = -73.9985;
+let pinName = "SoHo";
+let nycMap = null;
+let pinMarker = null;
+let radiusCircle = null;
+let camLayer = null;
+let curR1Target = 12;
+let curR2Target = 6;
+
+function initMap() {
+  if (typeof L === "undefined") return;
+  nycMap = L.map("nycMap", { zoomControl: true }).setView([pinLat, pinLon], 15);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap contributors"
+  }).addTo(nycMap);
+  camLayer = L.layerGroup().addTo(nycMap);
+  updatePinOnMap(false);
+  nycMap.on("click", (e) => {
+    pinLat = Number(e.latlng.lat.toFixed(5));
+    pinLon = Number(e.latlng.lng.toFixed(5));
+    pinName = "Dropped Pin";
+    updatePinOnMap(false);
+  });
+}
+
+function updatePinOnMap(recenter) {
+  document.getElementById("pinLabel").textContent = `${pinName} · ${pinLat.toFixed(4)}, ${pinLon.toFixed(4)}`;
+  if (!nycMap) return;
+  if (pinMarker) nycMap.removeLayer(pinMarker);
+  pinMarker = L.circleMarker([pinLat, pinLon], {
+    radius: 8, color: "#38bdf8", fillColor: "#38bdf8", fillOpacity: 0.9, weight: 2
+  }).addTo(nycMap).bindPopup(`<b>${pinName}</b><br/>${pinLat.toFixed(4)}, ${pinLon.toFixed(4)}`);
+  updateMapCircle();
+  if (recenter) nycMap.setView([pinLat, pinLon], 15);
+}
+
+function updateMapCircle() {
+  if (!nycMap) return;
+  if (radiusCircle) { nycMap.removeLayer(radiusCircle); radiusCircle = null; }
+  const r = Number(document.getElementById("radiusSelect").value || 0);
+  if (r > 0) {
+    radiusCircle = L.circle([pinLat, pinLon], {
+      radius: r, color: "#1b9e77", fillColor: "#1b9e77", fillOpacity: 0.12, weight: 1.5, dashArray: "5,5"
+    }).addTo(nycMap);
+  }
+}
+
+function jumpTo(lat, lon, label) {
+  pinLat = lat; pinLon = lon; pinName = label;
+  if (Number(document.getElementById("radiusSelect").value) === 0) {
+    document.getElementById("radiusSelect").value = "450";
+  }
+  updatePinOnMap(true);
+}
+
+function useMyLocation() {
+  if (!navigator.geolocation) {
+    alert("Geolocation is not supported by your browser.");
+    return;
+  }
+  document.getElementById("status").innerHTML = "Requesting your browser GPS coordinates...";
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      pinLat = Number(pos.coords.latitude.toFixed(5));
+      pinLon = Number(pos.coords.longitude.toFixed(5));
+      pinName = "My Location";
+      if (Number(document.getElementById("radiusSelect").value) === 0) {
+        document.getElementById("radiusSelect").value = "220";
+      }
+      updatePinOnMap(true);
+      runSearch();
+    },
+    (err) => {
+      document.getElementById("status").innerHTML = `<span style="color:#fca5a5;">Location blocked (${err.message}). Click anywhere on the map to drop a pin instead!</span>`;
+    },
+    { enableHighAccuracy: true, timeout: 8000 }
+  );
+}
+
+function plotCamerasOnMap(inspected) {
+  if (!nycMap || !camLayer) return;
+  camLayer.clearLayers();
+  for (const item of inspected) {
+    const v = item.observation.verdict;
+    const color = v === "strong_match" ? "#22c55e" : (v === "partial_match" ? "#f97316" : "#64748b");
+    const m = L.circleMarker([item.camera.latitude, item.camera.longitude], {
+      radius: v === "strong_match" ? 8 : 6,
+      color: "#ffffff", weight: 1.5, fillColor: color, fillOpacity: 0.92
+    }).addTo(camLayer);
+    m.bindPopup(`<b>${item.camera.name}</b><br/>R${item.round_num} · ${v}<br/>${item.observation.summary}`);
+  }
+}
 
 function setMode(isOffline) {
   useSnapshotMode = isOffline;
@@ -440,13 +582,20 @@ function setStage(id, state, subText) {
 function resetStages() {
   r1Count = 0;
   r2Count = 0;
+  const [r1k, r2k] = document.getElementById("camBudget").value.split(",");
+  curR1Target = Number(r1k);
+  curR2Target = Number(r2k);
+  document.getElementById("st_r1_title").textContent = `2. Sweep (×${curR1Target})`;
+  document.getElementById("st_r2_title").textContent = `3. GPS Zoom (×${curR2Target})`;
+  document.getElementById("st_solo_title").textContent = `1. Same ${curR1Target} R1 Photos`;
+  document.getElementById("soloBadge").textContent = `GEMINI SOLO (${curR1Target} R1 PHOTOS · NO ZOOM)`;
   setStage("st_catalog", "", "waiting...");
-  setStage("st_r1", "", "ARESRunner + hydrogen");
-  setStage("st_r2", "", "nearest street neighbors");
-  setStage("st_fusion", "", "patch.py + disqualifiers");
-  setStage("st_probe", "", "counterfactual drops");
-  setStage("st_solo_in", "", "same 9 JPEGs, no zoom");
-  setStage("st_solo_out", "", "no disqualifiers / no probe");
+  setStage("st_r1", "", "parallel");
+  setStage("st_r2", "", "nearest streets");
+  setStage("st_fusion", "", "patch.py");
+  setStage("st_probe", "", "calibrated");
+  setStage("st_solo_in", "", `${curR1Target} R1 JPEGs, no zoom`);
+  setStage("st_solo_out", "", "no rules / no probe");
 }
 
 function updateStagesFromEvent(step, message, elapsed) {
@@ -454,37 +603,37 @@ function updateStagesFromEvent(step, message, elapsed) {
   if (step === "catalog") {
     setStage("st_catalog", "active", "fetching NYC DOT API...");
   } else if (step === "catalog_done") {
-    setStage("st_catalog", "done-ares", `${message.replace("Found ", "").replace(" online street intersection cameras in ", " cams · ")} (${t})`);
+    setStage("st_catalog", "done-ares", `${message.slice(0, 34)} (${t})`);
   } else if (step === "round1_start") {
-    setStage("st_r1", "active", "0/6 live JPEGs checked...");
+    setStage("st_r1", "active", `0/${curR1Target} checked...`);
   } else if (step === "camera_done") {
     if (message.startsWith("[R1]")) {
       r1Count += 1;
-      setStage("st_r1", "active", `${r1Count}/6 live JPEGs checked (${t})`);
+      setStage("st_r1", "active", `${r1Count}/${curR1Target} checked (${t})`);
     } else if (message.startsWith("[R2]")) {
       r2Count += 1;
-      setStage("st_r2", "active", `${r2Count}/3 neighbors checked (${t})`);
+      setStage("st_r2", "active", `${r2Count}/${curR2Target} checked (${t})`);
     }
   } else if (step === "round2_start") {
-    setStage("st_r1", "done-ares", `${r1Count}/6 done · picked anchor (${t})`);
-    setStage("st_r2", "active", "0/3 GPS neighbors checked...");
+    setStage("st_r1", "done-ares", `${r1Count}/${curR1Target} done (${t})`);
+    setStage("st_r2", "active", `0/${curR2Target} neighbors...`);
   } else if (step === "fusion") {
-    setStage("st_r1", "done-ares", `${r1Count}/6 done`);
-    setStage("st_r2", "done-ares", `${r2Count}/3 done`);
+    setStage("st_r1", "done-ares", `${r1Count}/${curR1Target} done`);
+    setStage("st_r2", "done-ares", `${r2Count}/${curR2Target} done`);
     setStage("st_fusion", "active", "verifying SHA-256 + rules...");
   } else if (step === "probe") {
     setStage("st_fusion", "done-ares", `0 invariant violations (${t})`);
-    setStage("st_probe", "active", "running 9 parallel ablations...");
+    setStage("st_probe", "active", "running ablations...");
   } else if (step === "ares_done") {
-    setStage("st_probe", "done-ares", `calibrated verdict ready (${t})`);
+    setStage("st_probe", "done-ares", `calibrated verdict (${t})`);
   } else if (step === "solo_start") {
-    setStage("st_solo_in", "active", "6 R1 JPEGs in 1 call...");
-    setStage("st_solo_out", "active", "racing ARES Round 2...");
+    setStage("st_solo_in", "active", `${curR1Target} R1 JPEGs in 1 call...`);
+    setStage("st_solo_out", "active", "racing ARES...");
   } else if (step === "solo_done") {
-    setStage("st_solo_in", "done-solo", "6 R1 JPEGs only");
+    setStage("st_solo_in", "done-solo", `${curR1Target} R1 JPEGs only`);
     setStage("st_solo_out", "done-solo", `1-shot guess (${t})`);
   } else if (step === "done") {
-    setStage("st_solo_in", "done-solo", "6 R1 JPEGs only");
+    setStage("st_solo_in", "done-solo", `${curR1Target} R1 JPEGs only`);
   }
 }
 
@@ -515,6 +664,7 @@ function runSearch() {
   status.innerHTML = "Streaming live requests...";
 
   const [r1k, r2k] = document.getElementById("camBudget").value.split(",");
+  const rad = Number(document.getElementById("radiusSelect").value || 0);
   const params = new URLSearchParams({
     area: document.getElementById("area").value,
     query: document.getElementById("query").value,
@@ -523,6 +673,11 @@ function runSearch() {
     round1_k: r1k,
     round2_k: r2k,
   });
+  if (rad > 0) {
+    params.set("center_lat", String(pinLat));
+    params.set("center_lon", String(pinLon));
+    params.set("radius_m", String(rad));
+  }
   const kw = document.getElementById("keyword").value.trim();
   if (kw) params.set("keyword", kw);
 
@@ -582,9 +737,10 @@ function renderResult(data) {
     const s = data.solo_baseline;
     document.getElementById("soloVerdict").textContent = s.predicted_intersection;
     document.getElementById("soloMeta").innerHTML =
-      `<b>${(s.confidence * 100).toFixed(0)}%</b> self-reported &nbsp;·&nbsp; <b>${s.wall_clock_s}s</b> &nbsp;·&nbsp; 6 R1 photos only<br/>${s.reasoning}`;
+      `<b>${(s.confidence * 100).toFixed(0)}%</b> self-reported &nbsp;·&nbsp; <b>${s.wall_clock_s}s</b> &nbsp;·&nbsp; ${curR1Target} R1 photos only<br/>${s.reasoning}`;
   }
 
+  plotCamerasOnMap(data.inspected || []);
   rerenderGrid();
 }
 
@@ -696,8 +852,11 @@ async function toggleHide(fieldName) {
   }
 }
 
-// Auto-run once on load so the page is immediately live!
-window.addEventListener("DOMContentLoaded", () => runSearch());
+// Initialize interactive NYC map + auto-run once on load
+window.addEventListener("DOMContentLoaded", () => {
+  initMap();
+  runSearch();
+});
 </script>
 </body>
 </html>
