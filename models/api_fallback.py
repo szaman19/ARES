@@ -167,3 +167,66 @@ def call_fallback_vision_json(
         )
 
     raise ValueError(f"Unsupported fallback vision provider: {provider}")
+
+
+def call_fallback_text_json(
+    provider: str,
+    api_key: str,
+    model: str,
+    *,
+    prompt: str,
+    system_instruction: str,
+    schema: dict[str, Any],
+    timeout_s: float = 20.0,
+) -> str:
+    """Call OpenAI, Anthropic, or OpenRouter text endpoint expecting strict JSON."""
+    schema_hint = (
+        f"{prompt}\n\nReturn ONLY valid JSON matching this JSON schema:\n"
+        f"{json.dumps(schema)}"
+    )
+    if provider in ("openai", "openrouter"):
+        url = (
+            "https://api.openai.com/v1/chat/completions"
+            if provider == "openai"
+            else "https://openrouter.ai/api/v1/chat/completions"
+        )
+        resp = httpx.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": schema_hint},
+                ],
+            },
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"] or "{}"
+
+    if provider == "anthropic":
+        resp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 300,
+                "system": system_instruction,
+                "messages": [{"role": "user", "content": schema_hint}],
+            },
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+        blocks = resp.json().get("content") or []
+        return "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text") or "{}"
+
+    raise ValueError(f"Unsupported fallback text provider: {provider}")

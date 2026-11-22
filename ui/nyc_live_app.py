@@ -6,8 +6,10 @@ Run with:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import queue
+import shutil
 import threading
 import uuid
 from pathlib import Path
@@ -15,17 +17,38 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from google import genai
 from pydantic import BaseModel, Field
 
 from domain.nyc_cameras import DEFAULT_VISION_MODEL, NYCDemoResult, run_live_nyc_search
-from models.api_fallback import get_fallback_vision_providers, get_gemini_api_keys
+from models.api_fallback import (
+    call_fallback_text_json,
+    get_fallback_vision_providers,
+    get_gemini_api_keys,
+)
 from models.decision_probe import DecisionProbeClient, ablate_board_fields
+from models.gemini_provider import _strip_json_fences
 
 app = FastAPI(title="ARES Live NYC Street-Camera Search Demo")
 
 RUN_ROOT = Path("benchmark/results/nyc_live_web")
+# Start clean on container boot so old run artifacts don't accumulate
+if RUN_ROOT.exists():
+    shutil.rmtree(RUN_ROOT, ignore_errors=True)
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
-_RUNS: dict[str, NYCDemoResult] = {}
+
+MAX_CACHED_RUNS = 10
+_RUNS_LOCK = threading.Lock()
+_RUNS: OrderedDict[str, NYCDemoResult] = OrderedDict()
+
+
+def _store_run(run_id: str, res: NYCDemoResult) -> None:
+    with _RUNS_LOCK:
+        _RUNS[run_id] = res
+        _RUNS.move_to_end(run_id)
+        while len(_RUNS) > MAX_CACHED_RUNS:
+            old_id, _ = _RUNS.popitem(last=False)
+            shutil.rmtree(RUN_ROOT / old_id, ignore_errors=True)
 
 
 DEFAULT_SNAPSHOT_DIR = Path("fixtures/nyc_snapshot")
@@ -57,6 +80,111 @@ class LiveSearchRequest(BaseModel):
 class AblateRequest(BaseModel):
     run_id: str
     hidden_fields: list[str] = Field(default_factory=list)
+
+
+class AddressResolveRequest(BaseModel):
+    address: str = Field(min_length=2, max_length=200)
+
+
+class ResolvedAddress(BaseModel):
+    valid: bool
+    normalized_address: str = ""
+    borough: str = "Manhattan"
+    latitude: float | None = None
+    longitude: float | None = None
+    reason: str = ""
+
+
+def _resolve_nyc_address_with_llm(raw_address: str) -> ResolvedAddress:
+    """Validate and geocode a user-entered NYC address/intersection via LLM (with multi-key + provider fallback)."""
+    cleaned = raw_address.strip()
+    if len(cleaned) < 2:
+        return ResolvedAddress(valid=False, reason="Please enter an NYC street address or intersection.")
+
+    prompt = (
+        f"User input: {cleaned!r}\n\n"
+        "Determine if this is a real, recognizable street address, intersection, landmark, or location "
+        "within the 5 boroughs of New York City (Manhattan, Brooklyn, Queens, Bronx, Staten Island).\n"
+        "- If it is gibberish, too vague (e.g. just 'NYC' or 'parking'), outside New York City, or not a real place, "
+        "set valid=false and explain briefly in reason.\n"
+        "- If it IS a valid NYC location, set valid=true, normalized_address (clean concise NYC address/intersection), "
+        "borough (one of Manhattan, Brooklyn, Queens, Bronx, Staten Island), and accurate latitude & longitude."
+    )
+    system_instruction = (
+        "You are a strict NYC geocoder and address validator. Reject anything outside NYC or nonsensical. "
+        "Output strict JSON matching the schema."
+    )
+    schema = ResolvedAddress.model_json_schema()
+
+    errors: list[str] = []
+    parsed: ResolvedAddress | None = None
+
+    for idx, key in enumerate(get_gemini_api_keys()):
+        try:
+            client = genai.Client(api_key=key)
+            interaction = client.interactions.create(
+                model=DEFAULT_VISION_MODEL,
+                store=False,
+                input=prompt,
+                system_instruction=system_instruction,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": schema,
+                },
+                generation_config={"thinking_level": "low"},
+            )
+            raw = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
+            parsed = ResolvedAddress.model_validate_json(raw)
+            break
+        except Exception as exc:
+            errors.append(f"gemini[{idx}]: {exc}")
+
+    if parsed is None:
+        for provider, prov_key, prov_model in get_fallback_vision_providers():
+            try:
+                raw_text = call_fallback_text_json(
+                    provider,
+                    prov_key,
+                    prov_model,
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    schema=schema,
+                )
+                parsed = ResolvedAddress.model_validate_json(_strip_json_fences(raw_text))
+                break
+            except Exception as exc:
+                errors.append(f"{provider}: {exc}")
+
+    if parsed is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Address validation service is temporarily unavailable: " + " | ".join(errors or ["no API keys"]),
+        )
+
+    # Hard geographic bounding-box check for NYC 5 boroughs
+    if parsed.valid:
+        if (
+            parsed.latitude is None
+            or parsed.longitude is None
+            or not (40.47 <= parsed.latitude <= 40.92 and -74.26 <= parsed.longitude <= -73.70)
+        ):
+            return ResolvedAddress(
+                valid=False,
+                reason="Location is outside New York City bounds.",
+            )
+    return parsed
+
+
+@app.post("/api/resolve-address")
+def api_resolve_address(req: AddressResolveRequest) -> dict[str, Any]:
+    resolved = _resolve_nyc_address_with_llm(req.address)
+    if not resolved.valid:
+        raise HTTPException(
+            status_code=400,
+            detail=resolved.reason or "Not a recognized NYC address or intersection.",
+        )
+    return resolved.model_dump()
 
 
 def _serialize_run(run_id: str, res: NYCDemoResult) -> dict[str, Any]:
@@ -91,7 +219,7 @@ def api_search(req: LiveSearchRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _RUNS[run_id] = res
+    _store_run(run_id, res)
     return _serialize_run(run_id, res)
 
 
@@ -132,7 +260,7 @@ def api_search_stream(
                 snapshot_dir=DEFAULT_SNAPSHOT_DIR if use_snapshot else None,
                 on_event=_on_event,
             )
-            _RUNS[run_id] = res
+            _store_run(run_id, res)
             ev_q.put({"type": "result", "data": _serialize_run(run_id, res)})
         except Exception as exc:
             ev_q.put({"type": "error", "detail": str(exc)})
@@ -401,14 +529,12 @@ HTML_PAGE = """<!doctype html>
   </div>
 
   <div class="map-panel">
-    <div class="map-bar">
-      <div><b>Pick location on map:</b> click anywhere in NYC to drop your pin (<span id="pinLabel">SoHo · 40.7233, -73.9985</span>)</div>
-      <div class="map-btns">
+    <div class="map-bar" style="flex-wrap:wrap;gap:8px;">
+      <div><b>Pick location:</b> enter an NYC address or click the map (<span id="pinLabel">40.7233, -73.9985</span>)</div>
+      <div class="map-btns" style="flex:1;justify-content:flex-end;min-width:280px;">
+        <input id="addressInput" type="text" placeholder="NYC address or intersection (e.g. 350 5th Ave, Houston &amp; Bowery)" style="max-width:340px;padding:6px 10px;font-size:12px;" onkeydown="if(event.key==='Enter'){event.preventDefault();resolveAddress();}" />
+        <button id="addressBtn" class="chip-btn" onclick="resolveAddress()">Set Pin</button>
         <button class="chip-btn geo" onclick="useMyLocation()">📍 Use My Location</button>
-        <button class="chip-btn" onclick="jumpTo(40.7233, -73.9985, 'SoHo')">SoHo</button>
-        <button class="chip-btn" onclick="jumpTo(40.7549, -73.9840, 'Midtown')">Midtown</button>
-        <button class="chip-btn" onclick="jumpTo(40.7265, -73.9815, 'East Village')">East Village</button>
-        <button class="chip-btn" onclick="jumpTo(40.7143, -73.9614, 'Williamsburg')">Williamsburg</button>
         <select id="radiusSelect" onchange="updateMapCircle()" style="width:auto;padding:5px 8px;font-size:11.5px;">
           <option value="220">~2 blocks (220m)</option>
           <option value="450" selected>~4 blocks (450m)</option>
@@ -417,6 +543,7 @@ HTML_PAGE = """<!doctype html>
         </select>
       </div>
     </div>
+    <div id="addressMsg" style="display:none;font-size:12px;margin:0 0 8px;padding:6px 10px;border-radius:8px;background:#10161d;border:1px solid var(--border);"></div>
     <div id="nycMap"></div>
   </div>
 
@@ -449,7 +576,7 @@ HTML_PAGE = """<!doctype html>
       </select>
     </div>
     <div>
-      <button id="runBtn" class="primary" onclick="runSearch()">Re-Run</button>
+      <button id="runBtn" class="primary" onclick="runSearch()">Launch Search</button>
     </div>
     <div class="check-row">
       <label><input id="streetOnly" type="checkbox" checked /> Streets only</label>
@@ -457,7 +584,7 @@ HTML_PAGE = """<!doctype html>
     </div>
   </div>
 
-  <div id="status" class="status">Starting live search...</div>
+  <div id="status" class="status">Enter an NYC address or click the map to drop a pin, then click <b>Launch Search</b>.</div>
 
   <div class="pipelines">
     <div class="pipe-row">
@@ -593,12 +720,57 @@ function updateMapCircle() {
   }
 }
 
-function jumpTo(lat, lon, label) {
-  pinLat = lat; pinLon = lon; pinName = label;
-  if (Number(document.getElementById("radiusSelect").value) === 0) {
-    document.getElementById("radiusSelect").value = "450";
+async function resolveAddress() {
+  const input = document.getElementById("addressInput");
+  const btn = document.getElementById("addressBtn");
+  const msg = document.getElementById("addressMsg");
+  const raw = (input.value || "").trim();
+  if (!raw) {
+    msg.style.display = "block";
+    msg.style.color = "#fca5a5";
+    msg.textContent = "Please enter an NYC street address or intersection.";
+    return;
   }
-  updatePinOnMap(true);
+  btn.disabled = true;
+  btn.textContent = "Checking...";
+  msg.style.display = "block";
+  msg.style.color = "#93a1b0";
+  msg.textContent = "Validating NYC address...";
+  try {
+    const resp = await fetch("/api/resolve-address", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address: raw })
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.error || `Rejected (HTTP ${resp.status})`);
+    }
+    pinLat = Number(data.latitude);
+    pinLon = Number(data.longitude);
+    pinName = data.normalized_address || raw;
+    if (data.borough) {
+      const areaEl = document.getElementById("area");
+      for (const opt of areaEl.options) {
+        if (opt.value.toLowerCase() === String(data.borough).toLowerCase()) {
+          areaEl.value = opt.value;
+          break;
+        }
+      }
+    }
+    if (Number(document.getElementById("radiusSelect").value) === 0) {
+      document.getElementById("radiusSelect").value = "450";
+    }
+    updatePinOnMap(true);
+    msg.style.color = "#86efac";
+    msg.textContent = `Pin set to ${pinName} (${data.borough || "NYC"}). Click Launch Search when ready.`;
+  } catch (err) {
+    msg.style.color = "#fca5a5";
+    msg.textContent = `Address rejected: ${err.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Set Pin";
+  }
 }
 
 function useMyLocation() {
@@ -616,10 +788,10 @@ function useMyLocation() {
         document.getElementById("radiusSelect").value = "220";
       }
       updatePinOnMap(true);
-      runSearch();
+      document.getElementById("status").innerHTML = "Location pin set. Click <b>Launch Search</b> when ready.";
     },
     (err) => {
-      document.getElementById("status").innerHTML = `<span style="color:#fca5a5;">Location blocked (${err.message}). Click anywhere on the map to drop a pin instead!</span>`;
+      document.getElementById("status").innerHTML = `<span style="color:#fca5a5;">Location blocked (${err.message}). Enter an address or click anywhere on the map to drop a pin instead!</span>`;
     },
     { enableHighAccuracy: true, timeout: 8000 }
   );
@@ -894,7 +1066,7 @@ function runSearch() {
   };
 
   es.onerror = () => {
-    status.innerHTML = `<span style="color:#fca5a5;">Stream disconnected. Click Run / Re-Run Live to retry.</span>`;
+    status.innerHTML = `<span style="color:#fca5a5;">Rate limit reached or connection interrupted. Please wait ~20 seconds before retrying.</span>`;
     stopCostTimer();
     es.close();
     activeStream = null;
@@ -1131,10 +1303,9 @@ async function toggleHide(fieldName) {
   }
 }
 
-// Initialize interactive NYC map + auto-run once on load
+// Initialize interactive NYC map (user launches search manually)
 window.addEventListener("DOMContentLoaded", () => {
   initMap();
-  runSearch();
 });
 </script>
 </body>
