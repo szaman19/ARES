@@ -31,8 +31,8 @@ const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 
 // Site-wide + per-IP sliding-window rate limits (enforced in the single Durable Object)
 const WINDOW_MS = 60_000;
-const GLOBAL_SITE_LIMIT = 120; // max 120 requests/min across entire site
-const IP_SITE_LIMIT = 60; // max 60 requests/min per IP
+const GLOBAL_SITE_LIMIT = 60; // max 60 requests/min across entire site
+const IP_SITE_LIMIT = 10; // max 10 requests/min per IP
 const GLOBAL_SEARCH_LIMIT = 6; // max 6 live searches/min across entire site
 const IP_SEARCH_LIMIT = 3; // max 3 live searches/min per IP
 
@@ -81,7 +81,8 @@ export class AresNycContainer extends DurableObject<Env> {
 	private checkRateLimit(request: Request): Response | null {
 		const url = new URL(request.url);
 		const path = url.pathname;
-		if (path === "/health") {
+		// Exempt health checks and already-saved local frame thumbnails (zero downstream calls)
+		if (path === "/health" || (path.startsWith("/api/runs/") && path.includes("/frames/"))) {
 			return null;
 		}
 		const now = Date.now();
