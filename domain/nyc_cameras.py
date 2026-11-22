@@ -542,7 +542,7 @@ def _inspect_camera_with_hydrogen(
                     "mime_type": "application/json",
                     "schema": schema,
                 },
-                generation_config={"thinking_level": "low"},
+                generation_config={"thinking_level": "medium"},
             )
             latency_ms = (time.perf_counter() - t0) * 1000.0
             telemetry = extract_telemetry(interaction, latency_ms)
