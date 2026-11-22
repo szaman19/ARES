@@ -51,10 +51,18 @@ from contracts import (
     Note,
 )
 from fusion.patch import validate_and_merge_patch
+from models.api_fallback import (
+    call_fallback_vision_json,
+    get_fallback_vision_providers,
+    get_gemini_api_keys,
+    has_any_vision_api_key,
+)
 from models.decision_probe import DecisionProbeClient, ProbeResult
 from models.gemini_provider import ModelTelemetry, _strip_json_fences, extract_telemetry
 
 matplotlib.use("Agg")
+
+DEFAULT_VISION_MODEL = os.getenv("ARES_VISION_MODEL", "gemini-4-hydrogen")
 
 NYC_CAMERAS_API = "https://webcams.nyctmc.org/api/cameras"
 CATALOG_CACHE_TTL_S = float(os.environ.get("NYC_CATALOG_CACHE_TTL_S", "1800"))  # 30 min
@@ -465,9 +473,9 @@ def _inspect_camera_with_hydrogen(
     artifact: ArtifactRef,
     query: str,
     *,
-    model: str = "gemini-4-hydrogen",
+    model: str = DEFAULT_VISION_MODEL,
 ) -> tuple[CameraObservation, ModelTelemetry]:
-    """Ask `gemini-4-hydrogen` to inspect one live street camera JPEG for `query`."""
+    """Inspect one live street camera JPEG with Gemini (multi-key fallback) or fallback vision APIs."""
     b64_img = base64.b64encode(Path(artifact.path).read_bytes()).decode("ascii")
     prompt = (
         f"Live NYC DOT traffic camera at: {camera.name} ({camera.area}).\n"
@@ -485,30 +493,72 @@ def _inspect_camera_with_hydrogen(
         "in 0..1000 normalized image coordinates tightly circling that exact open curb parking spot; otherwise set spot_box=null.\n"
         "5. Keep summary to 1 concise factual sentence describing what you literally see."
     )
-    t0 = time.perf_counter()
-    interaction = client.interactions.create(
-        model=model,
-        store=False,
-        input=[
-            {"type": "text", "text": prompt},
-            {"type": "image", "data": b64_img, "mime_type": "image/jpeg"},
-        ],
-        system_instruction=(
-            "You are a strict, skeptical street-camera verifier. Never count red bus lanes, "
-            "green bike lanes, bridge approaches, highways, or guardrails as street parking. "
-            "Output strict JSON matching the schema."
-        ),
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": CameraObservation.model_json_schema(),
-        },
-        generation_config={"thinking_level": "low"},
+    system_instruction = (
+        "You are a strict, skeptical street-camera verifier. Never count red bus lanes, "
+        "green bike lanes, bridge approaches, highways, or guardrails as street parking. "
+        "Output strict JSON matching the schema."
     )
-    latency_ms = (time.perf_counter() - t0) * 1000.0
-    telemetry = extract_telemetry(interaction, latency_ms)
-    raw = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
-    obs = CameraObservation.model_validate_json(raw)
+    schema = CameraObservation.model_json_schema()
+
+    clients = client if isinstance(client, list) else ([client] if client is not None else [])
+    errors: list[str] = []
+    obs: CameraObservation | None = None
+    telemetry = ModelTelemetry()
+
+    for idx, gem_client in enumerate(clients):
+        try:
+            t0 = time.perf_counter()
+            interaction = gem_client.interactions.create(
+                model=model,
+                store=False,
+                input=[
+                    {"type": "text", "text": prompt},
+                    {"type": "image", "data": b64_img, "mime_type": "image/jpeg"},
+                ],
+                system_instruction=system_instruction,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": schema,
+                },
+                generation_config={"thinking_level": "low"},
+            )
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            telemetry = extract_telemetry(interaction, latency_ms)
+            raw = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
+            obs = CameraObservation.model_validate_json(raw)
+            break
+        except Exception as exc:
+            errors.append(f"gemini[{idx}]: {exc}")
+
+    if obs is None:
+        for provider, prov_key, prov_model in get_fallback_vision_providers():
+            try:
+                raw_text, p_toks, c_toks, latency_ms = call_fallback_vision_json(
+                    provider,
+                    prov_key,
+                    prov_model,
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    b64_img=b64_img,
+                    schema=schema,
+                )
+                raw = _strip_json_fences(raw_text)
+                obs = CameraObservation.model_validate_json(raw)
+                telemetry = ModelTelemetry(
+                    prompt_tokens=p_toks,
+                    completion_tokens=c_toks,
+                    model_calls=1,
+                    latency_ms=latency_ms,
+                )
+                break
+            except Exception as exc:
+                errors.append(f"{provider}({prov_model}): {exc}")
+
+    if obs is None:
+        raise RuntimeError(
+            "All configured vision API keys/providers failed: " + " | ".join(errors or ["no keys configured"])
+        )
 
     # Deterministic ARES verifier enforcement: disqualify non-parking road types in Python
     wants_parking = any(
@@ -779,7 +829,7 @@ def run_live_nyc_search(
     area: str = "Manhattan",
     keyword: str | None = None,
     street_only: bool = True,
-    include_solo_baseline: bool = True,
+    include_solo_baseline: bool = False,
     round1_k: int = 12,
     round2_k: int = 6,
     center_lat: float | None = None,
@@ -791,9 +841,10 @@ def run_live_nyc_search(
 ) -> NYCDemoResult:
     """Execute the 2-round parallel ARES search + `gemini-decision-1` counterfactual probe live (or from saved snapshot)."""
     load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is required in .env to run the live NYC camera demo.")
+    if not has_any_vision_api_key():
+        raise RuntimeError(
+            "No vision API key configured. Set GEMINI_API_KEY (or GEMINI_API_KEYS / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY)."
+        )
 
     t_start = time.perf_counter()
 
@@ -861,7 +912,7 @@ def run_live_nyc_search(
         else:
             _emit("catalog_done", f"Found {len(cameras)} online street intersection cameras in {area}.")
 
-    client = genai.Client(api_key=api_key)
+    client = [genai.Client(api_key=k) for k in get_gemini_api_keys()]
     note_store = NoteStore()
     total_telemetry = ModelTelemetry()
     inspected: list[InspectedCamera] = []
@@ -967,7 +1018,7 @@ def run_live_nyc_search(
         )[:round1_k]
     else:
         r1_cams = select_spread_cameras(cameras, k=round1_k)
-    _emit("prefetch", f"Pre-fetching {len(r1_cams)} live street JPEGs in parallel for both ARES & Gemini Solo...")
+    _emit("prefetch", f"Pre-fetching {len(r1_cams)} live street JPEGs in parallel...")
     prefetched_r1: dict[str, ArtifactRef] = {}
 
     def _prefetch_one(cam: CameraInfo) -> tuple[str, ArtifactRef | None]:
@@ -1156,7 +1207,12 @@ def run_live_nyc_search(
         solo_baseline = solo_future.result()
     if solo_executor is not None:
         solo_executor.shutdown(wait=False)
-    _emit("done", f"Both completed! ARES={ares_wall_clock_s}s, Gemini Solo={solo_baseline.wall_clock_s if solo_baseline else 0}s.")
+    _emit(
+        "done",
+        f"ARES completed in {ares_wall_clock_s}s."
+        if solo_baseline is None
+        else f"Both completed! ARES={ares_wall_clock_s}s, Gemini Solo={solo_baseline.wall_clock_s}s.",
+    )
 
     return NYCDemoResult(
         query=query,

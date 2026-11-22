@@ -3,8 +3,28 @@ import { DurableObject } from "cloudflare:workers";
 interface Env {
 	ARES_CONTAINER: DurableObjectNamespace<AresNycContainer>;
 	CF_VERSION_METADATA: { id: string };
-	GEMINI_API_KEY: string;
+	GEMINI_API_KEY?: string;
+	GEMINI_API_KEYS?: string;
+	GEMINI_API_KEY_FALLBACK?: string;
+	GEMINI_API_KEY_2?: string;
+	GEMINI_API_KEY_3?: string;
+	GOOGLE_API_KEY?: string;
+	OPENAI_API_KEY?: string;
+	ANTHROPIC_API_KEY?: string;
+	OPENROUTER_API_KEY?: string;
 }
+
+const FORWARDED_SECRET_KEYS = [
+	"GEMINI_API_KEY",
+	"GEMINI_API_KEYS",
+	"GEMINI_API_KEY_FALLBACK",
+	"GEMINI_API_KEY_2",
+	"GEMINI_API_KEY_3",
+	"GOOGLE_API_KEY",
+	"OPENAI_API_KEY",
+	"ANTHROPIC_API_KEY",
+	"OPENROUTER_API_KEY",
+] as const;
 
 const CONTAINER_PORT = 8080;
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
@@ -25,14 +45,20 @@ export class AresNycContainer extends DurableObject<Env> {
 			throw new Error("Container binding is not available on this Durable Object");
 		}
 		if (!container.running) {
+			const containerEnv: Record<string, string> = {
+				PYTHONUNBUFFERED: "1",
+			};
+			for (const key of FORWARDED_SECRET_KEYS) {
+				const value = this.env[key];
+				if (value) {
+					containerEnv[key] = value;
+				}
+			}
 			container.start({
 				image: container.images.base,
 				instance: "basic",
 				enableInternet: true,
-				env: {
-					GEMINI_API_KEY: this.env.GEMINI_API_KEY,
-					PYTHONUNBUFFERED: "1",
-				},
+				env: containerEnv,
 			});
 		}
 		await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
@@ -68,7 +94,7 @@ export class AresNycContainer extends DurableObject<Env> {
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		const instanceName = `ares-combined-${env.CF_VERSION_METADATA?.id || "main"}`;
+		const instanceName = `nyc-live-${env.CF_VERSION_METADATA?.id || "main"}`;
 		return env.ARES_CONTAINER.getByName(instanceName).fetch(request);
 	},
 };

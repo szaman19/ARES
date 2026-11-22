@@ -17,7 +17,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from domain.nyc_cameras import NYCDemoResult, run_live_nyc_search
+from domain.nyc_cameras import DEFAULT_VISION_MODEL, NYCDemoResult, run_live_nyc_search
+from models.api_fallback import get_fallback_vision_providers, get_gemini_api_keys
 from models.decision_probe import DecisionProbeClient, ablate_board_fields
 
 app = FastAPI(title="ARES Live NYC Street-Camera Search Demo")
@@ -31,8 +32,13 @@ DEFAULT_SNAPSHOT_DIR = Path("fixtures/nyc_snapshot")
 
 
 @app.get("/health")
-def health() -> dict[str, bool]:
-    return {"ok": True}
+def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "vision_model": DEFAULT_VISION_MODEL,
+        "gemini_keys_configured": len(get_gemini_api_keys()),
+        "fallback_providers": [p[0] for p in get_fallback_vision_providers()],
+    }
 
 
 class LiveSearchRequest(BaseModel):
@@ -73,7 +79,7 @@ def api_search(req: LiveSearchRequest) -> dict[str, Any]:
             area=req.area,
             keyword=req.keyword or None,
             street_only=req.street_only,
-            include_solo_baseline=True,
+            include_solo_baseline=False,
             round1_k=req.round1_k,
             round2_k=req.round2_k,
             center_lat=req.center_lat,
@@ -116,7 +122,7 @@ def api_search_stream(
                 area=area,
                 keyword=keyword or None,
                 street_only=street_only,
-                include_solo_baseline=True,
+                include_solo_baseline=False,
                 round1_k=round1_k,
                 round2_k=round2_k,
                 center_lat=center_lat,
@@ -468,7 +474,7 @@ HTML_PAGE = """<!doctype html>
         <div class="stage" id="st_probe"><div class="st-title">5. Decision-1</div><div class="st-sub" id="st_probe_sub">calibrated</div></div>
       </div>
     </div>
-    <div class="pipe-row">
+    <div class="pipe-row" id="soloPipeRow" style="display:none;">
       <div class="pipe-label solo">Gemini Solo</div>
       <div class="pipe-stages">
         <div class="stage" id="st_solo_in"><div class="st-title" id="st_solo_title">1. Same 12 R1 Photos</div><div class="st-sub" id="st_solo_in_sub">no Round-2 zoom</div></div>
@@ -493,20 +499,20 @@ HTML_PAGE = """<!doctype html>
       <div class="cost-track"><div id="aresCostFill" class="cost-fill ares"></div></div>
       <div id="aresCostStats" class="cost-stats"><b>0.0s</b> · running...</div>
     </div>
-    <div class="cost-row">
+    <div class="cost-row" id="soloCostRow" style="display:none;">
       <div class="cost-label solo">Gemini Solo</div>
       <div class="cost-track"><div id="soloCostFill" class="cost-fill solo"></div></div>
       <div id="soloCostStats" class="cost-stats"><b>0.0s</b> · running...</div>
     </div>
   </div>
 
-  <div id="compare" class="compare" style="display:none;">
+  <div id="compare" class="compare" style="display:none;grid-template-columns:1fr;">
     <div class="panel ares">
       <span class="badge green">ARES (2-ROUND SEARCH + VERIFIED)</span>
       <div id="aresVerdict" class="verdict"></div>
       <div id="aresMeta" class="meta"></div>
     </div>
-    <div class="panel solo">
+    <div class="panel solo" id="soloComparePanel" style="display:none;">
       <span class="badge orange" id="soloBadge">GEMINI SOLO (12 R1 PHOTOS · NO ZOOM)</span>
       <div id="soloVerdict" class="verdict"></div>
       <div id="soloMeta" class="meta"></div>
@@ -515,7 +521,7 @@ HTML_PAGE = """<!doctype html>
 
   <div id="ablateBanner" class="ablate-banner"></div>
 
-  <div id="resultsCols" class="results-cols" style="display:none;">
+  <div id="resultsCols" class="results-cols" style="display:none;grid-template-columns:1fr;">
     <div class="result-col ares-col">
       <div class="col-header ares">
         <span>ARES Results</span>
@@ -523,7 +529,7 @@ HTML_PAGE = """<!doctype html>
       </div>
       <div id="aresGrid" class="col-grid"></div>
     </div>
-    <div class="result-col solo-col">
+    <div class="result-col solo-col" id="soloResultCol" style="display:none;">
       <div class="col-header solo">
         <span>Gemini Solo Result</span>
         <span id="soloColCount" class="badge orange" style="margin:0;">1-shot pick</span>

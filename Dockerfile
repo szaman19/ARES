@@ -26,4 +26,4 @@ RUN uvicorn --version
 
 EXPOSE 8080
 
-CMD ["uvicorn", "ui.combined_app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "ui.nyc_live_app:app", "--host", "0.0.0.0", "--port", "8080"]

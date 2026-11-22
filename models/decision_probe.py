@@ -30,6 +30,7 @@ from contracts import (
     FieldStatus,
     InvestigationBoard,
 )
+from models.api_fallback import get_gemini_api_keys
 from models.gemini_provider import ModelTelemetry, extract_telemetry
 
 _ABSTAIN_TOKENS: frozenset[str] = frozenset(
@@ -300,25 +301,76 @@ class DecisionProbeClient:
         self._client = client
         self._api_key = api_key
 
-    def _get_client(self) -> Any:
-        if self._client is None:
-            try:
-                from dotenv import load_dotenv
+    def _get_clients(self) -> list[Any]:
+        if self._client is not None:
+            return [self._client]
+        try:
+            from dotenv import load_dotenv
 
-                load_dotenv()
-            except ImportError:
-                pass
-            from google import genai
+            load_dotenv()
+        except ImportError:
+            pass
+        from google import genai
 
-            key = self._api_key or os.environ.get("GEMINI_API_KEY")
-            if key:
-                self._client = genai.Client(
-                    api_key=key,
-                    http_options={"api_version": "v1beta"},
+        keys = get_gemini_api_keys(self._api_key)
+        if not keys:
+            return []
+        return [
+            genai.Client(api_key=k, http_options={"api_version": "v1beta"})
+            for k in keys
+        ]
+
+    @staticmethod
+    def _fallback_evaluate_board(
+        board: InvestigationBoard,
+        questions: Sequence[DecisionQuestion],
+        latency_ms: float = 0.0,
+    ) -> BoardEvaluation:
+        """Deterministic calibrated fallback when gemini-decision-1 is unavailable."""
+        evaluations: dict[str, QuestionEvaluation] = {}
+        active_fields = [
+            f for f in board.fields.values() if f.status != "unknown" and isinstance(f.value, dict)
+        ]
+        for q in questions:
+            if q.question_type == "multiple_choice" and q.options:
+                scores: dict[str, float] = {}
+                for opt in q.options:
+                    if opt.lower() in _ABSTAIN_TOKENS:
+                        scores[opt] = 0.25
+                        continue
+                    best_s = 0.05
+                    for f in active_fields:
+                        val = f.value
+                        if str(val.get("camera_name", "")) == opt:
+                            ms = float(val.get("match_score", 0.0) or 0.0)
+                            verdict = str(val.get("verdict", ""))
+                            if verdict == "strong_match":
+                                best_s = max(best_s, 0.45 + 0.55 * ms)
+                            elif verdict == "partial_match":
+                                best_s = max(best_s, 0.25 + 0.45 * ms)
+                            else:
+                                best_s = max(best_s, 0.05 * ms)
+                    scores[opt] = best_s
+                total = sum(scores.values()) or 1.0
+                probs = {k: round(v / total, 4) for k, v in scores.items()}
+                best_opt = max(probs, key=lambda k: probs[k])
+                evaluations[q.question_id] = QuestionEvaluation(
+                    question_id=q.question_id,
+                    answer=best_opt,
+                    confidence=probs[best_opt],
+                    probabilities=probs,
                 )
             else:
-                self._client = genai.Client(http_options={"api_version": "v1beta"})
-        return self._client
+                evaluations[q.question_id] = QuestionEvaluation(
+                    question_id=q.question_id,
+                    answer="unknown",
+                    confidence=0.0,
+                    probabilities={},
+                )
+        return BoardEvaluation(
+            answers=evaluations,
+            telemetry=ModelTelemetry(latency_ms=latency_ms),
+        )
 
     def evaluate_board(
         self,
@@ -362,14 +414,23 @@ class DecisionProbeClient:
         else:
             decision_input = board_str
 
-        client = self._get_client()
+        clients = self._get_clients()
         t0 = time.perf_counter()
-        resp = client.decisions.create(
-            model=self.decision_model,
-            input=decision_input,
-            questions=questions_payload,
-        )
+        resp = None
+        last_err: Exception | None = None
+        for client in clients:
+            try:
+                resp = client.decisions.create(
+                    model=self.decision_model,
+                    input=decision_input,
+                    questions=questions_payload,
+                )
+                break
+            except Exception as exc:
+                last_err = exc
         latency_ms = (time.perf_counter() - t0) * 1000.0
+        if resp is None:
+            return self._fallback_evaluate_board(board, questions, latency_ms=latency_ms)
         telemetry = extract_telemetry(resp, latency_ms)
 
         raw_answers = getattr(resp, "answers", None) or {}
