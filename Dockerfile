@@ -4,10 +4,13 @@ WORKDIR /app
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH="/app"
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --no-dev --no-install-project
 
 COPY contracts.py ./
 COPY adapters ./adapters
@@ -19,6 +22,8 @@ COPY ui ./ui
 COPY viz ./viz
 COPY fixtures/nyc_snapshot ./fixtures/nyc_snapshot
 
+RUN uvicorn --version
+
 EXPOSE 8080
 
-CMD ["uv", "run", "--no-sync", "uvicorn", "ui.nyc_live_app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "ui.combined_app:app", "--host", "0.0.0.0", "--port", "8080"]

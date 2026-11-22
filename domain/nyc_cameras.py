@@ -19,12 +19,14 @@ Workflow (only ~9 live JPEG fetches instead of scanning all ~964 cameras):
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 import concurrent.futures
 import hashlib
 import io
 import json
 import math
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +57,104 @@ from models.gemini_provider import ModelTelemetry, _strip_json_fences, extract_t
 matplotlib.use("Agg")
 
 NYC_CAMERAS_API = "https://webcams.nyctmc.org/api/cameras"
+CATALOG_CACHE_TTL_S = float(os.environ.get("NYC_CATALOG_CACHE_TTL_S", "1800"))  # 30 min
+FRAME_CACHE_TTL_S = float(os.environ.get("NYC_FRAME_CACHE_TTL_S", "180"))  # 3 min
+FRAME_CACHE_MAX_ITEMS = 1024
+
+_CATALOG_LOCK = threading.Lock()
+_CATALOG_CACHE: tuple[float, list[dict[str, Any]]] | None = None
+
+_FRAME_CACHE_LOCK = threading.Lock()
+_FRAME_CACHE: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+_CAM_LOCKS_GUARD = threading.Lock()
+_CAM_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _get_camera_lock(cam_id: str) -> threading.Lock:
+    with _CAM_LOCKS_GUARD:
+        lock = _CAM_LOCKS.get(cam_id)
+        if lock is None:
+            lock = threading.Lock()
+            _CAM_LOCKS[cam_id] = lock
+        return lock
+
+
+def _get_raw_camera_catalog(timeout_s: float = 12.0, *, bypass_cache: bool = False) -> list[dict[str, Any]]:
+    global _CATALOG_CACHE
+    now = time.monotonic()
+    if not bypass_cache and _CATALOG_CACHE is not None:
+        fetched_at, payload = _CATALOG_CACHE
+        if now - fetched_at < CATALOG_CACHE_TTL_S:
+            return payload
+
+    with _CATALOG_LOCK:
+        now = time.monotonic()
+        if not bypass_cache and _CATALOG_CACHE is not None:
+            fetched_at, payload = _CATALOG_CACHE
+            if now - fetched_at < CATALOG_CACHE_TTL_S:
+                return payload
+        resp = httpx.get(
+            NYC_CAMERAS_API,
+            timeout=timeout_s,
+            headers={"User-Agent": "ARES-Hackathon-Demo/1.0"},
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        raw_list = resp.json()
+        _CATALOG_CACHE = (time.monotonic(), raw_list)
+        return raw_list
+
+
+def _get_camera_jpeg_bytes(
+    camera: CameraInfo,
+    *,
+    timeout_s: float = 10.0,
+    bypass_cache: bool = False,
+) -> bytes:
+    now = time.monotonic()
+    if not bypass_cache:
+        with _FRAME_CACHE_LOCK:
+            cached = _FRAME_CACHE.get(camera.id)
+            if cached is not None and (now - cached[0]) < FRAME_CACHE_TTL_S:
+                _FRAME_CACHE.move_to_end(camera.id)
+                return cached[1]
+
+    cam_lock = _get_camera_lock(camera.id)
+    with cam_lock:
+        now = time.monotonic()
+        if not bypass_cache:
+            with _FRAME_CACHE_LOCK:
+                cached = _FRAME_CACHE.get(camera.id)
+                if cached is not None and (now - cached[0]) < FRAME_CACHE_TTL_S:
+                    _FRAME_CACHE.move_to_end(camera.id)
+                    return cached[1]
+
+        resp = httpx.get(
+            camera.image_url,
+            timeout=timeout_s,
+            headers={"User-Agent": "ARES-Hackathon-Demo/1.0"},
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        img_bytes = resp.content
+        if len(img_bytes) < 512:
+            raise ValueError(f"Camera {camera.name} returned empty/tiny image ({len(img_bytes)} bytes).")
+
+        with _FRAME_CACHE_LOCK:
+            _FRAME_CACHE[camera.id] = (time.monotonic(), img_bytes)
+            _FRAME_CACHE.move_to_end(camera.id)
+            while len(_FRAME_CACHE) > FRAME_CACHE_MAX_ITEMS:
+                _FRAME_CACHE.popitem(last=False)
+        return img_bytes
+
+
+def clear_nyc_camera_caches() -> None:
+    """Clear in-memory catalog and JPEG caches (useful for tests)."""
+    global _CATALOG_CACHE
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE = None
+    with _FRAME_CACHE_LOCK:
+        _FRAME_CACHE.clear()
 COLOR_CERTIFIED = "#1b9e77"
 COLOR_UNCERTIFIED = "#d95f02"
 COLOR_NEUTRAL = "#666666"
@@ -141,6 +241,10 @@ class GeminiSoloBaseline(BaseModel):
     predicted_intersection: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reasoning: str = ""
+    spot_box: list[int] | None = Field(
+        default=None,
+        description="Optional [ymin, xmin, ymax, xmax] bounding box in 0..1000 normalized coordinates circling where Gemini Solo thinks the spot is.",
+    )
     has_live_evidence: bool = False
     wall_clock_s: float = 0.0
     telemetry: ModelTelemetry = Field(default_factory=ModelTelemetry)
@@ -230,16 +334,10 @@ def fetch_camera_catalog(
     keyword: str | None = None,
     street_only: bool = True,
     timeout_s: float = 12.0,
+    bypass_cache: bool = False,
 ) -> list[CameraInfo]:
     """Fetch online NYC DOT cameras filtered by borough (`area`), street_only, and optional keyword."""
-    resp = httpx.get(
-        NYC_CAMERAS_API,
-        timeout=timeout_s,
-        headers={"User-Agent": "ARES-Hackathon-Demo/1.0"},
-        follow_redirects=True,
-    )
-    resp.raise_for_status()
-    raw_list = resp.json()
+    raw_list = _get_raw_camera_catalog(timeout_s=timeout_s, bypass_cache=bypass_cache)
 
     area_norm = area.strip().lower() if area and area.strip().lower() != "all" else None
     kw_norm = keyword.strip().lower() if keyword and keyword.strip() else None
@@ -336,18 +434,14 @@ def fetch_camera_jpeg(
     out_dir: Path,
     *,
     timeout_s: float = 10.0,
+    bypass_cache: bool = False,
 ) -> ArtifactRef:
-    """Download one live JPEG frame, verify bytes, compute SHA-256, and return ArtifactRef."""
-    resp = httpx.get(
-        camera.image_url,
-        timeout=timeout_s,
-        headers={"User-Agent": "ARES-Hackathon-Demo/1.0"},
-        follow_redirects=True,
+    """Download one live JPEG frame (with TTL + singleflight cache), verify bytes, compute SHA-256, and return ArtifactRef."""
+    img_bytes = _get_camera_jpeg_bytes(
+        camera,
+        timeout_s=timeout_s,
+        bypass_cache=bypass_cache,
     )
-    resp.raise_for_status()
-    img_bytes = resp.content
-    if len(img_bytes) < 512:
-        raise ValueError(f"Camera {camera.name} returned empty/tiny image ({len(img_bytes)} bytes).")
 
     sha256 = hashlib.sha256(img_bytes).hexdigest()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -557,6 +651,10 @@ def run_gemini_solo_baseline(
         predicted_intersection: str
         confidence: float = Field(ge=0.0, le=1.0)
         reasoning: str
+        spot_box: list[int] | None = Field(
+            default=None,
+            description="Optional [ymin, xmin, ymax, xmax] bounding box in 0..1000 normalized image coordinates tightly circling the open curb spot in your chosen image (or null if none_verified).",
+        )
 
     cam_items = list(round1_items or [])
     if cam_items:
@@ -567,9 +665,17 @@ def run_gemini_solo_baseline(
         prompt_text = (
             f"You are given {len(cam_items)} live NYC traffic camera photos from {area}:\n"
             f"{cam_list_str}\n\n"
-            f"User request: '{query}'\n"
-            "Look at the attached images in order and pick the single best intersection name "
-            "(or 'none_verified'), your confidence (0.0 to 1.0), and a 1-2 sentence explanation."
+            f"User request: '{query}'\n\n"
+            "Apply the exact same strict NYC street-parking rules:\n"
+            "1. Reject cameras that are dark, blurry, frozen, obstructed, or angled away.\n"
+            "2. Never count red painted BUS ONLY / TRUCK ONLY lanes, protected green bike lanes along the curb, "
+            "bridge approaches, overpasses, highways, divided roadways, tunnels, or guardrails with no sidewalk curb.\n"
+            "3. Only pick an intersection if you literally see an empty car-length space along a normal city parking curb "
+            "(typically beside other legally parked cars); otherwise return 'none_verified'.\n\n"
+            "Look at the attached images in order and return the single best intersection name "
+            "(or 'none_verified'), your confidence (0.0 to 1.0), a 1-2 sentence explanation, "
+            "and spot_box=[ymin, xmin, ymax, xmax] in 0..1000 normalized image coordinates "
+            "tightly circling the exact spot in your chosen image (or null if none_verified)."
         )
         multimodal_input: Any = [{"type": "text", "text": prompt_text}]
         for _, art in cam_items:
@@ -588,7 +694,11 @@ def run_gemini_solo_baseline(
         model=model,
         store=False,
         input=multimodal_input,
-        system_instruction="Respond in strict JSON matching the schema.",
+        system_instruction=(
+            "You are a strict, skeptical street-camera verifier. Never count red bus lanes, "
+            "green bike lanes, bridge approaches, highways, or guardrails as street parking. "
+            "Respond in strict JSON matching the schema."
+        ),
         response_format={
             "type": "text",
             "mime_type": "application/json",
@@ -600,10 +710,16 @@ def run_gemini_solo_baseline(
     tel = extract_telemetry(interaction, elapsed_s * 1000.0)
     raw = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
     parsed = _SoloSchema.model_validate_json(raw)
+    valid_box: list[int] | None = None
+    if parsed.spot_box is not None and len(parsed.spot_box) == 4:
+        ymin, xmin, ymax, xmax = [max(0, min(1000, int(v))) for v in parsed.spot_box]
+        if ymax > ymin and xmax > xmin:
+            valid_box = [ymin, xmin, ymax, xmax]
     return GeminiSoloBaseline(
         predicted_intersection=parsed.predicted_intersection,
         confidence=parsed.confidence,
         reasoning=parsed.reasoning,
+        spot_box=valid_box,
         has_live_evidence=bool(cam_items),
         wall_clock_s=elapsed_s,
         telemetry=tel,

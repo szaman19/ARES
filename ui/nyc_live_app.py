@@ -284,13 +284,58 @@ HTML_PAGE = """<!doctype html>
     background: rgba(117,112,179,0.16); border: 1px solid var(--purple); border-radius: 10px;
     padding: 12px 14px; margin-bottom: 16px; font-size: 13px; display: none;
   }
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .cost-bar-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 16px; margin-bottom: 16px; display: none;
+  }
+  .cost-bar-head {
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;
+    gap: 8px; margin-bottom: 10px;
+  }
+  .cost-bar-title { font-size: 11px; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .cost-bar-ratio { font-size: 11.5px; color: #7dd3fc; font-weight: 600; }
+  .cost-row {
+    display: grid; grid-template-columns: 110px 1fr 220px; gap: 10px; align-items: center;
+    margin-bottom: 8px;
+  }
+  .cost-row:last-child { margin-bottom: 0; }
+  .cost-label { font-size: 11.5px; font-weight: 700; }
+  .cost-label.ares { color: #5eead4; }
+  .cost-label.solo { color: #fdba74; }
+  .cost-track {
+    height: 14px; background: #10161d; border: 1px solid var(--border);
+    border-radius: 999px; overflow: hidden; position: relative;
+  }
+  .cost-fill {
+    height: 100%; border-radius: 999px; width: 0%;
+    transition: width 0.25s ease;
+  }
+  .cost-fill.ares { background: linear-gradient(90deg, #15803d, #1b9e77, #2dd4bf); }
+  .cost-fill.solo { background: linear-gradient(90deg, #b45309, #d95f02, #fb923c); }
+  .cost-stats { font-size: 11.5px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cost-stats b { color: var(--text); }
+  .results-cols {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start;
+  }
+  .result-col {
+    background: rgba(24,32,40,0.45); border: 1px solid var(--border); border-radius: 12px; padding: 12px;
+  }
+  .result-col.ares-col { border-top: 3px solid var(--green); }
+  .result-col.solo-col { border-top: 3px solid var(--orange); }
+  .col-header {
+    display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;
+    font-size: 11.5px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .col-header.ares { color: #5eead4; }
+  .col-header.solo { color: #fdba74; }
+  .col-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 12px; }
   .cam-card {
     background: var(--card); border: 2px solid var(--border); border-radius: 12px; overflow: hidden;
     display: flex; flex-direction: column;
   }
   .cam-card.strong_match { border-color: var(--green); }
   .cam-card.partial_match { border-color: var(--orange); }
+  .cam-card.solo-pick { border-color: var(--orange); }
   .cam-card.hidden-clue { opacity: 0.48; border-style: dashed; border-color: var(--purple); }
   .img-wrap { position: relative; width: 100%; height: 205px; background: #000; overflow: hidden; }
   .img-wrap img { width: 100%; height: 100%; object-fit: fill; display: block; }
@@ -330,7 +375,9 @@ HTML_PAGE = """<!doctype html>
   }
   button.hide-btn.active { background: var(--purple); color: white; }
   @media (max-width: 900px) {
-    .controls, .compare, .grid { grid-template-columns: 1fr; }
+    .controls, .compare, .results-cols { grid-template-columns: 1fr; }
+    .cost-row { grid-template-columns: 95px 1fr; }
+    .cost-stats { grid-column: 1 / -1; text-align: left; }
   }
 </style>
 </head>
@@ -436,6 +483,23 @@ HTML_PAGE = """<!doctype html>
     <div id="traceBox" class="trace-box" style="margin-bottom:0;"></div>
   </details>
 
+  <div id="costBarCard" class="cost-bar-card">
+    <div class="cost-bar-head">
+      <div class="cost-bar-title">Est. API Cost &amp; Time to Find</div>
+      <div id="costBarRatio" class="cost-bar-ratio"></div>
+    </div>
+    <div class="cost-row">
+      <div class="cost-label ares">ARES Verified</div>
+      <div class="cost-track"><div id="aresCostFill" class="cost-fill ares"></div></div>
+      <div id="aresCostStats" class="cost-stats"><b>0.0s</b> · running...</div>
+    </div>
+    <div class="cost-row">
+      <div class="cost-label solo">Gemini Solo</div>
+      <div class="cost-track"><div id="soloCostFill" class="cost-fill solo"></div></div>
+      <div id="soloCostStats" class="cost-stats"><b>0.0s</b> · running...</div>
+    </div>
+  </div>
+
   <div id="compare" class="compare" style="display:none;">
     <div class="panel ares">
       <span class="badge green">ARES (2-ROUND SEARCH + VERIFIED)</span>
@@ -450,7 +514,23 @@ HTML_PAGE = """<!doctype html>
   </div>
 
   <div id="ablateBanner" class="ablate-banner"></div>
-  <div id="grid" class="grid"></div>
+
+  <div id="resultsCols" class="results-cols" style="display:none;">
+    <div class="result-col ares-col">
+      <div class="col-header ares">
+        <span>ARES Results</span>
+        <span id="aresColCount" class="badge green" style="margin:0;">0 verified</span>
+      </div>
+      <div id="aresGrid" class="col-grid"></div>
+    </div>
+    <div class="result-col solo-col">
+      <div class="col-header solo">
+        <span>Gemini Solo Result</span>
+        <span id="soloColCount" class="badge orange" style="margin:0;">1-shot pick</span>
+      </div>
+      <div id="soloGrid" class="col-grid"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -572,6 +652,86 @@ function formatLocalTime(isoStr) {
 let activeStream = null;
 let r1Count = 0;
 let r2Count = 0;
+let costTimerId = null;
+let searchStartPerf = 0;
+let soloDoneTimeS = null;
+let aresDoneTimeS = null;
+
+// Estimated tier rates ($ per 1M tokens): hydrogen/decision-1 (lightweight) vs carbon (frontier)
+function estimateCostUsd(tel, tier) {
+  if (!tel) return 0;
+  const p = Number(tel.prompt_tokens || 0);
+  const c = Number(tel.completion_tokens || 0);
+  const inRate = tier === "carbon" ? 2.00 : 0.10;
+  const outRate = tier === "carbon" ? 12.00 : 0.40;
+  return (p * inRate + c * outRate) / 1_000_000;
+}
+
+function formatUsd(usd) {
+  if (usd <= 0) return "$0.000";
+  if (usd < 0.01) return `~$${usd.toFixed(4)}`;
+  return `~$${usd.toFixed(3)}`;
+}
+
+function updateCostBars(aresS, soloS, aresTel, soloTel, isFinal) {
+  const card = document.getElementById("costBarCard");
+  card.style.display = "block";
+  const aVal = Math.max(0, Number(aresS || 0));
+  const sVal = Math.max(0, Number(soloS || 0));
+  const ratioEl = document.getElementById("costBarRatio");
+
+  if (isFinal) {
+    const aCost = estimateCostUsd(aresTel, "hydrogen");
+    const sCost = estimateCostUsd(soloTel, "carbon");
+    const maxCost = Math.max(aCost, sCost, 0.0001);
+    document.getElementById("aresCostFill").style.width = `${Math.min(100, (aCost / maxCost) * 100).toFixed(1)}%`;
+    document.getElementById("soloCostFill").style.width = `${Math.min(100, (sCost / maxCost) * 100).toFixed(1)}%`;
+    document.getElementById("aresCostStats").innerHTML =
+      `<b>${formatUsd(aCost)}</b> · ${aVal.toFixed(1)}s`;
+    document.getElementById("soloCostStats").innerHTML =
+      `<b>${formatUsd(sCost)}</b> · ${sVal.toFixed(1)}s`;
+    if (aCost > 0 && sCost > 0) {
+      if (sCost >= aCost) {
+        ratioEl.textContent = `ARES cost ${(sCost / aCost).toFixed(1)}× less (hydrogen + fusion + decision-1 vs carbon)`;
+      } else {
+        ratioEl.textContent = `ARES cost ${(aCost / sCost).toFixed(1)}× Solo (hydrogen + fusion + decision-1 vs carbon)`;
+      }
+    } else {
+      ratioEl.textContent = `ARES ${aVal.toFixed(1)}s vs Solo ${sVal.toFixed(1)}s`;
+    }
+    return;
+  }
+
+  const maxVal = Math.max(aVal, sVal, 1.0);
+  document.getElementById("aresCostFill").style.width = `${Math.min(100, (aVal / maxVal) * 100).toFixed(1)}%`;
+  document.getElementById("soloCostFill").style.width = `${Math.min(100, (sVal / maxVal) * 100).toFixed(1)}%`;
+  document.getElementById("aresCostStats").innerHTML =
+    `<b>${aVal.toFixed(1)}s</b>${aresDoneTimeS !== null ? " · done" : " · searching..."}`;
+  document.getElementById("soloCostStats").innerHTML =
+    `<b>${sVal.toFixed(1)}s</b>${soloDoneTimeS !== null ? " · done" : " · guessing..."}`;
+  ratioEl.textContent = "Live elapsed wall-clock time...";
+}
+
+function startCostTimer() {
+  stopCostTimer();
+  searchStartPerf = performance.now();
+  soloDoneTimeS = null;
+  aresDoneTimeS = null;
+  updateCostBars(0, 0, null, null, false);
+  costTimerId = setInterval(() => {
+    const nowS = (performance.now() - searchStartPerf) / 1000;
+    const aS = aresDoneTimeS !== null ? aresDoneTimeS : nowS;
+    const sS = soloDoneTimeS !== null ? soloDoneTimeS : nowS;
+    updateCostBars(aS, sS, null, null, false);
+  }, 150);
+}
+
+function stopCostTimer() {
+  if (costTimerId) {
+    clearInterval(costTimerId);
+    costTimerId = null;
+  }
+}
 
 function setStage(id, state, subText) {
   const el = document.getElementById(id);
@@ -630,11 +790,13 @@ function updateStagesFromEvent(step, message, elapsed) {
     setStage("st_fusion", "done-ares", `0 invariant violations (${t})`);
     setStage("st_probe", "active", "running ablations...");
   } else if (step === "ares_done") {
+    aresDoneTimeS = Number(elapsed || 0);
     setStage("st_probe", "done-ares", `calibrated verdict (${t})`);
   } else if (step === "solo_start") {
     setStage("st_solo_in", "active", `${curR1Target} R1 JPEGs in 1 call...`);
     setStage("st_solo_out", "active", "racing ARES...");
   } else if (step === "solo_done") {
+    soloDoneTimeS = Number(elapsed || 0);
     setStage("st_solo_in", "done-solo", `${curR1Target} R1 JPEGs only`);
     setStage("st_solo_out", "done-solo", `1-shot guess (${t})`);
   } else if (step === "done") {
@@ -663,6 +825,7 @@ function runSearch() {
   btn.disabled = true;
   hiddenFields = new Set();
   resetStages();
+  startCostTimer();
   document.getElementById("ablateBanner").style.display = "none";
   box.innerHTML = "";
   box.style.display = "block";
@@ -711,11 +874,13 @@ function runSearch() {
       document.getElementById("traceDetails").open = false;
       status.innerHTML =
         `Live @ <b>${liveTime}</b> — <b>${matches}</b> verified spot(s) found (${rejected} non-matches/non-streets pruned from ${data.total_online_cameras_in_area} street cameras).`;
+      stopCostTimer();
       es.close();
       activeStream = null;
       btn.disabled = false;
     } else if (msg.type === "error") {
       status.innerHTML = `<span style="color:#fca5a5;">Error: ${msg.detail}</span>`;
+      stopCostTimer();
       es.close();
       activeStream = null;
       btn.disabled = false;
@@ -724,6 +889,7 @@ function runSearch() {
 
   es.onerror = () => {
     status.innerHTML = `<span style="color:#fca5a5;">Stream disconnected. Click Run / Re-Run Live to retry.</span>`;
+    stopCostTimer();
     es.close();
     activeStream = null;
     btn.disabled = false;
@@ -732,11 +898,21 @@ function runSearch() {
 
 function renderResult(data) {
   document.getElementById("compare").style.display = "grid";
+  document.getElementById("resultsCols").style.display = "grid";
   const dec = data.board.decision;
   const liveTime = formatLocalTime(data.timestamp_utc);
   document.getElementById("aresVerdict").textContent = dec.answer;
   document.getElementById("aresMeta").innerHTML =
     `<b>${(dec.confidence * 100).toFixed(1)}%</b> calibrated confidence &nbsp;·&nbsp; <b>${data.wall_clock_s}s</b> &nbsp;·&nbsp; live @ ${liveTime}`;
+
+  const soloS = data.solo_baseline ? data.solo_baseline.wall_clock_s : 0;
+  updateCostBars(
+    data.wall_clock_s,
+    soloS,
+    data.telemetry,
+    data.solo_baseline ? data.solo_baseline.telemetry : null,
+    true
+  );
 
   if (data.solo_baseline) {
     const s = data.solo_baseline;
@@ -749,69 +925,161 @@ function renderResult(data) {
   rerenderGrid();
 }
 
+function normalizeCamName(name) {
+  return String(name || "")
+    .replace(/\\((manhattan|brooklyn|queens|bronx|staten island|nyc)\\)\\s*$/i, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function findSoloMatchedCamera(data) {
+  if (!data || !data.solo_baseline || !data.solo_baseline.predicted_intersection) return null;
+  const pred = normalizeCamName(data.solo_baseline.predicted_intersection);
+  if (!pred || pred === "none verified" || pred === "none") return null;
+  const inspected = data.inspected || [];
+  let exact = inspected.find(item => normalizeCamName(item.camera.name) === pred);
+  if (exact) return exact;
+  let partial = inspected.find(item => {
+    const cn = normalizeCamName(item.camera.name);
+    return cn && (pred.includes(cn) || cn.includes(pred));
+  });
+  return partial || null;
+}
+
+function buildCircleSvg(box, strokeColor, fillColor) {
+  if (Array.isArray(box) && box.length === 4) {
+    const [ymin, xmin, ymax, xmax] = box;
+    const cx = (xmin + xmax) / 2;
+    const cy = (ymin + ymax) / 2;
+    const rx = Math.max(45, (xmax - xmin) / 2);
+    const ry = Math.max(45, (ymax - ymin) / 2);
+    return `
+      <svg class="spot-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none">
+        <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}"
+          fill="${fillColor}" stroke="${strokeColor}" stroke-width="14" />
+      </svg>
+    `;
+  }
+  return "";
+}
+
+function buildSpotOverlay(item) {
+  const v = item.observation.verdict;
+  if (v === "strong_match" || v === "partial_match") {
+    return buildCircleSvg(item.observation.spot_box, "#22c55e", "rgba(27,158,119,0.20)");
+  }
+  return "";
+}
+
 function rerenderGrid() {
   if (!currentData) return;
   const showRejected = document.getElementById("showRejected").checked;
   const liveTime = formatLocalTime(currentData.timestamp_utc);
-  const grid = document.getElementById("grid");
-  grid.innerHTML = "";
+  const aresGrid = document.getElementById("aresGrid");
+  const soloGrid = document.getElementById("soloGrid");
+  aresGrid.innerHTML = "";
+  soloGrid.innerHTML = "";
 
-  const visibleItems = currentData.inspected.filter(item => {
-    const isMatch = item.observation.verdict === "strong_match" || item.observation.verdict === "partial_match";
-    return showRejected || isMatch;
-  });
+  const matchedCount = currentData.inspected.filter(
+    i => i.observation.verdict === "strong_match" || i.observation.verdict === "partial_match"
+  ).length;
+  document.getElementById("aresColCount").textContent = `${matchedCount} verified`;
+
+  const visibleItems = currentData.inspected
+    .filter(item => {
+      const isMatch = item.observation.verdict === "strong_match" || item.observation.verdict === "partial_match";
+      return showRejected || isMatch;
+    })
+    .sort((a, b) => {
+      const rank = v => (v === "strong_match" ? 2 : (v === "partial_match" ? 1 : 0));
+      const rd = rank(b.observation.verdict) - rank(a.observation.verdict);
+      return rd !== 0 ? rd : (b.influence - a.influence);
+    });
 
   if (visibleItems.length === 0) {
-    grid.innerHTML = `<div style="grid-column:1/-1;color:#93a1b0;padding:18px;background:#182028;border-radius:10px;">No verified open parking spots in these ${currentData.inspected.length} cameras right now (ARES honestly abstains instead of guessing). Check <b>Show rejected cameras</b> above to inspect them.</div>`;
-    return;
+    aresGrid.innerHTML = `<div style="grid-column:1/-1;color:#93a1b0;padding:16px;background:#182028;border-radius:10px;font-size:12.5px;">No verified open parking spots in these ${currentData.inspected.length} cameras right now (ARES honestly abstains instead of guessing). Check <b>Show rejected cameras</b> above to inspect them.</div>`;
+  } else {
+    for (const item of visibleItems) {
+      const v = item.observation.verdict;
+      const badgeCls = v === "strong_match" ? "green" : (v === "partial_match" ? "orange" : "gray");
+      const roundTag = item.round_num === 2 ? "R2 Zoom" : "R1";
+      const card = document.createElement("div");
+      card.className = `cam-card ${v}` + (hiddenFields.has(item.field_name) ? " hidden-clue" : "");
+      card.id = `card_${item.field_name}`;
+      const disq = item.observation.disqualifier && item.observation.disqualifier !== "none"
+        ? `<span class="badge" style="background:rgba(228,26,28,0.22);color:#fca5a5;">✕ ${item.observation.disqualifier}</span>`
+        : "";
+      const isHidden = hiddenFields.has(item.field_name);
+      card.innerHTML = `
+        <div class="img-wrap">
+          <img src="${item.image_endpoint}" alt="${item.camera.name}" />
+          ${buildSpotOverlay(item)}
+        </div>
+        <div class="cam-body">
+          <div>
+            <span class="badge ${badgeCls}">${roundTag} · ${v.replace("_", " ")}</span>
+            <span class="badge gray">impact ${(item.influence * 100).toFixed(0)}%</span>
+            ${disq}
+          </div>
+          <div class="cam-title">${item.camera.name}</div>
+          <div class="cam-desc">${item.observation.summary}</div>
+          <div class="cam-foot">
+            <span class="meta">${liveTime}</span>
+            <button class="hide-btn ${isHidden ? "active" : ""}" id="btn_${item.field_name}" onclick="toggleHide('${item.field_name}')">${isHidden ? "Hidden (Restore)" : "Hide camera"}</button>
+          </div>
+        </div>
+      `;
+      aresGrid.appendChild(card);
+    }
   }
 
-  for (const item of visibleItems) {
-    const v = item.observation.verdict;
-    const badgeCls = v === "strong_match" ? "green" : (v === "partial_match" ? "orange" : "gray");
-    const roundTag = item.round_num === 2 ? "R2 Zoom" : "R1";
-    const card = document.createElement("div");
-    card.className = `cam-card ${v}` + (hiddenFields.has(item.field_name) ? " hidden-clue" : "");
-    card.id = `card_${item.field_name}`;
-    const disq = item.observation.disqualifier && item.observation.disqualifier !== "none"
-      ? `<span class="badge" style="background:rgba(228,26,28,0.22);color:#fca5a5;">✕ ${item.observation.disqualifier}</span>`
+  // Right column: Gemini Solo's pick (with the actual camera photo it guessed)
+  const solo = currentData.solo_baseline;
+  const soloItem = findSoloMatchedCamera(currentData);
+  if (!solo) {
+    soloGrid.innerHTML = `<div style="color:#93a1b0;padding:16px;background:#182028;border-radius:10px;font-size:12.5px;">Gemini Solo baseline was not run.</div>`;
+  } else if (soloItem) {
+    const sv = soloItem.observation.verdict;
+    const agreed = sv === "strong_match" || sv === "partial_match";
+    const verifierBadge = agreed
+      ? `<span class="badge green">✓ ARES verifier: ${sv.replace("_", " ")}</span>`
+      : `<span class="badge" style="background:rgba(228,26,28,0.22);color:#fca5a5;">✕ ARES rejected (${sv.replace("_", " ")})</span>`;
+    const disq = soloItem.observation.disqualifier && soloItem.observation.disqualifier !== "none"
+      ? `<span class="badge" style="background:rgba(228,26,28,0.22);color:#fca5a5;">✕ ${soloItem.observation.disqualifier}</span>`
       : "";
-    const isHidden = hiddenFields.has(item.field_name);
-    const box = item.observation.spot_box;
-    let overlaySvg = "";
-    if (Array.isArray(box) && box.length === 4 && (v === "strong_match" || v === "partial_match")) {
-      const [ymin, xmin, ymax, xmax] = box;
-      const cx = (xmin + xmax) / 2;
-      const cy = (ymin + ymax) / 2;
-      const rx = Math.max(45, (xmax - xmin) / 2);
-      const ry = Math.max(45, (ymax - ymin) / 2);
-      overlaySvg = `
-        <svg class="spot-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none">
-          <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}"
-            fill="rgba(27,158,119,0.20)" stroke="#22c55e" stroke-width="14" />
-        </svg>
-      `;
-    }
+    document.getElementById("soloColCount").textContent = agreed ? "matched R1 cam" : "rejected by ARES";
+    const card = document.createElement("div");
+    card.className = "cam-card solo-pick";
+    const soloOverlay = buildCircleSvg(solo.spot_box, "#f97316", "rgba(217,95,2,0.20)");
     card.innerHTML = `
       <div class="img-wrap">
-        <img src="${item.image_endpoint}" alt="${item.camera.name}" />
-        ${overlaySvg}
+        <img src="${soloItem.image_endpoint}" alt="${soloItem.camera.name}" />
+        ${soloOverlay}
       </div>
       <div class="cam-body">
         <div>
-          <span class="badge ${badgeCls}">${roundTag} · ${v.replace("_", " ")}</span>
-          <span class="badge gray">impact ${(item.influence * 100).toFixed(0)}%</span>
+          <span class="badge orange">1-Shot Pick · ${(solo.confidence * 100).toFixed(0)}%</span>
+          ${verifierBadge}
           ${disq}
         </div>
-        <div class="cam-title">${item.camera.name}</div>
-        <div class="cam-desc">${item.observation.summary}</div>
+        <div class="cam-title">${soloItem.camera.name}</div>
+        <div class="cam-desc"><b>Solo reasoning:</b> ${solo.reasoning}<br/><span style="color:#94a3b8;"><b>ARES check:</b> ${soloItem.observation.summary}</span></div>
         <div class="cam-foot">
-          <span class="meta">${liveTime}</span>
-          <button class="hide-btn ${isHidden ? "active" : ""}" id="btn_${item.field_name}" onclick="toggleHide('${item.field_name}')">${isHidden ? "Hidden (Restore)" : "Hide camera"}</button>
+          <span class="meta">Found in ${solo.wall_clock_s}s · no Round-2 zoom</span>
         </div>
       </div>
     `;
-    grid.appendChild(card);
+    soloGrid.appendChild(card);
+  } else {
+    document.getElementById("soloColCount").textContent = "no camera match";
+    soloGrid.innerHTML = `
+      <div style="color:#cbd5e1;padding:16px;background:#182028;border:2px dashed var(--orange);border-radius:12px;font-size:12.5px;">
+        <div style="margin-bottom:6px;"><span class="badge orange">1-Shot Pick · ${(solo.confidence * 100).toFixed(0)}%</span></div>
+        <div style="font-weight:700;font-size:14px;margin-bottom:6px;">${solo.predicted_intersection}</div>
+        <div style="color:#93a1b0;">${solo.reasoning}</div>
+      </div>
+    `;
   }
 }
 

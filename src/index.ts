@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 
 interface Env {
 	ARES_CONTAINER: DurableObjectNamespace<AresNycContainer>;
+	CF_VERSION_METADATA: { id: string };
 	GEMINI_API_KEY: string;
 }
 
@@ -26,6 +27,7 @@ export class AresNycContainer extends DurableObject<Env> {
 		if (!container.running) {
 			container.start({
 				image: container.images.base,
+				instance: "basic",
 				enableInternet: true,
 				env: {
 					GEMINI_API_KEY: this.env.GEMINI_API_KEY,
@@ -66,6 +68,7 @@ export class AresNycContainer extends DurableObject<Env> {
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		return env.ARES_CONTAINER.getByName("nyc-live-main").fetch(request);
+		const instanceName = `ares-combined-${env.CF_VERSION_METADATA?.id || "main"}`;
+		return env.ARES_CONTAINER.getByName(instanceName).fetch(request);
 	},
 };
