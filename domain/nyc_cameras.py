@@ -68,6 +68,8 @@ NYC_CAMERAS_API = "https://webcams.nyctmc.org/api/cameras"
 CATALOG_CACHE_TTL_S = float(os.environ.get("NYC_CATALOG_CACHE_TTL_S", "1800"))  # 30 min
 FRAME_CACHE_TTL_S = float(os.environ.get("NYC_FRAME_CACHE_TTL_S", "180"))  # 3 min
 FRAME_CACHE_MAX_ITEMS = 1024
+ORIGIN_MAX_CONCURRENT = int(os.environ.get("NYC_ORIGIN_MAX_CONCURRENT", "3"))
+ORIGIN_MIN_INTERVAL_S = float(os.environ.get("NYC_ORIGIN_MIN_INTERVAL_S", "0.18"))
 
 _CATALOG_LOCK = threading.Lock()
 _CATALOG_CACHE: tuple[float, list[dict[str, Any]]] | None = None
@@ -76,6 +78,23 @@ _FRAME_CACHE_LOCK = threading.Lock()
 _FRAME_CACHE: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
 _CAM_LOCKS_GUARD = threading.Lock()
 _CAM_LOCKS: dict[str, threading.Lock] = {}
+
+_ORIGIN_SEMAPHORE = threading.BoundedSemaphore(value=max(1, ORIGIN_MAX_CONCURRENT))
+_ORIGIN_PACE_LOCK = threading.Lock()
+_ORIGIN_LAST_FETCH_TS = 0.0
+
+
+def _pace_origin_request() -> None:
+    """Enforce a polite minimum interval between outbound requests to webcams.nyctmc.org."""
+    global _ORIGIN_LAST_FETCH_TS
+    if ORIGIN_MIN_INTERVAL_S <= 0:
+        return
+    with _ORIGIN_PACE_LOCK:
+        now = time.monotonic()
+        wait_s = (_ORIGIN_LAST_FETCH_TS + ORIGIN_MIN_INTERVAL_S) - now
+        if wait_s > 0:
+            time.sleep(wait_s)
+        _ORIGIN_LAST_FETCH_TS = time.monotonic()
 
 
 def _get_camera_lock(cam_id: str) -> threading.Lock:
@@ -137,12 +156,14 @@ def _get_camera_jpeg_bytes(
                     _FRAME_CACHE.move_to_end(camera.id)
                     return cached[1]
 
-        resp = httpx.get(
-            camera.image_url,
-            timeout=timeout_s,
-            headers={"User-Agent": "ARES-Hackathon-Demo/1.0"},
-            follow_redirects=True,
-        )
+        with _ORIGIN_SEMAPHORE:
+            _pace_origin_request()
+            resp = httpx.get(
+                camera.image_url,
+                timeout=timeout_s,
+                headers={"User-Agent": "ARES-Hackathon-Demo/1.0"},
+                follow_redirects=True,
+            )
         resp.raise_for_status()
         img_bytes = resp.content
         if len(img_bytes) < 512:
