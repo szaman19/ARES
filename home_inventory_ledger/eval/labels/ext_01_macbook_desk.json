@@ -1,0 +1,36 @@
+{
+  "clip_id": "ext_01_macbook_desk",
+  "source": "Wikimedia Commons (CC BY 3.0)",
+  "conditions": {
+    "lighting": "studio_indoor",
+    "motion": "multi_angle_cuts",
+    "audio": "contradictory_narration"
+  },
+  "items": [
+    {
+      "category": "laptop",
+      "brand": "Apple",
+      "model": null,
+      "qty": 1,
+      "price_usd": 1199.0
+    },
+    {
+      "category": "stand",
+      "brand": "Sanwa",
+      "model": "PDA-STN23S",
+      "qty": 1,
+      "price_usd": 45.0
+    },
+    {
+      "category": "monitor",
+      "brand": null,
+      "model": null,
+      "qty": 1,
+      "price_usd": 350.0
+    }
+  ],
+  "planted_contradiction": {
+    "item_index": 0,
+    "said": "Dell"
+  }
+}
