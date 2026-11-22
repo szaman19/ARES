@@ -20,7 +20,6 @@ COPY fusion ./fusion
 COPY models ./models
 COPY ui ./ui
 COPY viz ./viz
-COPY fixtures/nyc_snapshot ./fixtures/nyc_snapshot
 
 RUN uvicorn --version
 

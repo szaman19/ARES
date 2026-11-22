@@ -51,9 +51,6 @@ def _store_run(run_id: str, res: NYCDemoResult) -> None:
             shutil.rmtree(RUN_ROOT / old_id, ignore_errors=True)
 
 
-DEFAULT_SNAPSHOT_DIR = Path("fixtures/nyc_snapshot")
-
-
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -69,7 +66,6 @@ class LiveSearchRequest(BaseModel):
     query: str = "open legal street parking spot along a normal city curb"
     keyword: str | None = None
     street_only: bool = True
-    use_snapshot: bool = False
     round1_k: int = Field(default=12, ge=2, le=24)
     round2_k: int = Field(default=6, ge=0, le=12)
     center_lat: float | None = None
@@ -214,7 +210,6 @@ def api_search(req: LiveSearchRequest) -> dict[str, Any]:
             center_lon=req.center_lon,
             radius_m=req.radius_m,
             out_dir=run_dir,
-            snapshot_dir=DEFAULT_SNAPSHOT_DIR if req.use_snapshot else None,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -229,7 +224,6 @@ def api_search_stream(
     query: str = Query(default="open legal street parking spot along a normal city curb"),
     keyword: str | None = Query(default=None),
     street_only: bool = Query(default=True),
-    use_snapshot: bool = Query(default=False),
     round1_k: int = Query(default=12, ge=2, le=24),
     round2_k: int = Query(default=6, ge=0, le=12),
     center_lat: float | None = Query(default=None),
@@ -257,7 +251,6 @@ def api_search_stream(
                 center_lon=center_lon,
                 radius_m=radius_m,
                 out_dir=run_dir,
-                snapshot_dir=DEFAULT_SNAPSHOT_DIR if use_snapshot else None,
                 on_event=_on_event,
             )
             _store_run(run_id, res)
@@ -523,8 +516,7 @@ HTML_PAGE = """<!doctype html>
       <div class="sub" style="margin-bottom:0;">2-round parallel street search + deterministic parking rules + <code>gemini-decision-1</code> counterfactuals</div>
     </div>
     <div class="mode-switch">
-      <button id="modeLiveBtn" class="mode-btn active-live" onclick="setMode(false)">● LIVE NYC DOT</button>
-      <button id="modeOffBtn" class="mode-btn" onclick="setMode(true)">📦 OFFLINE SNAPSHOT (36)</button>
+      <span class="mode-btn active-live" style="cursor:default;">● LIVE NYC DOT</span>
     </div>
   </div>
 
@@ -670,7 +662,6 @@ HTML_PAGE = """<!doctype html>
 let currentRunId = null;
 let currentData = null;
 let hiddenFields = new Set();
-let useSnapshotMode = false;
 let pinLat = 40.7233;
 let pinLon = -73.9985;
 let pinName = "SoHo";
@@ -809,14 +800,6 @@ function plotCamerasOnMap(inspected) {
     }).addTo(camLayer);
     m.bindPopup(`<b>${item.camera.name}</b><br/>R${item.round_num} · ${v}<br/>${item.observation.summary}`);
   }
-}
-
-function setMode(isOffline) {
-  useSnapshotMode = isOffline;
-  const liveBtn = document.getElementById("modeLiveBtn");
-  const offBtn = document.getElementById("modeOffBtn");
-  liveBtn.className = "mode-btn" + (isOffline ? "" : " active-live");
-  offBtn.className = "mode-btn" + (isOffline ? " active-off" : "");
 }
 
 function formatLocalTime(isoStr) {
@@ -1015,7 +998,6 @@ function runSearch() {
     area: document.getElementById("area").value,
     query: document.getElementById("query").value,
     street_only: document.getElementById("streetOnly").checked ? "true" : "false",
-    use_snapshot: useSnapshotMode ? "true" : "false",
     round1_k: r1k,
     round2_k: r2k,
   });
