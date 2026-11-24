@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from domain.audio_haystack import (
+from examples.audio_haystack.domain import (
     AudioHaystackStore,
     ScrambledRunContext,
     _AudioInspectionOutput,
@@ -18,8 +18,8 @@ from domain.audio_haystack import (
     run_ares_audio_search,
     synthesize_card_pcm,
 )
-from models.gemini_provider import ModelTelemetry
-from ui.audio_haystack_app import app
+from ares.models.gemini import ModelTelemetry
+from examples.audio_haystack.app import app
 
 
 def _mock_sql_proposer(*, angle_name: str, excluded_nums: list[int] | None = None, **_kwargs):

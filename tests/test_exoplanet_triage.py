@@ -1,41 +1,35 @@
-"""Unit & integration tests for `ExoplanetTriageDomain` (Real NASA TESS Vetting)."""
+"""Offline unit & integration tests for `examples/exoplanet_triage` (NASA TESS Vetting)."""
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import pyarrow.parquet as pq
 import pytest
 
-from ares.engine import ARESRunner, TaskGraph, TaskSpec
-from ares.store import NoteStore
-from contracts import (
-    DecisionQuestion,
+from ares.context import (
+    create_initial_board,
+    deterministic_patch_from_notes,
+    validate_and_merge_patch,
+)
+from ares.contracts import (
     Domain,
     GuardValidationError,
     HypothesisSpec,
     InMemoryVerifierRegistry,
-    InvestigationBoard,
 )
-from domain.exoplanet_artifacts import render_exoplanet_diagnostic_card
-from domain.exoplanet_triage import (
+from ares.engine import ARESRunner, ProcessorResult, TaskGraph, TaskSpec
+from ares.loop import LoopConfig, run_investigation_loop
+from ares.models import ModelTelemetry
+from ares.store import NoteStore
+from examples.exoplanet_triage.artifacts import render_exoplanet_diagnostic_card
+from examples.exoplanet_triage.domain import (
     EXOPLANET_PIVOTAL_FIELDS,
     EXOPLANET_REQUIRED_SIGNALS,
     ExoplanetTriageDomain,
-)
-from fusion.loop import LoopConfig, run_investigation_loop
-from fusion.patch import (
-    create_initial_board,
-    deterministic_patch_from_notes,
-    rebuild_board_from_notes,
-    validate_and_merge_patch,
-)
-from models.decision_probe import (
-    BoardEvaluation,
-    ModelTelemetry,
-    ProbeResult,
-    QuestionEvaluation,
 )
 
 
@@ -110,8 +104,6 @@ def test_dedup_and_all_nine_cases_deterministic_verifiers(tmp_path: Path) -> Non
     assert rep2.usage.skipped_duplicate_tasks == 1
 
     # Verify all 9 benchmark cases (3 planet, 3 impostor decoy, 3 under-determined)
-    import shutil
-
     for needle in domain.needle_menu():
         case_ws = tmp_path / f"case_{needle.case_id}"
         shutil.copytree(base_dir, case_ws)
@@ -134,7 +126,7 @@ def test_dedup_and_all_nine_cases_deterministic_verifiers(tmp_path: Path) -> Non
             notes.append(note)
 
         board = create_initial_board(
-            domain.decision_questions(),
+            domain.search_questions(),
             seed_fields=domain.pivotal_fields(),
         )
         patch = deterministic_patch_from_notes(
@@ -156,7 +148,6 @@ def test_dedup_and_all_nine_cases_deterministic_verifiers(tmp_path: Path) -> Non
             assert conf_field.value == truth.primary_target
             if truth.decoy_target:
                 assert conf_field.value != truth.decoy_target
-                # Loud decoy MUST have triggered periodic_transit_snr!
                 snr_val = board.fields["periodic_transit_snr"].value
                 snr_list = [snr_val] if isinstance(snr_val, str) else list(snr_val)
                 assert truth.decoy_target in snr_list
@@ -167,7 +158,6 @@ def test_dedup_and_all_nine_cases_deterministic_verifiers(tmp_path: Path) -> Non
 
 
 def test_deterministic_png_sha256_and_offline_fallback(tmp_path: Path) -> None:
-    # Exercise offline fallback generator explicitly
     fallback_domain = ExoplanetTriageDomain(staged_dir=tmp_path / "nonexistent_staged")
     assert fallback_domain.is_using_real_nasa_data is False
 
@@ -175,8 +165,6 @@ def test_deterministic_png_sha256_and_offline_fallback(tmp_path: Path) -> None:
     fallback_domain.generate(str(ws), size_gb=0.01, seed=99)
     needle = fallback_domain.needle_menu()[3]  # decoy case
     fallback_domain.plant(str(ws), needle)
-
-    import duckdb
 
     con = duckdb.connect(":memory:")
     art1 = render_exoplanet_diagnostic_card(
@@ -198,9 +186,10 @@ def test_deterministic_png_sha256_and_offline_fallback(tmp_path: Path) -> None:
 
 class _StubGeminiProvider:
     def make_propose_processor(self, **kwargs: Any):
-        from ares.engine import ProcessorResult
+        del kwargs
 
         def _proc(spec: TaskSpec, dep_outputs: dict[str, Any]) -> ProcessorResult:
+            del dep_outputs
             h = HypothesisSpec(
                 query="SELECT tic_id, tmag, crowding_metric FROM stellar_catalog WHERE candidate_period_days IS NOT NULL LIMIT 10",
                 hypothesis_family=str(spec.context.get("hypothesis_family", "scan")),
@@ -212,91 +201,12 @@ class _StubGeminiProvider:
         return _proc
 
     def propose_followup_tasks(self, **kwargs: Any):
+        del kwargs
         return [], ModelTelemetry()
 
     def propose_board_patch(self, **kwargs: Any):
+        del kwargs
         return {"updates": {}, "rationale": "Deterministic canonical verifier merge"}, ModelTelemetry()
-
-
-class _StubDecisionProbe:
-    def probe_board(
-        self,
-        board: InvestigationBoard,
-        questions: list[DecisionQuestion],
-        *,
-        required_signal_fields: tuple[str, ...] = (),
-        artifact_refs: list[Any] | None = None,
-        **kwargs: Any,
-    ) -> ProbeResult:
-        # Mirror exact intersection semantics over required_signal_fields
-        sets: list[set[str]] = []
-        all_cert = True
-        for req in required_signal_fields:
-            fld = board.fields.get(req)
-            if fld is None or fld.status != "certified" or fld.value in ("unknown", "none"):
-                all_cert = False
-                break
-            vals = [fld.value] if isinstance(fld.value, str) else list(fld.value)
-            sets.append(set(vals))
-
-        common = sorted(set.intersection(*sets)) if (all_cert and sets) else []
-        if len(common) == 1:
-            ans_tic = common[0]
-            ans_act = "trigger_flagship_slew"
-            ans_ver = "yes"
-            conf = 0.94
-            influences = {k: (0.25 if k in required_signal_fields else 0.0) for k in board.fields}
-            cert_share = 1.0
-            voi_map = {k: 0.0 for k in board.fields}
-            voi_max = 0.0
-        else:
-            ans_tic = "none_verified"
-            ans_act = "request_spectroscopy"
-            ans_ver = "no"
-            conf = 0.88
-            influences = {k: 0.0 for k in board.fields}
-            cert_share = 0.0
-            voi_map = {
-                k: (0.82 if board.fields[k].status != "certified" and k in required_signal_fields else 0.0)
-                for k in board.fields
-            }
-            voi_max = max(voi_map.values(), default=0.0)
-
-        eval_answers = {
-            "confirmed_planet_tic": QuestionEvaluation(
-                question_id="confirmed_planet_tic", answer=ans_tic, confidence=conf
-            ),
-            "recommended_followup": QuestionEvaluation(
-                question_id="recommended_followup", answer=ans_act, confidence=conf
-            ),
-            "sufficiently_verified": QuestionEvaluation(
-                question_id="sufficiently_verified", answer=ans_ver, confidence=conf
-            ),
-        }
-        updated = board.model_copy(deep=True)
-        for k, fobj in updated.fields.items():
-            fobj.influence = influences.get(k, 0.0)
-            fobj.voi = voi_map.get(k, 0.0)
-        for q in questions:
-            qe = eval_answers[q.question_id]
-            updated.decisions[q.question_id].answer = qe.answer
-            updated.decisions[q.question_id].confidence = qe.confidence
-            updated.decisions[q.question_id].certified_influence_share = cert_share
-            updated.decisions[q.question_id].uncertified_influence_share = 0.0
-            updated.decisions[q.question_id].unknown_voi_max = voi_max
-        updated.decision = updated.decisions["confirmed_planet_tic"].model_copy(deep=True)
-
-        return ProbeResult(
-            base_evaluation=BoardEvaluation(answers=eval_answers),
-            field_influences=influences,
-            raw_swings=influences,
-            certified_influence_share=cert_share,
-            uncertified_influence_share=0.0,
-            field_voi=voi_map,
-            unknown_voi_max=voi_max,
-            updated_board=updated,
-            api_calls=6,
-        )
 
 
 def test_end_to_end_loop_invariants_on_real_nasa_decoy_and_ud(tmp_path: Path) -> None:
@@ -311,7 +221,6 @@ def test_end_to_end_loop_invariants_on_real_nasa_decoy_and_ud(tmp_path: Path) ->
             domain,
             str(ws),
             provider=_StubGeminiProvider(),  # type: ignore[arg-type]
-            probe_client=_StubDecisionProbe(),  # type: ignore[arg-type]
             config=LoopConfig(max_rounds=2, artifact_dir=str(tmp_path / f"art_{needle_idx}")),
         )
         assert res.termination_reason == expected_term

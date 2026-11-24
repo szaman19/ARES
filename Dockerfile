@@ -12,17 +12,11 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --no-dev --no-install-project
 
-COPY contracts.py ./
-COPY adapters ./adapters
 COPY ares ./ares
-COPY domain ./domain
-COPY fusion ./fusion
-COPY models ./models
-COPY ui ./ui
-COPY viz ./viz
+COPY examples ./examples
 
 RUN uvicorn --version
 
 EXPOSE 8080
 
-CMD ["uvicorn", "ui.nyc_live_app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "examples.nyc_cameras.app:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -1,7 +1,7 @@
 [project]
-name = "ares-hack"
+name = "ares"
 version = "0.1.0"
-description = "ARES Hackathon: Parallel Hypothesis Swarm, Deterministic Certification, and Counterfactual Decision Probing"
+description = "ARES: Search framework for orchestrating parallel agent swarms, deterministic verification, and automatic context management."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

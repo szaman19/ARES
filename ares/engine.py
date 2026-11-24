@@ -1,6 +1,6 @@
 """Backend- and domain-agnostic ARES Task DAG engine and parallel `solve(graph=...)` runner.
 
-Respects the ARES Narrow-Waist Boundary Rule (ARES Plan §3.2):
+Respects the ARES Narrow-Waist Boundary Rule:
 - Provides TaskSpec, TaskGraph, solve(graph=...), max_concurrent parallel dispatch,
   streaming/progress callbacks, populated UsageReport, pluggable ExecutionBackend
   guard & cheapest-first cost sorting, content-hash deduplication, and standalone
@@ -21,8 +21,7 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from ares.store import NoteStore
-from contracts import (
+from ares.contracts import (
     CertificationStatus,
     CostEstimate,
     ExecutionBackend,
@@ -32,6 +31,7 @@ from contracts import (
     VerifierRegistry,
     VerifierResult,
 )
+from ares.store import NoteStore
 
 
 TaskType = Literal["propose", "query", "verify", "custom"]

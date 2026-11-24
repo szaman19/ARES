@@ -9,3 +9,6 @@ data/
 .env.*
 benchmark/results/artifacts/
 .wrangler/
+examples/incident_rca/results/artifacts/
+examples/exoplanet_triage/results/artifacts/
+examples/nyc_cameras/runs/

@@ -1,71 +1,40 @@
-"""Deterministic unit tests for the 8-step investigation loop (`fusion/loop.py`)."""
+"""Deterministic offline tests for the ARES orchestration & context loop (`ares/loop.py`)."""
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
-from ares.engine import ProcessorResult, SolveEvent, TaskSpec
-from ares.store import NoteStore
-from benchmark.run_micro_bench import build_baseline_board_for_scoring
-from contracts import (
-    DecisionQuestion,
-    HypothesisSpec,
-    InvestigationBoard,
-    Note,
+from ares.context import (
+    create_initial_board,
+    deterministic_patch_from_notes,
+    validate_and_merge_patch,
 )
-from domain.micro_bench import (
+from ares.contracts import HypothesisSpec, InvestigationBoard, Note
+from ares.engine import ProcessorResult, SolveEvent, TaskSpec
+from ares.loop import LoopConfig, RoundTelemetry, run_investigation_loop
+from ares.models.gemini import ModelTelemetry
+from ares.store import NoteStore
+from examples.incident_rca.benchmark import build_baseline_board_for_scoring
+from examples.incident_rca.domain import (
     INCIDENT_PIVOTAL_FIELDS,
     MicroBenchDomain,
     extract_incident_note_fields,
 )
-from fusion import (
-    LoopConfig,
-    RoundTelemetry,
-    create_initial_board,
-    deterministic_patch_from_notes,
-    run_investigation_loop,
-    validate_and_merge_patch,
-)
-from models import DecisionProbeClient
-from models.decision_probe import _build_questions_payload
-from models.gemini_provider import ModelTelemetry
-
-
-def _candidate_in_field(val: Any, service: str) -> bool:
-    if isinstance(val, str):
-        return val == service
-    if isinstance(val, list):
-        return service in val
-    return False
-
-
-def _infer_action_from_board(board_fields: dict[str, dict[str, Any]], service: str) -> str:
-    anom_entry = board_fields.get("metric_anomaly_type", {})
-    anom_val = anom_entry.get("value")
-    metric_name = ""
-    if isinstance(anom_val, str):
-        metric_name = anom_val
-    elif isinstance(anom_val, dict):
-        metric_name = str(anom_val.get(service, ""))
-
-    if metric_name == "pool_utilization_pct":
-        return "scale_pool"
-    if service == "inventory-db" and metric_name == "lock_wait_ms":
-        return "restart"
-    if service in ("payments-db", "auth-svc") and metric_name in ("lock_wait_ms", "p99_latency_ms"):
-        return "rollback"
-    return "rollback"
 
 
 class _MockLoopProvider:
     """Fast deterministic mock of `GeminiModelProvider` over real DuckDB notes."""
 
-    def __init__(self, *, inject_hallucinated_field: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        inject_hallucinated_field: bool = False,
+        inject_extra_distractors: bool = False,
+    ) -> None:
         self.inject_hallucinated_field = inject_hallucinated_field
+        self.inject_extra_distractors = inject_extra_distractors
         self.propose_calls = 0
         self.patch_calls = 0
         self.followup_calls = 0
@@ -150,6 +119,13 @@ class _MockLoopProvider:
                     "sources": [n0.note_id],
                     "artifact_ids": [],
                 }
+            if self.inject_extra_distractors:
+                for idx, qn in enumerate(query_notes):
+                    updates[f"distractor_probe_{self.patch_calls}_{idx}"] = {
+                        "value": qn.summary,
+                        "sources": [qn.note_id],
+                        "artifact_ids": [],
+                    }
 
         cert_notes = [n for n in new_notes if n.certification == "CERTIFIED"]
         if self.inject_hallucinated_field and cert_notes:
@@ -175,7 +151,7 @@ class _MockLoopProvider:
         self,
         *,
         board: InvestigationBoard,
-        high_voi_fields: list[str],
+        target_gap_fields: list[str],
         environment_description: str,
         magnet_rules: str = "",
         available_verifiers: Sequence[str] | None = None,
@@ -184,15 +160,15 @@ class _MockLoopProvider:
     ) -> tuple[list[HypothesisSpec], ModelTelemetry]:
         del environment_description, magnet_rules, available_verifiers, max_queries, thinking_level
         self.followup_calls += 1
-        target = high_voi_fields[0] if high_voi_fields else "traces_error_cluster"
+        target = target_gap_fields[0] if target_gap_fields else "traces_error_cluster"
         spec = HypothesisSpec(
             query=(
                 "SELECT service, status, MAX(duration_ms) AS max_dur "
                 "FROM traces GROUP BY service, status ORDER BY max_dur DESC LIMIT 10"
             ),
-            hypothesis_family="followup_voi_check",
+            hypothesis_family="followup_gap_check",
             expected_signal=f"Follow-up check for {target}",
-            target_fields=list(high_voi_fields),
+            target_fields=list(target_gap_fields),
             requested_under=board.board_version,
         )
         return (
@@ -205,97 +181,6 @@ class _MockLoopProvider:
                 latency_ms=4.0,
             ),
         )
-
-
-class _MockDecisionBackend:
-    """Deterministic `v1beta` `decisions.create` backend honoring 3-of-3 certified signal rules."""
-
-    def __init__(self) -> None:
-        self.decisions = SimpleNamespace(create=self._create)
-
-    def _create(
-        self,
-        *,
-        model: str,
-        input: Any,
-        questions: dict[str, dict[str, Any]],
-    ) -> Any:
-        assert model == "gemini-decision-1"
-        raw_text = input[0]["text"] if isinstance(input, list) else input
-        parsed = json.loads(raw_text)
-        fields: dict[str, dict[str, Any]] = parsed["fields"]
-
-        req_signals = ("logs_retry_spike", "metrics_zscore_breach", "traces_error_cluster")
-        rc_options = [
-            opt
-            for opt in questions["root_cause"]["criteria"].keys()
-            if opt != "none_verified"
-        ]
-
-        all_req_certified = all(
-            fields.get(sig, {}).get("status") == "certified"
-            and fields.get(sig, {}).get("value") not in ("unknown", "none", None)
-            for sig in req_signals
-        )
-
-        verified_service: str | None = None
-        if all_req_certified:
-            for svc in rc_options:
-                if all(
-                    _candidate_in_field(fields[sig]["value"], svc) for sig in req_signals
-                ):
-                    verified_service = svc
-                    break
-
-        if verified_service is not None:
-            rc_choice = verified_service
-            rc_conf = 0.95
-            rc_probs = {opt: 0.0 for opt in questions["root_cause"]["criteria"]}
-            rc_probs[verified_service] = 0.95
-            rc_probs["none_verified"] = 0.05
-
-            act_choice = _infer_action_from_board(fields, verified_service)
-            act_conf = 0.93
-            act_probs = {opt: 0.02 for opt in questions["recommended_action"]["criteria"]}
-            act_probs[act_choice] = 0.94
-            noul_val = 0.96
-        else:
-            rc_choice = "none_verified"
-            rc_conf = 0.93
-            rc_probs = {opt: 0.0 for opt in questions["root_cause"]["criteria"]}
-            rc_probs["none_verified"] = 0.93
-            if rc_options:
-                rc_probs[rc_options[0]] = 0.07
-
-            act_choice = "escalate"
-            act_conf = 0.94
-            act_probs = {opt: 0.02 for opt in questions["recommended_action"]["criteria"]}
-            act_probs["escalate"] = 0.94
-            noul_val = 0.04
-
-        answers = {
-            "root_cause": SimpleNamespace(
-                choice=rc_choice,
-                confidence=rc_conf,
-                probabilities=rc_probs,
-            ),
-            "recommended_action": SimpleNamespace(
-                choice=act_choice,
-                confidence=act_conf,
-                probabilities=act_probs,
-            ),
-            "sufficiently_verified": SimpleNamespace(
-                noul=noul_val,
-                confidence=max(noul_val, 1.0 - noul_val),
-            ),
-        }
-        usage = SimpleNamespace(
-            total_input_tokens=110,
-            total_output_tokens=0,
-            total_thought_tokens=0,
-            total_tokens=110,
-        )
-        return SimpleNamespace(answers=answers, usage=usage)
 
 
 def test_deterministic_patch_populates_metric_anomaly_type_single_and_multi() -> None:
@@ -326,7 +211,7 @@ def test_deterministic_patch_populates_metric_anomaly_type_single_and_multi() ->
     assert patch_single.updates["metric_anomaly_type"].sources == ["n_m1"]
 
     board = create_initial_board(
-        MicroBenchDomain().decision_questions(), seed_fields=INCIDENT_PIVOTAL_FIELDS
+        MicroBenchDomain().search_questions(), seed_fields=INCIDENT_PIVOTAL_FIELDS
     )
     merged_single, rep_single = validate_and_merge_patch(
         board,
@@ -386,42 +271,6 @@ def test_deterministic_patch_populates_metric_anomaly_type_single_and_multi() ->
     assert merged_multi.fields["metric_anomaly_type"].status == "certified"
 
 
-def test_decision_probe_rubrics_use_domain_supplied_criteria_and_generic_fallbacks() -> None:
-    domain = MicroBenchDomain()
-    questions: list[DecisionQuestion] = domain.decision_questions()
-    payload = _build_questions_payload(
-        questions, required_signal_fields=domain.required_signal_fields()
-    )
-
-    sv_inst = payload["sufficiently_verified"]["instructions"]
-    assert "logs_retry_spike" in sv_inst
-    assert "noul >= 0.5" in sv_inst
-
-    rc_spec = payload["root_cause"]
-    assert "logs_retry_spike" in rc_spec["criteria"]["none_verified"]
-    assert "ALL THREE required signal fields" in rc_spec["criteria"]["payments-db"]
-
-    generic_qs = [
-        DecisionQuestion(
-            question_id="lead_molecule",
-            question="Which molecule passes all filters?",
-            options=["mol_01", "mol_02", "none_verified"],
-        ),
-        DecisionQuestion(
-            question_id="sufficiently_verified",
-            question="Are all chemistry filters verified?",
-            options=["yes", "no"],
-            question_type="yes_no",
-        ),
-    ]
-    generic_payload = _build_questions_payload(
-        generic_qs,
-        required_signal_fields=("pharmacophore_match", "pains_clean", "low_strain_3d"),
-    )
-    assert "pharmacophore_match" in generic_payload["lead_molecule"]["instructions"]
-    assert "low_strain_3d" in generic_payload["sufficiently_verified"]["instructions"]
-
-
 def test_loop_multi_clue_join_certified_success_and_artifacts(tmp_path: Path) -> None:
     domain = MicroBenchDomain()
     case_dir = tmp_path / "mc_01"
@@ -430,7 +279,6 @@ def test_loop_multi_clue_join_certified_success_and_artifacts(tmp_path: Path) ->
     truth = domain.plant(str(case_dir), needle)
 
     provider = _MockLoopProvider(inject_hallucinated_field=True)
-    probe = DecisionProbeClient(client=_MockDecisionBackend())
     round_callbacks: list[RoundTelemetry] = []
     ares_events: list[SolveEvent] = []
 
@@ -438,7 +286,6 @@ def test_loop_multi_clue_join_certified_success_and_artifacts(tmp_path: Path) ->
         domain,
         str(case_dir),
         provider=provider,  # type: ignore[arg-type]
-        probe_client=probe,
         config=LoopConfig(max_rounds=3),
         on_round=lambda rt, _b: round_callbacks.append(rt),
         on_ares_event=ares_events.append,
@@ -449,6 +296,9 @@ def test_loop_multi_clue_join_certified_success_and_artifacts(tmp_path: Path) ->
     assert len(res.rounds) == 1
     assert len(round_callbacks) == 1
     assert len(ares_events) > 0
+    assert res.evaluator_calls == 1
+    assert res.rounds[0].conclusion_answer == "payments-db"
+    assert res.rounds[0].conclusion_confidence == 1.0
 
     assert res.invariant_violations_caught == 1
     assert res.ungrounded_fields_on_board == 0
@@ -465,7 +315,7 @@ def test_loop_multi_clue_join_certified_success_and_artifacts(tmp_path: Path) ->
     assert scored["predicted_root_cause"] == "payments-db"
     assert scored["predicted_action"] == "rollback"
     assert scored["false_certainty"] is False
-    assert scored["pivotal_influence_mean"] > scored["distractor_influence_mean"]
+    assert scored["pivotal_priority_mean"] > scored["distractor_priority_mean"]
 
 
 def test_loop_look_alike_decoy_avoids_decoy_and_ranks_pivotal_above_distractor(
@@ -480,13 +330,10 @@ def test_loop_look_alike_decoy_avoids_decoy_and_ranks_pivotal_above_distractor(
     truth = domain.plant(str(case_dir), needle)
 
     provider = _MockLoopProvider()
-    probe = DecisionProbeClient(client=_MockDecisionBackend())
-
     res = run_investigation_loop(
         domain,
         str(case_dir),
         provider=provider,  # type: ignore[arg-type]
-        probe_client=probe,
         config=LoopConfig(max_rounds=3),
     )
 
@@ -506,9 +353,9 @@ def test_loop_look_alike_decoy_avoids_decoy_and_ranks_pivotal_above_distractor(
     assert scored["decoy_fallen_for"] is False
     assert scored["predicted_root_cause"] == "payments-db"
     assert scored["predicted_action"] == "scale_pool"
-    assert scored["pivotal_influence_mean"] is not None
-    assert scored["distractor_influence_mean"] is not None
-    assert scored["pivotal_influence_mean"] > scored["distractor_influence_mean"]
+    assert scored["pivotal_priority_mean"] is not None
+    assert scored["distractor_priority_mean"] is not None
+    assert scored["pivotal_priority_mean"] > scored["distractor_priority_mean"]
 
 
 def test_loop_under_determined_terminates_honest_uncertified_without_false_certainty(
@@ -521,13 +368,10 @@ def test_loop_under_determined_terminates_honest_uncertified_without_false_certa
     truth = domain.plant(str(case_dir), needle)
 
     provider = _MockLoopProvider()
-    probe = DecisionProbeClient(client=_MockDecisionBackend())
-
     res = run_investigation_loop(
         domain,
         str(case_dir),
         provider=provider,  # type: ignore[arg-type]
-        probe_client=probe,
         config=LoopConfig(max_rounds=3),
     )
 
@@ -547,6 +391,32 @@ def test_loop_under_determined_terminates_honest_uncertified_without_false_certa
     assert scored["predicted_action"] == "escalate"
 
 
+def test_loop_automatic_context_archiving_enforces_max_active_fields(
+    tmp_path: Path,
+) -> None:
+    domain = MicroBenchDomain()
+    case_dir = tmp_path / "ud_archive"
+    domain.generate(str(case_dir), size_gb=0.002, seed=42)
+    needle = next(n for n in domain.needle_menu() if n.case_id == "ud_01_missing_traces")
+    domain.plant(str(case_dir), needle)
+
+    provider = _MockLoopProvider(inject_extra_distractors=True)
+    res = run_investigation_loop(
+        domain,
+        str(case_dir),
+        provider=provider,  # type: ignore[arg-type]
+        config=LoopConfig(max_rounds=3, max_active_fields=5),
+    )
+
+    assert res.termination_reason == "honest_uncertified"
+    assert len(res.board.fields) <= 5
+    assert len(res.board.archived_fields) >= 1
+    for piv in INCIDENT_PIVOTAL_FIELDS:
+        assert piv in res.board.fields
+    assert res.final_board_drift == 0.0
+    assert res.ungrounded_fields_on_board == 0
+
+
 def test_build_baseline_board_for_scoring_fairly_credits_and_penalizes(
     tmp_path: Path,
 ) -> None:
@@ -564,7 +434,7 @@ def test_build_baseline_board_for_scoring_fairly_credits_and_penalizes(
             },
             "confidence": 0.91,
         },
-        domain.decision_questions(),
+        domain.search_questions(),
     )
     mc_truth = domain.plant(str(tmp_path / "mc_score"), mc_needle)
     mc_score = domain.score(b_board_ok, mc_truth)
@@ -580,7 +450,7 @@ def test_build_baseline_board_for_scoring_fairly_credits_and_penalizes(
             },
             "confidence": 0.90,
         },
-        domain.decision_questions(),
+        domain.search_questions(),
     )
     ud_truth = domain.plant(str(tmp_path / "ud_score"), ud_needle)
     ud_score = domain.score(b_board_fc, ud_truth)
