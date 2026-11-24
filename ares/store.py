@@ -1,15 +1,22 @@
 """Immutable, append-only NoteStore for ARES (Invariant I3).
 
 100% modality- and backend-agnostic: provides thread-safe note appending, sequential
-note ID generation, content-hash deduplication lookups, and artifact provenance lookups.
+note ID generation, content-hash deduplication lookups, artifact provenance lookups,
+bounded recall search, and JSON serialization for long-horizon checkpointing.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import threading
-from typing import Iterator
+from collections.abc import Sequence
+from typing import Any, Iterator
 
 from ares.contracts import ArtifactRef, CertificationStatus, Note
+
+_SEARCH_TOKEN_RE = re.compile(r"[a-z0-9_-]+")
+_NOTE_ID_NUM_RE = re.compile(r"^n_(\d+)$")
 
 
 class NoteStore:
@@ -42,6 +49,9 @@ class NoteStore:
                 self._by_content_hash[note.content_hash] = note
             for art in note.artifacts:
                 self._artifacts[art.artifact_id] = art
+            m = _NOTE_ID_NUM_RE.match(note.note_id)
+            if m:
+                self._counter = max(self._counter, int(m.group(1)))
             return note
 
     def get(self, note_id: str) -> Note:
@@ -95,6 +105,80 @@ class NoteStore:
         if verifier_name is not None:
             result = [n for n in result if n.verifier_name == verifier_name]
         return result
+
+    def search(
+        self,
+        query: str = "",
+        *,
+        certification: CertificationStatus | None = None,
+        verifier_name: str | None = None,
+        hypothesis_family: str | None = None,
+        limit: int = 10,
+    ) -> list[Note]:
+        """Search stored notes by metadata filters and keyword overlap for long-horizon recall."""
+        if limit <= 0:
+            return []
+
+        with self._lock:
+            indexed = list(enumerate(self._notes))
+
+        filtered = [
+            (idx, n)
+            for idx, n in indexed
+            if (certification is None or n.certification == certification)
+            and (verifier_name is None or n.verifier_name == verifier_name)
+            and (hypothesis_family is None or n.hypothesis_family == hypothesis_family)
+        ]
+
+        cleaned = (query or "").strip().lower()
+        if not cleaned:
+            return [n for _, n in reversed(filtered[-limit:])]
+
+        tokens = list(dict.fromkeys(_SEARCH_TOKEN_RE.findall(cleaned)))
+        if not tokens:
+            return [n for _, n in reversed(filtered[-limit:])]
+
+        scored: list[tuple[int, int, Note]] = []
+        for idx, note in filtered:
+            try:
+                evidence_blob = json.dumps(note.evidence, sort_keys=True, default=str)
+            except TypeError:
+                evidence_blob = repr(note.evidence)
+            haystack = " ".join(
+                [
+                    note.summary or "",
+                    note.verifier_name or "",
+                    note.hypothesis_family or "",
+                    note.query or "",
+                    evidence_blob,
+                ]
+            ).lower()
+            score = sum(1 for tok in tokens if tok in haystack)
+            if score > 0:
+                scored.append((score, idx, note))
+
+        scored.sort(key=lambda item: (-item[0], -item[1]))
+        return [item[2] for item in scored[:limit]]
+
+    def to_dicts(self) -> list[dict[str, Any]]:
+        """Serialize all stored notes into JSON-safe dicts in append order."""
+        with self._lock:
+            return [n.model_dump(mode="json") for n in self._notes]
+
+    @classmethod
+    def from_dicts(cls, items: Sequence[dict[str, Any]]) -> NoteStore:
+        """Restore a NoteStore from serialized Note dictionaries."""
+        store = cls()
+        max_suffix = 0
+        for item in items:
+            note = Note.model_validate(item)
+            store.append(note)
+            m = _NOTE_ID_NUM_RE.match(note.note_id)
+            if m:
+                max_suffix = max(max_suffix, int(m.group(1)))
+        with store._lock:
+            store._counter = max(store._counter, max_suffix, len(store._notes))
+        return store
 
     def snapshot(self) -> list[Note]:
         """Return an ordered shallow copy of all notes in append order."""

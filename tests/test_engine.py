@@ -190,6 +190,60 @@ def test_note_store_append_only_and_lookups() -> None:
         store.append(n1)
 
 
+def test_note_store_search_ranking_and_serialization() -> None:
+    store = NoteStore()
+    n1 = store.append(
+        Note(
+            note_id=store.next_note_id(),
+            certification="UNCERTIFIED",
+            hypothesis_family="logs_scan",
+            query="inspect:cache",
+            summary="Cache pool timeout warning observed",
+            evidence={"module": "TokenCache", "count": 2},
+            row_count=1,
+        )
+    )
+    n2 = store.append(
+        Note(
+            note_id=store.next_note_id(),
+            certification="CERTIFIED",
+            verifier_name="verify_lock_inversion",
+            hypothesis_family="lock_graph",
+            query="inspect:lock_cycle",
+            summary="Deadlock lock inversion confirmed in SessionPool",
+            evidence={"module": "SessionPool", "cycle": ["L1", "L2"]},
+            row_count=1,
+        )
+    )
+    n3 = store.append(
+        Note(
+            note_id=store.next_note_id(),
+            certification="CERTIFIED",
+            verifier_name="verify_race_repro",
+            hypothesis_family="stress_repro",
+            query="inspect:race_repro",
+            summary="Deterministic race repro passed for SessionPool deadlock",
+            evidence={"module": "SessionPool", "repro": True},
+            row_count=1,
+        )
+    )
+
+    hits = store.search("SessionPool deadlock", limit=5)
+    assert [n.note_id for n in hits] == [n3.note_id, n2.note_id]
+
+    cert_hits = store.search("SessionPool", certification="CERTIFIED", verifier_name="verify_lock_inversion")
+    assert [n.note_id for n in cert_hits] == [n2.note_id]
+
+    recent = store.search("", limit=2)
+    assert [n.note_id for n in recent] == [n3.note_id, n2.note_id]
+    assert n1.note_id not in {n.note_id for n in recent}
+
+    restored = NoteStore.from_dicts(store.to_dicts())
+    assert len(restored) == 3
+    assert restored.get(n2.note_id).summary == n2.summary
+    assert restored.next_note_id() == "n_0004"
+
+
 def test_adhoc_sql_emits_uncertified_note_with_row_cap(
     planted_micro_bench: dict[str, object],
 ) -> None:
@@ -340,6 +394,7 @@ def test_solve_parallel_max_concurrent_and_callbacks() -> None:
     assert report.usage.model_calls == 6
     assert report.usage.total_prompt_tokens == 600
     assert report.usage.total_completion_tokens == 150
+    assert report.usage.peak_prompt_tokens == 100
     assert 2 <= peak <= 3
     assert any(e.event_type == "task_started" for e in events)
     assert sum(1 for e in events if e.event_type == "task_completed") == 6

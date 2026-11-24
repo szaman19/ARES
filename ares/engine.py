@@ -115,6 +115,7 @@ class TaskNode(BaseModel):
     note_ids: list[str] = Field(default_factory=list)
     output: Any = None
     error: str | None = None
+    error_type: str | None = None
     duration_ms: float = Field(default=0.0, ge=0.0)
 
 
@@ -125,6 +126,7 @@ class ProcessorResult(BaseModel):
     notes: list[Note] = Field(default_factory=list)
     prompt_tokens: int = Field(default=0, ge=0)
     completion_tokens: int = Field(default=0, ge=0)
+    peak_prompt_tokens: int = Field(default=0, ge=0)
     model_calls: int = Field(default=0, ge=0)
 
 
@@ -144,6 +146,7 @@ class UsageReport(BaseModel):
     artifacts_produced: int = Field(default=0, ge=0)
     total_prompt_tokens: int = Field(default=0, ge=0)
     total_completion_tokens: int = Field(default=0, ge=0)
+    peak_prompt_tokens: int = Field(default=0, ge=0)
     model_calls: int = Field(default=0, ge=0)
     wall_clock_ms: float = Field(default=0.0, ge=0.0)
 
@@ -508,6 +511,7 @@ class ARESRunner:
                     "verifiers": 0,
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
+                    "peak_prompt_tokens": 0,
                     "model_calls": 0,
                 }
                 try:
@@ -618,6 +622,12 @@ class ARESRunner:
                             node.output = raw_out.output
                             delta["prompt_tokens"] += raw_out.prompt_tokens
                             delta["completion_tokens"] += raw_out.completion_tokens
+                            delta["peak_prompt_tokens"] = max(
+                                delta["peak_prompt_tokens"],
+                                raw_out.peak_prompt_tokens
+                                if raw_out.peak_prompt_tokens > 0
+                                else raw_out.prompt_tokens,
+                            )
                             delta["model_calls"] += raw_out.model_calls
                             for emitted in raw_out.notes:
                                 self.note_store.append(emitted)
@@ -640,6 +650,7 @@ class ARESRunner:
                 except Exception as exc:
                     node.status = "failed"
                     node.error = str(exc)
+                    node.error_type = type(exc).__name__
                     node.duration_ms = round((time.perf_counter() - t0) * 1000.0, 3)
                     _emit("task_failed", spec.task_id, error=node.error)
                 return node, delta
@@ -658,6 +669,9 @@ class ARESRunner:
                     usage.verifiers_executed += delta["verifiers"]
                     usage.total_prompt_tokens += delta["prompt_tokens"]
                     usage.total_completion_tokens += delta["completion_tokens"]
+                    usage.peak_prompt_tokens = max(
+                        usage.peak_prompt_tokens, delta["peak_prompt_tokens"]
+                    )
                     usage.model_calls += delta["model_calls"]
 
         usage.notes_emitted = len(new_notes)

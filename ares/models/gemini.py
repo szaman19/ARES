@@ -1,6 +1,6 @@
 """Backend- and domain-agnostic Gemini 4 Interactions API provider (`gemini-4-hydrogen` and `gemini-4-carbon`).
 
-Implements:
+Implements `ares.models.base.ModelProvider`:
 - Parallel hypothesis magnet proposal (`propose_hypotheses` + stateless ARES `make_propose_processor`)
 - Multimodal context patch synthesis (`propose_board_patch`, attaching up to 3 verifier PNG slices)
 - Targeted follow-up task proposal (`propose_followup_tasks`) for unresolved board gaps
@@ -12,24 +12,47 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Callable
 
-from pydantic import BaseModel, Field
-
 from ares.contracts import (
-    ArtifactRef,
     HypothesisSpec,
     InvestigationBoard,
     Note,
     SearchQuestion,
 )
-from ares.engine import ProcessorFn, ProcessorResult, TaskSpec
+from ares.engine import ProcessorFn
+from ares.models.base import (
+    BaselineAnswerEntry,
+    BaselineFinalEnvelope,
+    BoardPatchEnvelope,
+    ContextLengthExceededError,
+    FieldUpdateItem,
+    HypothesisProposalEnvelope,
+    ModelTelemetry,
+    ProposedHypothesisItem,
+    build_board_patch_prompts,
+    build_followup_prompts,
+    build_propose_prompts,
+    default_make_propose_processor,
+    filter_board_patch_updates,
+    parse_hypothesis_items,
+    sanitize_query,
+    strip_json_fences,
+)
 
 VALID_THINKING_LEVELS: frozenset[str] = frozenset({"low", "medium", "high"})
+
+# Backward-compatible private aliases (e.g. `examples/nyc_cameras/domain.py`)
+_strip_json_fences = strip_json_fences
+_ProposedHypothesisItem = ProposedHypothesisItem
+_HypothesisProposalEnvelope = HypothesisProposalEnvelope
+_FieldUpdateItem = FieldUpdateItem
+_BoardPatchEnvelope = BoardPatchEnvelope
+_BaselineAnswerEntry = BaselineAnswerEntry
+_BaselineFinalEnvelope = BaselineFinalEnvelope
 
 
 def _normalize_thinking_level(level: str) -> str:
@@ -51,27 +74,6 @@ def _get_usage_int(usage: Any, *attr_names: str) -> int:
             except (TypeError, ValueError):
                 continue
     return 0
-
-
-class ModelTelemetry(BaseModel):
-    """Token, call count, and latency telemetry for Gemini model calls."""
-
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    thought_tokens: int = 0
-    total_tokens: int = 0
-    model_calls: int = 0
-    latency_ms: float = 0.0
-
-    def plus(self, other: ModelTelemetry) -> ModelTelemetry:
-        return ModelTelemetry(
-            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
-            completion_tokens=self.completion_tokens + other.completion_tokens,
-            thought_tokens=self.thought_tokens + other.thought_tokens,
-            total_tokens=self.total_tokens + other.total_tokens,
-            model_calls=self.model_calls + other.model_calls,
-            latency_ms=round(self.latency_ms + other.latency_ms, 3),
-        )
 
 
 def extract_telemetry(resp: Any, latency_ms: float, model_calls: int = 1) -> ModelTelemetry:
@@ -96,165 +98,10 @@ def extract_telemetry(resp: Any, latency_ms: float, model_calls: int = 1) -> Mod
         completion_tokens=completion_toks,
         thought_tokens=thought_toks,
         total_tokens=total_toks,
+        peak_prompt_tokens=prompt_toks,
         model_calls=model_calls,
         latency_ms=round(max(0.0, latency_ms), 3),
     )
-
-
-class _ProposedHypothesisItem(BaseModel):
-    query: str = Field(
-        default="",
-        description=(
-            "Single read-only magnet query/expression obeying the domain's magnet rules "
-            "(or empty string if strictly invoking a deterministic verifier via `params_json`)."
-        ),
-    )
-    params_json: str = Field(
-        default="{}",
-        description="Optional JSON object string of structured parameters for the magnet or verifier.",
-    )
-    hypothesis_family: str = Field(description="Hypothesis family identifier.")
-    expected_signal: str = Field(
-        description="Concise description of the empirical signal or invariant tested."
-    )
-    target_fields: list[str] = Field(
-        default_factory=list,
-        description="Target InvestigationBoard fields informed by this hypothesis.",
-    )
-    verifier_name: str | None = Field(
-        default=None,
-        description=(
-            "Exact registered verifier name from `available_verifiers` when deterministic "
-            "certification applies, or null for exploratory probing."
-        ),
-    )
-
-
-class _HypothesisProposalEnvelope(BaseModel):
-    hypotheses: list[_ProposedHypothesisItem] = Field(default_factory=list)
-
-
-class _FieldUpdateItem(BaseModel):
-    field_name: str = Field(
-        description="Board field name to create or update (prefer canonical pivotal field names)."
-    )
-    value_json: str = Field(
-        description=(
-            "Exact value grounded directly in the cited notes' evidence or summary, encoded as a "
-            "plain string or JSON literal."
-        )
-    )
-    sources: list[str] = Field(
-        default_factory=list,
-        description="Exact `note_id` values from the provided notes supporting this field.",
-    )
-    artifact_ids: list[str] = Field(
-        default_factory=list,
-        description="Exact `artifact_id` values from the cited notes relevant to this field.",
-    )
-
-
-class _BoardPatchEnvelope(BaseModel):
-    updates: list[_FieldUpdateItem] = Field(default_factory=list)
-    rationale: str = Field(
-        default="",
-        description="Concise synthesis rationale referencing cited note_ids.",
-    )
-
-
-class _BaselineAnswerEntry(BaseModel):
-    question_id: str = Field(description="Exact `question_id` from SearchQuestions.")
-    answer: str = Field(description="Selected option from the question's `options`.")
-
-
-class _BaselineFinalEnvelope(BaseModel):
-    answers: list[_BaselineAnswerEntry] = Field(default_factory=list)
-    confidence: float = Field(description="Calibrated overall confidence in [0.0, 1.0].")
-    rationale: str = Field(default="", description="Brief empirical summary of findings.")
-
-
-def _strip_json_fences(raw_text: str) -> str:
-    text = (raw_text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
-def _parse_value_json(raw: str) -> Any:
-    text = (raw or "").strip()
-    if not text:
-        return "unknown"
-    try:
-        parsed = json.loads(text)
-        if parsed is None:
-            return "unknown"
-        return parsed
-    except (json.JSONDecodeError, TypeError):
-        return text
-
-
-def _parse_params_json(raw: str) -> dict[str, Any]:
-    text = (raw or "").strip()
-    if not text:
-        return {}
-    try:
-        parsed = json.loads(text)
-        return dict(parsed) if isinstance(parsed, dict) else {}
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-
-def _sanitize_query(query: str) -> str:
-    cleaned = (query or "").strip()
-    while cleaned.endswith(";"):
-        cleaned = cleaned[:-1].rstrip()
-    return cleaned
-
-
-def _summarize_board_for_prompt(board: InvestigationBoard | str | dict[str, Any] | None) -> str:
-    if board is None:
-        return "No active board state yet (initial exploration round)."
-    if isinstance(board, str):
-        return board
-    if isinstance(board, dict):
-        return json.dumps(board, indent=2, default=str)
-    fields_summary = {
-        fname: {
-            "value": f.value,
-            "status": f.status,
-            "priority": f.priority,
-            "uncertainty": f.uncertainty,
-        }
-        for fname, f in board.fields.items()
-    }
-    return json.dumps(
-        {
-            "board_version": board.board_version,
-            "conclusion": board.conclusion.model_dump(),
-            "fields": fields_summary,
-        },
-        indent=2,
-        default=str,
-    )
-
-
-def _collect_png_artifacts(notes: list[Note], max_images: int = 3) -> list[ArtifactRef]:
-    seen_ids: set[str] = set()
-    candidates: list[ArtifactRef] = []
-    for note in notes:
-        for art in note.artifacts:
-            if art.artifact_id in seen_ids:
-                continue
-            is_png = art.kind in ("plot_png", "image") or art.mime_type == "image/png"
-            if not is_png:
-                continue
-            if not Path(art.path).is_file():
-                continue
-            seen_ids.add(art.artifact_id)
-            candidates.append(art)
-    candidates.sort(key=lambda a: (0 if a.produced_by_verifier else 1, a.artifact_id))
-    return candidates[:max_images]
 
 
 class GeminiModelProvider:
@@ -287,41 +134,6 @@ class GeminiModelProvider:
             self._client = genai.Client(api_key=key) if key else genai.Client()
         return self._client
 
-    def _parse_hypothesis_items(
-        self,
-        items: Sequence[_ProposedHypothesisItem],
-        *,
-        cap: int,
-        default_family: str,
-        default_targets: Sequence[str],
-        allowed_verifiers: Sequence[str],
-        requested_under: int,
-    ) -> list[HypothesisSpec]:
-        allowed_set = set(allowed_verifiers)
-        specs: list[HypothesisSpec] = []
-        for item in items[:cap]:
-            q_str = _sanitize_query(item.query)
-            params = _parse_params_json(item.params_json)
-            vname = item.verifier_name
-            if vname in ("", "null", "none", "None"):
-                vname = None
-            if vname is not None and allowed_verifiers and vname not in allowed_set:
-                vname = None
-            if not q_str and vname is None and not params:
-                continue
-            specs.append(
-                HypothesisSpec(
-                    query=q_str,
-                    params=params,
-                    hypothesis_family=item.hypothesis_family or default_family,
-                    expected_signal=item.expected_signal,
-                    target_fields=list(item.target_fields or default_targets),
-                    verifier_name=vname,
-                    requested_under=requested_under,
-                )
-            )
-        return specs
-
     def propose_hypotheses(
         self,
         *,
@@ -342,33 +154,16 @@ class GeminiModelProvider:
         effective_requested_under = (
             board.board_version if (board is not None and requested_under == 0) else requested_under
         )
-        board_text = (
-            board_summary
-            if board_summary is not None
-            else _summarize_board_for_prompt(board)
-        )
-
-        rules_block = f"\nCRITICAL MAGNET RULES:\n{magnet_rules}\n" if magnet_rules else ""
-        pivotal_block = (
-            f"\nTarget canonical pivotal board fields where applicable: {list(pivotal_fields)}."
-            if pivotal_fields
-            else ""
-        )
-        sys_instruction = (
-            "You are an ARES parallel hypothesis worker (`gemini-4-hydrogen`). "
-            "Emit concise, high-signal, read-only magnet queries and/or deterministic verifier "
-            "bindings that test the assigned hypothesis family without reading raw haystacks."
-            f"{rules_block}"
-            "When a registered deterministic verifier in `available_verifiers` directly tests "
-            "the target signal, bind its exact name in `verifier_name`; otherwise set `verifier_name` to null."
-            f"{pivotal_block}"
-        )
-        prompt = (
-            f"### Domain Environment\n{environment_description}\n\n"
-            f"### Assigned Hypothesis Family\n{hypothesis_family}\n\n"
-            f"### Available Trusted Verifiers\n{json.dumps(allowed_verifiers)}\n\n"
-            f"### Current Investigation Board\n{board_text}\n\n"
-            f"Propose up to {cap} distinct hypothesis magnets for family '{hypothesis_family}'."
+        sys_instruction, prompt = build_propose_prompts(
+            environment_description=environment_description,
+            hypothesis_family=hypothesis_family,
+            magnet_rules=magnet_rules,
+            pivotal_fields=pivotal_fields,
+            board=board,
+            available_verifiers=allowed_verifiers,
+            max_queries=cap,
+            board_summary=board_summary,
+            role_label="parallel hypothesis worker (`gemini-4-hydrogen`)",
         )
 
         client = self._get_client()
@@ -381,16 +176,18 @@ class GeminiModelProvider:
             response_format={
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": _HypothesisProposalEnvelope.model_json_schema(),
+                "schema": HypothesisProposalEnvelope.model_json_schema(),
             },
             generation_config={"thinking_level": _normalize_thinking_level(thinking_level)},
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
         telemetry = extract_telemetry(interaction, latency_ms)
 
-        raw_text = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
-        envelope = _HypothesisProposalEnvelope.model_validate_json(raw_text)
-        specs = self._parse_hypothesis_items(
+        raw_text = strip_json_fences(
+            getattr(interaction, "output_text", "") or '{"hypotheses": []}'
+        )
+        envelope = HypothesisProposalEnvelope.model_validate_json(raw_text)
+        specs = parse_hypothesis_items(
             envelope.hypotheses,
             cap=cap,
             default_family=hypothesis_family,
@@ -409,48 +206,13 @@ class GeminiModelProvider:
         available_verifiers: Sequence[str] | None = None,
     ) -> ProcessorFn:
         """Build a stateless ARES ProcessorFn wrapping `propose_hypotheses`."""
-
-        def _processor(spec: TaskSpec, dep_outputs: dict[str, Any]) -> ProcessorResult:
-            del dep_outputs
-            ctx = spec.context or {}
-            family = str(ctx.get("hypothesis_family", "general_exploration"))
-            max_queries = int(ctx.get("max_queries", 2))
-            thinking_level = str(ctx.get("thinking_level", "low"))
-            env_desc = str(ctx.get("environment_description", environment_description))
-            rules = str(ctx.get("magnet_rules", magnet_rules))
-            piv_fields = ctx.get("pivotal_fields", pivotal_fields)
-            verifiers = ctx.get("available_verifiers", available_verifiers)
-
-            raw_board = ctx.get("board")
-            board_obj: InvestigationBoard | None = None
-            board_summary: str | None = ctx.get("board_summary")
-            if isinstance(raw_board, InvestigationBoard):
-                board_obj = raw_board
-            elif isinstance(raw_board, dict) and "conclusion" in raw_board:
-                board_obj = InvestigationBoard.model_validate(raw_board)
-            elif isinstance(raw_board, str) and board_summary is None:
-                board_summary = raw_board
-
-            specs, telemetry = self.propose_hypotheses(
-                environment_description=env_desc,
-                hypothesis_family=family,
-                magnet_rules=rules,
-                pivotal_fields=piv_fields,
-                board=board_obj,
-                available_verifiers=verifiers,
-                requested_under=spec.requested_under,
-                max_queries=max_queries,
-                thinking_level=thinking_level,
-                board_summary=board_summary,
-            )
-            return ProcessorResult(
-                output=specs,
-                prompt_tokens=telemetry.prompt_tokens,
-                completion_tokens=telemetry.completion_tokens,
-                model_calls=telemetry.model_calls,
-            )
-
-        return _processor
+        return default_make_propose_processor(
+            self,
+            environment_description=environment_description,
+            magnet_rules=magnet_rules,
+            pivotal_fields=pivotal_fields,
+            available_verifiers=available_verifiers,
+        )
 
     def propose_board_patch(
         self,
@@ -463,59 +225,15 @@ class GeminiModelProvider:
         thinking_level: str = "medium",
     ) -> tuple[dict[str, Any], ModelTelemetry]:
         """Use `gemini-4-carbon` (multimodal) to synthesize a grounded board patch dict."""
-        notes_payload = [
-            {
-                "note_id": n.note_id,
-                "certification": n.certification,
-                "verifier_name": n.verifier_name,
-                "hypothesis_family": n.hypothesis_family,
-                "summary": n.summary,
-                "row_count": n.row_count,
-                "evidence": n.evidence,
-                "artifact_ids": [a.artifact_id for a in n.artifacts],
-            }
-            for n in new_notes
-        ]
-
-        valid_note_ids: set[str] = {n.note_id for n in new_notes}
-        valid_artifact_ids: set[str] = {
-            a.artifact_id for n in new_notes for a in n.artifacts
-        }
-        for existing_field in board.fields.values():
-            valid_note_ids.update(existing_field.sources)
-            valid_artifact_ids.update(existing_field.artifact_ids)
-
-        pivotal_hint = (
-            f"1. Populate canonical pivotal fields {list(pivotal_fields)} whenever supported by note evidence "
-            "(if a verifier returned 0 candidates / UNCERTIFIED, do NOT claim a candidate passed).\n"
-            if pivotal_fields
-            else "1. Populate concise, informative board field names grounded in note evidence.\n"
-        )
-        sys_instruction = (
-            "You are the ARES Context Synthesis Engine (`gemini-4-carbon`). "
-            "Synthesize new immutable evidence notes (and any attached verifier PNG artifacts) "
-            "into a strictly grounded patch for the bounded InvestigationBoard.\n"
-            "CRITICAL INVARIANTS:\n"
-            f"{pivotal_hint}"
-            "2. Prefer CERTIFIED verifier notes over UNCERTIFIED exploratory notes when citing `sources`, "
-            "because citing any UNCERTIFIED note taints a field as uncertified.\n"
-            "3. ONLY cite exact `note_id` strings from the provided notes/board, and ONLY attach "
-            "exact `artifact_id` strings from those notes.\n"
-            "4. NEVER invent entities, counts, or values—every `value_json` must be grounded "
-            "strictly in the cited notes' `evidence` or `summary`."
-        )
-
-        png_artifacts = _collect_png_artifacts(new_notes, max_images=3) if include_images else []
-        artifact_manifest = [
-            {"artifact_id": a.artifact_id, "kind": a.kind, "mime_type": a.mime_type}
-            for a in png_artifacts
-        ]
-        prompt_str = (
-            f"### Domain Environment\n{environment_description or '(not provided)'}\n\n"
-            f"### Current InvestigationBoard\n{_summarize_board_for_prompt(board)}\n\n"
-            f"### New Immutable Evidence Notes\n{json.dumps(notes_payload, indent=2, default=str)}\n\n"
-            f"### Attached Verifier PNG Artifacts\n{json.dumps(artifact_manifest)}\n\n"
-            "Produce the grounded board patch updates and rationale."
+        sys_instruction, prompt_str, valid_note_ids, valid_artifact_ids, png_artifacts = (
+            build_board_patch_prompts(
+                board=board,
+                new_notes=new_notes,
+                environment_description=environment_description,
+                pivotal_fields=pivotal_fields,
+                include_images=include_images,
+                role_label="ARES Context Synthesis Engine (`gemini-4-carbon`)",
+            )
         )
 
         if png_artifacts:
@@ -542,35 +260,19 @@ class GeminiModelProvider:
             response_format={
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": _BoardPatchEnvelope.model_json_schema(),
+                "schema": BoardPatchEnvelope.model_json_schema(),
             },
             generation_config={"thinking_level": _normalize_thinking_level(thinking_level)},
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
         telemetry = extract_telemetry(interaction, latency_ms)
 
-        raw_text = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
-        envelope = _BoardPatchEnvelope.model_validate_json(raw_text)
-
-        updates_dict: dict[str, dict[str, Any]] = {}
-        for item in envelope.updates:
-            fname = item.field_name.strip()
-            if not fname:
-                continue
-            filtered_sources = [s for s in item.sources if s in valid_note_ids]
-            if not filtered_sources:
-                continue
-            filtered_artifacts = [a for a in item.artifact_ids if a in valid_artifact_ids]
-            updates_dict[fname] = {
-                "value": _parse_value_json(item.value_json),
-                "sources": filtered_sources,
-                "artifact_ids": filtered_artifacts,
-            }
-
-        return {
-            "updates": updates_dict,
-            "rationale": envelope.rationale,
-        }, telemetry
+        raw_text = strip_json_fences(
+            getattr(interaction, "output_text", "") or '{"updates": []}'
+        )
+        envelope = BoardPatchEnvelope.model_validate_json(raw_text)
+        patch = filter_board_patch_updates(envelope, valid_note_ids, valid_artifact_ids)
+        return patch, telemetry
 
     def propose_followup_tasks(
         self,
@@ -582,25 +284,20 @@ class GeminiModelProvider:
         available_verifiers: Sequence[str] | None = None,
         max_queries: int = 3,
         thinking_level: str = "low",
+        attempted_queries: Sequence[str] = (),
     ) -> tuple[list[HypothesisSpec], ModelTelemetry]:
         """Use `gemini-4-carbon` to propose targeted follow-up magnets/verifiers for unresolved fields."""
         cap = max(1, int(max_queries))
         allowed_verifiers = list(available_verifiers or ())
-        rules_block = f"\nCRITICAL MAGNET RULES:\n{magnet_rules}\n" if magnet_rules else ""
-
-        sys_instruction = (
-            "You are the ARES Follow-Up Search Planner (`gemini-4-carbon`). "
-            "Inspect the current InvestigationBoard and propose targeted read-only magnet queries "
-            "and deterministic verifier bindings from `available_verifiers` that resolve "
-            "uncertain, unknown, or uncertified target fields."
-            f"{rules_block}"
-        )
-        prompt = (
-            f"### Domain Environment\n{environment_description}\n\n"
-            f"### Available Trusted Verifiers\n{json.dumps(allowed_verifiers)}\n\n"
-            f"### Unresolved / Uncertified Target Fields\n{json.dumps(target_gap_fields)}\n\n"
-            f"### Current InvestigationBoard\n{_summarize_board_for_prompt(board)}\n\n"
-            f"Propose up to {cap} targeted follow-up HypothesisSpecs."
+        sys_instruction, prompt = build_followup_prompts(
+            board=board,
+            target_gap_fields=target_gap_fields,
+            environment_description=environment_description,
+            magnet_rules=magnet_rules,
+            available_verifiers=allowed_verifiers,
+            max_queries=cap,
+            attempted_queries=attempted_queries,
+            role_label="ARES Follow-Up Search Planner (`gemini-4-carbon`)",
         )
 
         client = self._get_client()
@@ -613,16 +310,18 @@ class GeminiModelProvider:
             response_format={
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": _HypothesisProposalEnvelope.model_json_schema(),
+                "schema": HypothesisProposalEnvelope.model_json_schema(),
             },
             generation_config={"thinking_level": _normalize_thinking_level(thinking_level)},
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
         telemetry = extract_telemetry(interaction, latency_ms)
 
-        raw_text = _strip_json_fences(getattr(interaction, "output_text", "") or "{}")
-        envelope = _HypothesisProposalEnvelope.model_validate_json(raw_text)
-        specs = self._parse_hypothesis_items(
+        raw_text = strip_json_fences(
+            getattr(interaction, "output_text", "") or '{"hypotheses": []}'
+        )
+        envelope = HypothesisProposalEnvelope.model_validate_json(raw_text)
+        specs = parse_hypothesis_items(
             envelope.hypotheses,
             cap=cap,
             default_family="followup_gap_resolution",
@@ -748,7 +447,7 @@ class GeminiModelProvider:
                         )
                     }
                 else:
-                    q_str = _sanitize_query(
+                    q_str = sanitize_query(
                         str(args_dict.get("query", args_dict.get("sql", "")))
                     )
                     queries_executed.append(q_str)
@@ -793,7 +492,7 @@ class GeminiModelProvider:
                     response_format={
                         "type": "text",
                         "mime_type": "application/json",
-                        "schema": _BaselineFinalEnvelope.model_json_schema(),
+                        "schema": BaselineFinalEnvelope.model_json_schema(),
                     },
                     generation_config={"thinking_level": norm_thinking},
                 )
@@ -809,13 +508,13 @@ class GeminiModelProvider:
         conf_val = 0.0
         rationale_val = ""
 
-        cleaned_final = _strip_json_fences(final_text)
+        cleaned_final = strip_json_fences(final_text)
         if cleaned_final:
             try:
                 raw_json = json.loads(cleaned_final)
                 if isinstance(raw_json, dict):
                     if isinstance(raw_json.get("answers"), list):
-                        env = _BaselineFinalEnvelope.model_validate(raw_json)
+                        env = BaselineFinalEnvelope.model_validate(raw_json)
                         for entry in env.answers:
                             if entry.question_id in answers_by_qid:
                                 answers_by_qid[entry.question_id] = entry.answer
@@ -837,10 +536,13 @@ class GeminiModelProvider:
             "query_count": len(queries_executed),
             "queries_executed": queries_executed,
             "telemetry": total_telemetry,
+            "peak_prompt_tokens": total_telemetry.peak_prompt_tokens,
+            "context_overflow": False,
         }
 
 
 __all__ = [
+    "ContextLengthExceededError",
     "GeminiModelProvider",
     "ModelTelemetry",
     "extract_telemetry",
