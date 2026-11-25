@@ -20,7 +20,7 @@ ARES lets small- or bounded-context models and deterministic tools solve deep, b
 3. **Broken-Context Crash & Resume (`ares.store.CheckpointStore`)**
    - When `run_dir` is provided, every wave atomically checkpoints `state.json` and appends `events.jsonl`. `StateMachine.resume(run_dir)` resets interrupted `"running"` tasks to `"pending"` without re-running completed tasks.
 4. **Zero Bloat Core**
-   - Core `ares` depends only on `pydantic>=2.9.0`. Optional LLM adapters live in `ares.llm` (`OpenAICompatClient` with structured schema validation retries), and domain tools (e.g., `duckdb`, `pytest` subprocesses) live strictly inside callers/examples.
+   - Core `ares` depends only on `pydantic>=2.9.0`. Optional LLM adapters live in `ares.llm` (`OpenAICompatClient` with structured schema validation retries), optional git-worktree isolation lives in `ares.sandbox` (`GitWorktreeSandbox`), and domain tools (e.g., `duckdb`, `pytest` subprocesses) live strictly inside callers/examples.
 
 ---
 
@@ -88,6 +88,7 @@ uv run ares resume /tmp/ares_run \
 | [`examples/long_horizon_small_context/`](examples/long_horizon_small_context/run.py) | Tail-recursive `H`-hop chains (`H=4, 8, 12`) keeping O(1) prompt size while a rolling-context baseline overflows; crash/resume + optional `OpenAICompatClient` (`--base-url`) | `uv run python -m examples.long_horizon_small_context.run` |
 | [`examples/coarse_to_fine_search/`](examples/coarse_to_fine_search/run.py) | 2-level dynamic `Spawn` coarse-to-fine search using `duckdb` strictly inside the example; separates 3-signal targets from 2-of-3 decoys | `uv run python -m examples.coarse_to_fine_search.run` |
 | [`examples/codegen_verify_repair/`](examples/codegen_verify_repair/run.py) | Parallel competing codegen branches (with optional `race=True` `join="any"` cancellation), isolated `pytest` subprocess verification, and bounded repair loops over spilled failure summaries | `uv run python -m examples.codegen_verify_repair.run` |
+| [`examples/repo_fix/`](examples/repo_fix/run.py) | Multi-file bounded repository navigation (`locate` -> parallel `inspect_file`) + parallel `GitWorktreeSandbox` patching/repair (`join="any"`) producing a verified `git diff` artifact | `uv run python -m examples.repo_fix.run` |
 
 ---
 

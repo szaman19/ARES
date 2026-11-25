@@ -9,6 +9,7 @@ from pathlib import Path
 
 FORBIDDEN_MODULES = {
     "ares.llm",
+    "ares.sandbox",
     "duckdb",
     "sql",
     "sqlite3",
