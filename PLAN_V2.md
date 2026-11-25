@@ -36,18 +36,18 @@
 - [x] Specify PDA `Spawn(..., then=...)` waiting/popping semantics, `ArtifactStore` auto-spill, and `CheckpointStore` crash/resume guarantees.
 
 ### Step 2: Core SDK & Optional LLM Adapter + Offline Tests
-- [ ] Implement `ares/types.py`, `ares/store.py`, `ares/machine.py`, `ares/cli.py`, and `ares/__init__.py`.
-- [ ] Implement optional `ares/llm/` (`LLMClient` protocol + `OpenAICompatClient` via `httpx`).
-- [ ] Pass offline tests for nested PDA `Spawn`/`then`, parallel dependency barriers, cycle detection, `dedup_key`, auto-spill, crash/suspend resume, CLI commands, and strict core import hygiene.
+- [x] Implement `ares/types.py` (143 LOC), `ares/store.py` (271 LOC), `ares/machine.py` (821 LOC), `ares/cli.py` (275 LOC), and `ares/__init__.py` (37 LOC) — 1,547 LOC total core.
+- [x] Implement optional `ares/llm/` (315 LOC: `LLMClient` protocol + `OpenAICompatClient` via `httpx`).
+- [x] Pass offline tests across `test_types_and_store.py`, `test_machine_pda.py`, `test_resume_and_suspend.py`, `test_boundary_hygiene.py`, `test_cli.py`, and `test_llm_openai_compat.py`.
 
 ### Step 3: Port 3 Flagship Examples (Abstraction Litmus Tests)
-- [ ] **`examples/long_horizon_small_context/`**: Tail-recursive multi-hop chain (`H=4, 8, 12`) proving O(1) bounded prompt size vs. rolling-context overflow, plus mid-chain crash/resume and `--mock` / `--base-url` support.
-- [ ] **`examples/coarse_to_fine_search/`**: 2-level dynamic `Spawn` coarse-to-fine search using `duckdb` strictly inside the example, separating 3-signal targets from 2-of-3 decoys and honest unverified cases.
-- [ ] **`examples/codegen_verify_repair/`**: Parallel competing codegen branches in isolated temp workspaces, deterministic `pytest` subprocess verification, bounded repair loop with compact/spilled failure feedback, and certified artifact selection.
+- [x] **`examples/long_horizon_small_context/`**: Tail-recursive multi-hop chain (`H=4, 8, 12`) proving O(1) bounded prompt size vs. rolling-context overflow, plus mid-chain crash/resume and `--mock` / `--base-url` support (`test_example_long_horizon.py`).
+- [x] **`examples/coarse_to_fine_search/`** (`machine.py`: 184 LOC): 2-level dynamic `Spawn` coarse-to-fine search using `duckdb` strictly inside the example, separating 3-signal targets from 2-of-3 decoys and honest unverified cases (`test_example_coarse_to_fine.py`).
+- [x] **`examples/codegen_verify_repair/`**: Parallel competing codegen branches in isolated temp workspaces, deterministic `pytest` subprocess verification, bounded repair loop with compact/spilled failure feedback, and certified artifact selection (`test_example_codegen_repair.py`).
 
 ### Step 4: Thin CLI & Clean Documentation
-- [ ] Verify `ares run`, `ares resume`, and `ares inspect` end-to-end against example machines.
-- [ ] Write clean `README.md` centered strictly on ARES v2 PDA state machines.
+- [x] Verify `ares run`, `ares resume`, and `ares inspect` end-to-end against example machines.
+- [x] Write clean `README.md` centered strictly on ARES v2 PDA state machines.
 
 ### Step 5: Full End-to-End Verification
-- [ ] Run full `uv run pytest -v`, all 3 example runners, and CLI smoke test on `v2/core-state-machine`.
+- [x] Run full `uv run pytest -v`, all 3 example runners, and CLI smoke test on `v2/core-state-machine`.

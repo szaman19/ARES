@@ -1,0 +1,166 @@
+"""End-to-end tests for the thin ARES v2 CLI (`run`, `resume`, `inspect`)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from ares import ArtifactStore
+from ares.cli import main
+
+_MACHINE_MODULE = '''\
+from ares import Done, Spawn, StateMachine, Suspend, Task, TaskContext, TaskSpec
+
+machine = StateMachine()
+
+
+@machine.state("entry")
+def entry(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+    return Spawn(
+        tasks=[
+            TaskSpec(id="prep", state="prep", input=task.input),
+            TaskSpec(id="gate", state="gate"),
+        ],
+        then=TaskSpec(id="finish", state="finish"),
+    )
+
+
+@machine.state("prep")
+def prep(task: Task, deps: dict, ctx: TaskContext) -> Done:
+    text = task.input.get("text", "default")
+    return Done(output=text * task.input.get("repeat", 1))
+
+
+@machine.state("gate")
+def gate(task: Task, deps: dict, ctx: TaskContext):
+    if ctx.resume_data is None:
+        return Suspend(reason="waiting approval", resume_key="approval")
+    return Done(output=ctx.resume_data)
+
+
+@machine.state("finish")
+def finish(task: Task, deps: dict, ctx: TaskContext) -> Done:
+    return Done(output={"prep_ref": deps["prep"]["__ares_ref__"], "gate": deps["gate"]})
+
+
+def build_machine() -> StateMachine:
+    return machine
+'''
+
+
+def _write_temp_machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    mod_name = "temp_cli_machine"
+    (tmp_path / f"{mod_name}.py").write_text(_MACHINE_MODULE, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    return mod_name
+
+
+def test_cli_run_resume_inspect_json_and_human(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mod_name = _write_temp_machine(tmp_path, monkeypatch)
+    run_dir = tmp_path / "run_state"
+
+    # 1. Run until suspended (using module:attr instance and spilling prep output).
+    rc = main(
+        [
+            "run",
+            f"{mod_name}:machine",
+            "--state",
+            "entry",
+            "--id",
+            "root_1",
+            "--input",
+            '{"text": "ABCD", "repeat": 20}',
+            "--run-dir",
+            str(run_dir),
+            "--max-concurrent",
+            "2",
+            "--max-tasks",
+            "50",
+            "--max-inline-bytes",
+            "64",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    run_out = json.loads(capsys.readouterr().out)
+    assert run_out["status"] == "suspended"
+    assert run_out["root_task_id"] == "root_1"
+    assert run_out["suspended_task_ids"] == ["gate"]
+    assert run_out["tasks"]["prep"]["spilled_artifact_id"] is not None
+
+    # 2. Inspect in human-readable mode while suspended.
+    rc_inspect_human = main(["inspect", str(run_dir)])
+    assert rc_inspect_human == 0
+    inspect_text = capsys.readouterr().out
+    assert "status=suspended" in inspect_text
+    assert "Artifacts:" in inspect_text
+    assert "root_1" in inspect_text
+
+    # 3. Resume using factory callable and --provide, emitting JSON.
+    rc_resume = main(
+        [
+            "resume",
+            str(run_dir),
+            "--machine",
+            f"{mod_name}:build_machine",
+            "--provide",
+            'approval={"approved": true, "reviewer": "bob"}',
+            "--max-concurrent",
+            "2",
+            "--json",
+        ]
+    )
+    assert rc_resume == 0
+    resume_out = json.loads(capsys.readouterr().out)
+    assert resume_out["status"] == "done"
+    assert ArtifactStore.is_artifact_handle(resume_out["output"])
+    final_obj = ArtifactStore(run_dir / "artifacts").get_json(
+        ArtifactStore.extract_ref_id(resume_out["output"])  # type: ignore[arg-type]
+    )
+    assert final_obj["gate"] == {"approved": True, "reviewer": "bob"}
+    assert final_obj["prep_ref"].startswith("art_")
+
+    # 4. Inspect final state in JSON mode.
+    rc_inspect_json = main(["inspect", str(run_dir), "--json"])
+    assert rc_inspect_json == 0
+    inspect_json = json.loads(capsys.readouterr().out)
+    assert inspect_json["status"] == "done"
+    assert inspect_json["root_task_id"] == "root_1"
+    assert len(inspect_json["artifacts"]) >= 1
+    assert any(ev["event_type"] == "run_finished" for ev in inspect_json["events"])
+
+
+def test_cli_run_human_output_and_error_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mod_name = _write_temp_machine(tmp_path, monkeypatch)
+
+    rc = main(
+        [
+            "run",
+            f"{mod_name}:build_machine",
+            "--state",
+            "prep",
+            "--input",
+            '{"text": "hi", "repeat": 2}',
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "task_started" in out
+    assert "task_done" in out
+    assert "status=done" in out
+    assert '"hihi"' in out
+
+    # Inspect missing directory returns non-zero cleanly.
+    rc_missing = main(["inspect", str(tmp_path / "does_not_exist")])
+    assert rc_missing == 1
+    assert "Error:" in capsys.readouterr().err
