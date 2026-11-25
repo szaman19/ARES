@@ -297,10 +297,13 @@ def _summarize_pytest_failure(stdout: str, stderr: str) -> str:
 def build_machine(
     llm: OpenAICompatClient | None = None,
     max_attempts: int = 3,
+    race: bool = False,
 ) -> StateMachine:
     """Construct the codegen-verify-repair ARES StateMachine.
 
     Callable with zero arguments for ``ares run`` CLI compatibility.
+    When ``race=True``, uses ``Spawn(..., join="any")`` so the first branch to pass
+    ``verify_pytest`` cancels remaining competing branches immediately.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
@@ -332,6 +335,7 @@ def build_machine(
         return Spawn(
             tasks=branches,
             then=TaskSpec(state="select_best", input={"task": task_name}),
+            join="any" if race else "all",
         )
 
     @machine.state("generate")
@@ -443,7 +447,7 @@ def build_machine(
         )
 
     @machine.state("decide_repair")
-    def decide_repair(task: Task, deps: dict[str, Any], ctx: TaskContext) -> Done | Spawn:
+    def decide_repair(task: Task, deps: dict[str, Any], ctx: TaskContext) -> Done | Spawn | Fail:
         task_name = str(task.input["task"])
         branch_id = str(task.input["branch_id"])
         attempt = int(task.input["attempt"])
@@ -481,6 +485,11 @@ def build_machine(
                         "prev_code_ref_id": code_ref_id,
                     },
                 ),
+            )
+
+        if race:
+            return Fail(
+                error=f"Branch {branch_id} exhausted {branch_max_attempts} attempts: {failure_summary[:200]}"
             )
 
         return Done(

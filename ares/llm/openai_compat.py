@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ares.llm.base import (
     ContextLengthExceededError,
@@ -132,6 +132,7 @@ class OpenAICompatClient:
         api_key: str | None = None,
         timeout_s: float = 60.0,
         reasoning_effort: str | None = None,
+        max_validation_retries: int = 1,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -140,6 +141,7 @@ class OpenAICompatClient:
         self.api_key = api_key
         self.timeout_s = timeout_s
         self.reasoning_effort = reasoning_effort
+        self.max_validation_retries = max(0, int(max_validation_retries))
         self.transport = transport
 
     def _headers(self) -> dict[str, str]:
@@ -182,61 +184,108 @@ class OpenAICompatClient:
     ) -> LLMResponse:
         """Send a chat-completion request and return a normalized ``LLMResponse``."""
         serialized_messages = self._build_messages(messages, system)
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": serialized_messages,
-            "temperature": temperature,
-        }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if self.reasoning_effort is not None:
-            payload["reasoning_effort"] = self.reasoning_effort
-        if response_model is not None:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": response_model.__name__,
-                    "schema": response_model.model_json_schema(),
-                    "strict": True,
-                },
+        use_response_format = response_model is not None
+
+        def _make_payload(msgs: list[dict[str, str]], *, with_schema_fmt: bool) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                "model": self.model,
+                "messages": msgs,
+                "temperature": temperature,
             }
+            if max_tokens is not None:
+                body["max_tokens"] = max_tokens
+            if self.reasoning_effort is not None:
+                body["reasoning_effort"] = self.reasoning_effort
+            if response_model is not None and with_schema_fmt:
+                body["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": response_model.__name__,
+                        "schema": response_model.model_json_schema(),
+                        "strict": True,
+                    },
+                }
+            return body
 
-        t0 = time.perf_counter()
+        total_usage = LLMUsage()
+        current_messages = list(serialized_messages)
+        max_attempts = 1 + (self.max_validation_retries if response_model is not None else 0)
+
         with httpx.Client(timeout=self.timeout_s, transport=self.transport) as client:
-            resp = self._post(client, payload)
-
-            if _is_context_length_error(resp.status_code, resp.text):
-                raise ContextLengthExceededError(
-                    f"Context length exceeded (HTTP {resp.status_code}): {resp.text}"
+            for attempt in range(max_attempts):
+                t0 = time.perf_counter()
+                req_messages = (
+                    current_messages
+                    if (use_response_format or response_model is None)
+                    else _append_schema_instructions(current_messages, response_model)
                 )
+                payload = _make_payload(req_messages, with_schema_fmt=use_response_format)
+                resp = self._post(client, payload)
 
-            if response_model is not None and _is_response_format_rejected(
-                resp.status_code, resp.text
-            ):
-                fallback_payload = dict(payload)
-                fallback_payload.pop("response_format", None)
-                fallback_payload["messages"] = _append_schema_instructions(
-                    serialized_messages, response_model
-                )
-                resp = self._post(client, fallback_payload)
                 if _is_context_length_error(resp.status_code, resp.text):
                     raise ContextLengthExceededError(
                         f"Context length exceeded (HTTP {resp.status_code}): {resp.text}"
                     )
 
-            resp.raise_for_status()
+                if (
+                    response_model is not None
+                    and use_response_format
+                    and _is_response_format_rejected(resp.status_code, resp.text)
+                ):
+                    use_response_format = False
+                    fallback_payload = _make_payload(
+                        _append_schema_instructions(current_messages, response_model),
+                        with_schema_fmt=False,
+                    )
+                    resp = self._post(client, fallback_payload)
+                    if _is_context_length_error(resp.status_code, resp.text):
+                        raise ContextLengthExceededError(
+                            f"Context length exceeded (HTTP {resp.status_code}): {resp.text}"
+                        )
 
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        data: dict[str, Any] = resp.json()
-        text = _extract_text(data)
-        parsed: Any = None
-        if response_model is not None:
-            cleaned = _strip_json_fences(text)
-            parsed = response_model.model_validate(json.loads(cleaned))
+                resp.raise_for_status()
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                data: dict[str, Any] = resp.json()
+                step_usage = _extract_usage(data, latency_ms)
+                total_usage = LLMUsage(
+                    prompt_tokens=total_usage.prompt_tokens + step_usage.prompt_tokens,
+                    completion_tokens=total_usage.completion_tokens + step_usage.completion_tokens,
+                    total_tokens=total_usage.total_tokens + step_usage.total_tokens,
+                    latency_ms=round(total_usage.latency_ms + step_usage.latency_ms, 3),
+                )
+                text = _extract_text(data)
 
-        return LLMResponse(
-            text=text,
-            parsed=parsed,
-            usage=_extract_usage(data, latency_ms),
-            raw=data,
-        )
+                if response_model is None:
+                    return LLMResponse(
+                        text=text,
+                        parsed=None,
+                        usage=total_usage,
+                        raw=data,
+                    )
+
+                cleaned = _strip_json_fences(text)
+                try:
+                    parsed = response_model.model_validate(json.loads(cleaned))
+                    return LLMResponse(
+                        text=text,
+                        parsed=parsed,
+                        usage=total_usage,
+                        raw=data,
+                    )
+                except (json.JSONDecodeError, ValidationError) as exc:
+                    if attempt + 1 >= max_attempts:
+                        raise
+                    schema_json = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+                    current_messages = [
+                        *current_messages,
+                        {"role": "assistant", "content": text},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Your previous output failed JSON/schema validation ({exc}). "
+                                f"Return ONLY valid JSON matching schema: {schema_json}"
+                            ),
+                        },
+                    ]
+
+        raise RuntimeError("Unreachable OpenAICompatClient completion loop exit")

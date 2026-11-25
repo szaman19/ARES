@@ -15,6 +15,7 @@ from ares import (
     Task,
     TaskContext,
     TaskSpec,
+    Usage,
 )
 
 
@@ -161,3 +162,49 @@ def test_suspend_complete_on_resume_false_and_true(tmp_path: Path) -> None:
     assert r2_done.tasks["waiter"].spilled_artifact_id is not None
     assert r2_done.tasks["inner_parent"].status == "done"
     assert r2_done.tasks["root"].status == "done"
+
+
+def test_resume_preserves_usage_and_race_cancellation(tmp_path: Path) -> None:
+    run_dir = tmp_path / "resume_usage_race"
+    m = StateMachine()
+
+    @m.state("root")
+    def root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        ctx.record_usage(prompt_tokens=15, completion_tokens=5, llm_calls=1, cost_usd=0.01)
+        return Spawn(
+            tasks=[
+                TaskSpec(id="gated", state="gated"),
+                TaskSpec(id="never_branch", state="gated_slow"),
+            ],
+            then=TaskSpec(id="after", state="after"),
+            join="any",
+        )
+
+    @m.state("gated")
+    def gated(task: Task, deps: dict, ctx: TaskContext):
+        if ctx.resume_data is None:
+            return Suspend(reason="need token", resume_key="gate_key")
+        return Done(
+            output=ctx.resume_data,
+            usage=Usage(prompt_tokens=20, completion_tokens=10, llm_calls=1, cost_usd=0.02),
+        )
+
+    @m.state("gated_slow")
+    def gated_slow(task: Task, deps: dict, ctx: TaskContext) -> Suspend:
+        return Suspend(reason="slower gate", resume_key="slow_key")
+
+    @m.state("after")
+    def after(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        return Done(output={"won": deps["gated"]})
+
+    r1 = m.run(TaskSpec(id="root", state="root"), run_dir=run_dir, max_concurrent=2)
+    assert r1.status == "suspended"
+    assert set(r1.suspended_task_ids) == {"gated", "never_branch"}
+    assert r1.usage.total_tokens == 20
+
+    r2 = m.resume(run_dir, resume_inputs={"gate_key": "ok"}, max_concurrent=2)
+    assert r2.status == "done"
+    assert r2.output == {"won": "ok"}
+    assert "never_branch" in r2.cancelled_task_ids
+    assert r2.usage.total_tokens == 50
+    assert r2.usage.llm_calls == 2

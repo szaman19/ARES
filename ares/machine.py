@@ -19,6 +19,7 @@ from ares.types import (
     Event,
     EventType,
     Fail,
+    JoinMode,
     RunBudget,
     RunResult,
     Spawn,
@@ -26,6 +27,7 @@ from ares.types import (
     Task,
     TaskSpec,
     Transition,
+    Usage,
 )
 
 F = TypeVar("F", bound=Callable[..., Transition])
@@ -62,6 +64,37 @@ class TaskContext:
         self.task_id = task_id
         self.run_id = run_id
         self._emit_fn = emit_fn
+        self._usage = Usage()
+        self._usage_lock = Lock()
+
+    def record_usage(
+        self,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int | None = None,
+        llm_calls: int = 1,
+        cost_usd: float = 0.0,
+    ) -> Usage:
+        """Record LLM token, call, and cost usage for the current task."""
+        resolved_total = (
+            total_tokens if total_tokens is not None else (prompt_tokens + completion_tokens)
+        )
+        delta = Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=resolved_total,
+            llm_calls=llm_calls,
+            cost_usd=cost_usd,
+        )
+        with self._usage_lock:
+            self._usage = self._usage.add(delta)
+            return self._usage
+
+    def recorded_usage(self) -> Usage:
+        """Return cumulative Usage recorded on this TaskContext."""
+        with self._usage_lock:
+            return self._usage.model_copy()
 
     def emit(
         self,
@@ -207,9 +240,12 @@ class _RunSession:
         *,
         parent_id: str | None,
         depth: int,
+        then_depth: int | None = None,
         then_spec: TaskSpec | None = None,
+        join_mode: JoinMode = "all",
     ) -> tuple[list[Task], Task | None]:
         """Materialize specs + optional ``then`` continuation and validate DAG invariants."""
+        eff_then_depth = depth if then_depth is None else then_depth
         assigned_ids: list[str] = []
         batch_ids: set[str] = set()
 
@@ -250,14 +286,20 @@ class _RunSession:
 
         then_task: Task | None = None
         if then_spec is not None and then_id is not None:
-            then_deps = list(dict.fromkeys([*then_spec.depends_on, *assigned_ids]))
+            if join_mode == "any":
+                then_deps = list(dict.fromkeys(then_spec.depends_on))
+                then_status: Any = "waiting"
+            else:
+                then_deps = list(dict.fromkeys([*then_spec.depends_on, *assigned_ids]))
+                then_status = "pending"
             then_task = Task(
                 id=then_id,
                 state=then_spec.state,
                 input=dict(then_spec.input),
                 depends_on=then_deps,
                 parent_id=parent_id,
-                depth=depth,
+                depth=eff_then_depth,
+                status=then_status,
                 dedup_key=then_spec.dedup_key,
                 metadata=dict(then_spec.metadata),
             )
@@ -298,14 +340,138 @@ class _RunSession:
             )
         return children, then_task
 
+    def _has_cancelled_ancestor(self, task: Task) -> bool:
+        cur = task.parent_id
+        while cur is not None:
+            parent = self.tasks.get(cur)
+            if parent is None:
+                return False
+            if parent.status == "cancelled":
+                return True
+            cur = parent.parent_id
+        return False
+
+    def _cancel_subtree(self, root_id: str, *, reason: str) -> None:
+        if root_id not in self.tasks:
+            return
+        children_by_parent: dict[str, list[str]] = {}
+        for tid, t in self.tasks.items():
+            if t.parent_id is not None:
+                children_by_parent.setdefault(t.parent_id, []).append(tid)
+
+        queue: list[str] = [root_id]
+        visited: set[str] = set()
+        while queue:
+            tid = queue.pop(0)
+            if tid in visited:
+                continue
+            visited.add(tid)
+            t = self.tasks.get(tid)
+            if t is None:
+                continue
+            for child_id in children_by_parent.get(tid, ()):
+                if child_id not in visited:
+                    queue.append(child_id)
+            if t.continuation_id is not None and t.continuation_id not in visited:
+                queue.append(t.continuation_id)
+            for wf_id in t.wait_for:
+                if wf_id not in visited:
+                    queue.append(wf_id)
+
+            if t.status in ("pending", "waiting", "suspended", "running"):
+                t.status = "cancelled"
+                t.suspend_reason = None
+                self.emit(
+                    "task_cancelled",
+                    task_id=t.id,
+                    payload={"reason": reason},
+                )
+
     def propagate_pops(self) -> None:
-        """Run fixed-point PDA pop propagation for waiting parents."""
+        """Run fixed-point PDA pop propagation, dependency failure, and race resolution."""
         changed = True
         while changed:
             changed = False
+
+            # 1. Propagate dependency failures/cancellations to pending tasks.
+            for task in list(self.tasks.values()):
+                if task.status != "pending":
+                    continue
+                failed_dep = next(
+                    (
+                        self.tasks[dep_id]
+                        for dep_id in task.depends_on
+                        if self.tasks[dep_id].status in ("failed", "cancelled")
+                    ),
+                    None,
+                )
+                if failed_dep is not None:
+                    task.status = "failed"
+                    task.error = (
+                        f"Dependency {failed_dep.id} {failed_dep.status}: {failed_dep.error or ''}"
+                    ).strip()
+                    self.emit(
+                        "task_failed",
+                        task_id=task.id,
+                        payload={"failed_dependency": failed_dep.id, "error": task.error},
+                    )
+                    changed = True
+
+            # 2. Resolve waiting PDA parents (race join="any" first, then join="all").
             for task in list(self.tasks.values()):
                 if task.status != "waiting":
                     continue
+
+                if task.join_mode == "any" and task.wait_for:
+                    children = [self.tasks[cid] for cid in task.wait_for]
+                    winner = next((c for c in children if c.status == "done"), None)
+                    if winner is not None:
+                        for other in children:
+                            if other.id != winner.id:
+                                self._cancel_subtree(other.id, reason=f"race_won_by:{winner.id}")
+                        if task.continuation_id is not None:
+                            cont = self.tasks[task.continuation_id]
+                            if winner.id not in cont.depends_on:
+                                cont.depends_on.append(winner.id)
+                            if cont.status == "waiting":
+                                cont.status = "pending"
+                            task.wait_for = []
+                            task.join_mode = "all"
+                        else:
+                            task.output = winner.output
+                            task.spilled_artifact_id = winner.spilled_artifact_id
+                            task.wait_for = []
+                            task.status = "done"
+                            self.emit(
+                                "task_done",
+                                task_id=task.id,
+                                payload={"race_winner": winner.id},
+                            )
+                        changed = True
+                        continue
+
+                    if all(c.status in ("failed", "cancelled") for c in children):
+                        first_fail = next((c for c in children if c.status == "failed"), children[0])
+                        err = first_fail.error or "All race children failed"
+                        if task.continuation_id is not None:
+                            self._cancel_subtree(
+                                task.continuation_id,
+                                reason="all_race_children_failed",
+                            )
+                        task.status = "failed"
+                        task.error = err
+                        task.wait_for = []
+                        self.emit(
+                            "task_failed",
+                            task_id=task.id,
+                            payload={"failed_child": first_fail.id, "error": err},
+                        )
+                        changed = True
+                        continue
+
+                    # Race still active; wait for a winner or all-failed.
+                    continue
+
                 if task.continuation_id is not None:
                     cont = self.tasks[task.continuation_id]
                     if cont.status == "done":
@@ -325,6 +491,14 @@ class _RunSession:
                             "task_failed",
                             task_id=task.id,
                             payload={"failed_child": cont.id, "error": cont.error},
+                        )
+                        changed = True
+                    elif cont.status == "cancelled":
+                        task.status = "cancelled"
+                        self.emit(
+                            "task_cancelled",
+                            task_id=task.id,
+                            payload={"reason": f"continuation_cancelled:{cont.id}"},
                         )
                         changed = True
                 elif task.wait_for:
@@ -408,12 +582,18 @@ class _RunSession:
                 continue
             return wave
 
-    def _execute_task(self, task_snapshot: Task, deps: dict[str, Any]) -> tuple[Transition, float]:
+    def _execute_task(
+        self, task_snapshot: Task, deps: dict[str, Any]
+    ) -> tuple[Transition, float, Usage]:
         start = time.perf_counter()
         cfg = self.machine._states.get(task_snapshot.state)
         if cfg is None:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            return Fail(error=f"Unknown state: {task_snapshot.state!r}", retryable=False), elapsed_ms
+            return (
+                Fail(error=f"Unknown state: {task_snapshot.state!r}", retryable=False),
+                elapsed_ms,
+                Usage(),
+            )
 
         ctx = TaskContext(
             store=self.store,
@@ -436,7 +616,7 @@ class _RunSession:
             transition = Fail(error=message, retryable=False)
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        return transition, elapsed_ms
+        return transition, elapsed_ms, ctx.recorded_usage()
 
     def _apply_transition(self, task: Task, transition: Transition) -> None:
         if isinstance(transition, Done):
@@ -495,6 +675,7 @@ class _RunSession:
         # Spawn transition
         children_specs = list(transition.tasks)
         then_spec = transition.then
+        eff_join_mode: JoinMode = transition.join if children_specs else "all"
 
         if not children_specs and then_spec is None:
             task.output = None
@@ -503,7 +684,7 @@ class _RunSession:
             return
 
         new_count = len(children_specs) + (1 if then_spec is not None else 0)
-        if task.depth + 1 > self.budget.max_depth:
+        if children_specs and task.depth + 1 > self.budget.max_depth:
             task.status = "pending"
             self.budget_exceeded = True
             return
@@ -516,11 +697,27 @@ class _RunSession:
             children_specs,
             parent_id=task.id,
             depth=task.depth + 1,
+            then_depth=task.depth,
             then_spec=then_spec,
+            join_mode=eff_join_mode,
         )
         child_ids = [c.id for c in children]
         task.status = "waiting"
-        if then_task is not None:
+        task.join_mode = eff_join_mode
+        if eff_join_mode == "any":
+            task.wait_for = child_ids
+            if then_task is not None:
+                task.continuation_id = then_task.id
+            self.emit(
+                "task_spawned",
+                task_id=task.id,
+                payload={
+                    "children": child_ids,
+                    "then": then_task.id if then_task is not None else None,
+                    "join": "any",
+                },
+            )
+        elif then_task is not None:
             task.continuation_id = then_task.id
             self.emit(
                 "task_spawned",
@@ -538,26 +735,42 @@ class _RunSession:
     def _wall_clock_exceeded(self) -> bool:
         return (time.monotonic() - self._start_monotonic) > self.budget.max_wall_clock_s
 
+    def _total_usage(self) -> Usage:
+        total = Usage()
+        for task in self.tasks.values():
+            total = total.add(task.usage)
+        return total
+
+    def _usage_budget_exceeded(self) -> bool:
+        if self.budget.max_tokens is None and self.budget.max_cost_usd is None:
+            return False
+        total = self._total_usage()
+        if self.budget.max_tokens is not None and total.total_tokens > self.budget.max_tokens:
+            return True
+        if self.budget.max_cost_usd is not None and total.cost_usd > self.budget.max_cost_usd:
+            return True
+        return False
+
     def run_loop(self) -> RunResult:
         root_task = self.tasks[self.root_task_id]
 
         with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
-            while root_task.status not in ("done", "failed"):
-                if self._wall_clock_exceeded():
+            while root_task.status not in ("done", "failed", "cancelled"):
+                if self._wall_clock_exceeded() or self._usage_budget_exceeded():
                     self.budget_exceeded = True
                     break
 
                 wave = self._select_ready_wave()
-                if root_task.status in ("done", "failed"):
+                if root_task.status in ("done", "failed", "cancelled"):
                     break
                 if not wave:
                     break
 
-                if self._wall_clock_exceeded():
+                if self._wall_clock_exceeded() or self._usage_budget_exceeded():
                     self.budget_exceeded = True
                     break
 
-                futures: list[tuple[Task, Future[tuple[Transition, float]]]] = []
+                futures: list[tuple[Task, Future[tuple[Transition, float, Usage]]]] = []
                 for task in wave:
                     task.status = "running"
                     task.attempts += 1
@@ -571,11 +784,25 @@ class _RunSession:
                     futures.append((task, executor.submit(self._execute_task, snapshot, deps)))
 
                 for task, future in futures:
-                    transition, elapsed_ms = future.result()
+                    transition, elapsed_ms, recorded_usage = future.result()
                     task.duration_ms += elapsed_ms
-                    self._apply_transition(task, transition)
+                    task.usage = task.usage.add(recorded_usage)
+                    if isinstance(transition, Done) and transition.usage is not None:
+                        task.usage = task.usage.add(transition.usage)
+                    if task.status == "cancelled" or self._has_cancelled_ancestor(task):
+                        if task.status != "cancelled":
+                            task.status = "cancelled"
+                            self.emit(
+                                "task_cancelled",
+                                task_id=task.id,
+                                payload={"reason": "ancestor_cancelled"},
+                            )
+                    else:
+                        self._apply_transition(task, transition)
 
                 self.propagate_pops()
+                if self._usage_budget_exceeded():
+                    self.budget_exceeded = True
                 self.save_checkpoint()
 
                 if self.budget_exceeded:
@@ -583,12 +810,14 @@ class _RunSession:
 
         suspended_ids = [tid for tid, t in self.tasks.items() if t.status == "suspended"]
         failed_ids = [tid for tid, t in self.tasks.items() if t.status == "failed"]
+        cancelled_ids = [tid for tid, t in self.tasks.items() if t.status == "cancelled"]
+        total_usage = self._total_usage()
 
         if self.budget_exceeded:
             status: Any = "budget_exceeded"
         elif root_task.status == "done":
             status = "done"
-        elif root_task.status == "failed":
+        elif root_task.status in ("failed", "cancelled"):
             status = "failed"
         elif suspended_ids:
             status = "suspended"
@@ -613,6 +842,8 @@ class _RunSession:
             tasks=self.tasks,
             suspended_task_ids=suspended_ids,
             failed_task_ids=failed_ids,
+            cancelled_task_ids=cancelled_ids,
+            usage=total_usage,
             run_dir=self.run_dir,
             wall_clock_ms=wall_clock_ms,
         )

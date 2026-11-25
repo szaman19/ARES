@@ -7,6 +7,7 @@ from ares.types import (
     Done,
     Event,
     Fail,
+    JoinMode,
     RunBudget,
     RunResult,
     Spawn,
@@ -15,6 +16,7 @@ from ares.types import (
     TaskSpec,
     TaskStatus,
     Transition,
+    Usage,
 )
 
 __all__ = [
@@ -24,6 +26,7 @@ __all__ = [
     "Done",
     "Event",
     "Fail",
+    "JoinMode",
     "RunBudget",
     "RunResult",
     "Spawn",
@@ -34,4 +37,5 @@ __all__ = [
     "TaskSpec",
     "TaskStatus",
     "Transition",
+    "Usage",
 ]

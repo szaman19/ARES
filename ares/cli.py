@@ -12,13 +12,19 @@ from typing import Any, Sequence
 
 from ares.machine import StateMachine
 from ares.store import ArtifactStore, CheckpointStore
-from ares.types import ArtifactRef, Event, RunBudget, RunResult, Task, TaskSpec
+from ares.types import ArtifactRef, Event, RunBudget, RunResult, Task, TaskSpec, Usage
 
 
 def _parse_optional_int(raw: str) -> int | None:
     if raw.strip().lower() in {"none", "null"}:
         return None
     return int(raw)
+
+
+def _parse_optional_float(raw: str) -> float | None:
+    if raw.strip().lower() in {"none", "null"}:
+        return None
+    return float(raw)
 
 
 def _load_machine(machine_ref: str) -> StateMachine:
@@ -69,6 +75,22 @@ def _format_event_line(event: Event) -> str:
     return f"[{event.seq:>4}] {event.event_type:<16}{task_part}{payload_part}"
 
 
+def _total_usage(tasks: dict[str, Task]) -> Usage:
+    total = Usage()
+    for task in tasks.values():
+        total = total.add(task.usage)
+    return total
+
+
+def _print_usage(usage: Usage) -> None:
+    if usage.total_tokens > 0 or usage.llm_calls > 0 or usage.cost_usd > 0.0:
+        print(
+            f"Usage:     calls={usage.llm_calls} tokens={usage.total_tokens} "
+            f"(prompt={usage.prompt_tokens}, completion={usage.completion_tokens}) "
+            f"cost=${usage.cost_usd:.6f}"
+        )
+
+
 def _print_tasks_table(tasks: dict[str, Task]) -> None:
     print("\nTasks:")
     header = f"  {'ID':<16} {'State':<18} {'Status':<10} {'Depth':>5} {'Att':>3} {'Ms':>8}"
@@ -79,6 +101,40 @@ def _print_tasks_table(tasks: dict[str, Task]) -> None:
             f"  {task.id:<16} {task.state:<18} {task.status:<10} "
             f"{task.depth:>5} {task.attempts:>3} {task.duration_ms:>8.1f}"
         )
+
+
+def _print_tasks_tree(tasks: dict[str, Task], root_task_id: str) -> None:
+    children_map: dict[str | None, list[Task]] = {}
+    for task in tasks.values():
+        parent_key = task.parent_id if task.parent_id in tasks else None
+        children_map.setdefault(parent_key, []).append(task)
+
+    print("\nTask Tree:")
+    visited: set[str] = set()
+
+    def _walk(tid: str, prefix: str, is_last: bool, is_root: bool) -> None:
+        if tid in visited or tid not in tasks:
+            return
+        visited.add(tid)
+        task = tasks[tid]
+        branch = "" if is_root else ("└─ " if is_last else "├─ ")
+        extras: list[str] = [f"depth={task.depth}", f"{task.duration_ms:.1f}ms"]
+        if task.usage.total_tokens > 0:
+            extras.append(f"tok={task.usage.total_tokens}")
+        if task.spilled_artifact_id:
+            extras.append(f"ref={task.spilled_artifact_id}")
+        print(f"  {prefix}{branch}{task.id} [{task.state}] ({task.status}) {' '.join(extras)}")
+
+        kids = children_map.get(tid, [])
+        child_prefix = prefix if is_root else (prefix + ("   " if is_last else "│  "))
+        for idx, child in enumerate(kids):
+            _walk(child.id, child_prefix, idx == len(kids) - 1, False)
+
+    if root_task_id in tasks:
+        _walk(root_task_id, "", True, True)
+    for tid in tasks:
+        if tid not in visited:
+            _walk(tid, "", True, True)
 
 
 def _print_artifacts(refs: list[ArtifactRef]) -> None:
@@ -97,10 +153,13 @@ def _print_run_summary(result: RunResult) -> None:
     print(f"Root task: {result.root_task_id}")
     if result.run_dir:
         print(f"Run dir:   {result.run_dir}")
+    _print_usage(result.usage)
     if result.suspended_task_ids:
         print(f"Suspended: {', '.join(result.suspended_task_ids)}")
     if result.failed_task_ids:
         print(f"Failed:    {', '.join(result.failed_task_ids)}")
+    if result.cancelled_task_ids:
+        print(f"Cancelled: {', '.join(result.cancelled_task_ids)}")
     _print_tasks_table(result.tasks)
     if result.run_dir:
         refs = ArtifactStore(Path(result.run_dir) / "artifacts").list_refs()
@@ -118,6 +177,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     budget = RunBudget(
         max_tasks=args.max_tasks,
         max_inline_bytes=args.max_inline_bytes,
+        max_tokens=args.max_tokens,
+        max_cost_usd=args.max_cost_usd,
     )
     root = TaskSpec(id=args.id, state=args.state, input=input_data)
 
@@ -186,6 +247,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     run_id = str(snapshot.get("run_id", ""))
     root_task_id = str(snapshot.get("root_task_id", ""))
     status = _derive_status(tasks, root_task_id, events)
+    usage = _total_usage(tasks)
 
     if args.json:
         payload = {
@@ -193,6 +255,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             "root_task_id": root_task_id,
             "status": status,
             "run_dir": str(run_path),
+            "usage": usage.model_dump(),
             "tasks": {tid: task.model_dump() for tid, task in tasks.items()},
             "events": [ev.model_dump() for ev in events],
             "artifacts": [ref.model_dump() for ref in refs],
@@ -201,11 +264,33 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     else:
         print(f"Run {run_id}: status={status} root_task_id={root_task_id}")
         print(f"Run dir: {run_path}")
-        _print_tasks_table(tasks)
+        _print_usage(usage)
+        if args.tree:
+            _print_tasks_tree(tasks, root_task_id)
+        else:
+            _print_tasks_table(tasks)
         _print_artifacts(refs)
         print(f"\nEvents ({len(events)} total):")
         for ev in events[-10:]:
             print("  " + _format_event_line(ev))
+    return 0
+
+
+def _cmd_artifact(args: argparse.Namespace) -> int:
+    artifacts_dir = Path(args.run_dir) / "artifacts"
+    if not artifacts_dir.exists():
+        print(f"Error: artifacts directory not found in {args.run_dir}", file=sys.stderr)
+        return 1
+    store = ArtifactStore(artifacts_dir)
+    if store.get_ref(args.ref_id) is None:
+        print(f"Error: unknown artifact ref {args.ref_id!r} in {args.run_dir}", file=sys.stderr)
+        return 1
+    if args.offset is not None or args.limit is not None:
+        offset = 0 if args.offset is None else args.offset
+        limit = 4096 if args.limit is None else args.limit
+        sys.stdout.write(store.read_slice(args.ref_id, offset=offset, limit=limit))
+    else:
+        sys.stdout.write(store.get_text(args.ref_id))
     return 0
 
 
@@ -231,6 +316,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=4096,
         help="Inline output byte limit before spilling to ArtifactStore (or 'none')",
     )
+    run_p.add_argument(
+        "--max-tokens",
+        type=_parse_optional_int,
+        default=None,
+        help="Maximum cumulative LLM tokens allowed before stopping (or 'none')",
+    )
+    run_p.add_argument(
+        "--max-cost-usd",
+        type=_parse_optional_float,
+        default=None,
+        help="Maximum cumulative LLM cost in USD allowed before stopping (or 'none')",
+    )
     run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
     run_p.set_defaults(handler=_cmd_run)
 
@@ -254,8 +351,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     inspect_p = subparsers.add_parser("inspect", help="Inspect a checkpointed run directory")
     inspect_p.add_argument("run_dir", help="Checkpoint directory to inspect")
+    inspect_p.add_argument(
+        "--tree",
+        action="store_true",
+        help="Display tasks as an indented parent-child DAG tree",
+    )
     inspect_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
     inspect_p.set_defaults(handler=_cmd_inspect)
+
+    art_p = subparsers.add_parser("artifact", help="Print a stored artifact or slice by ref_id")
+    art_p.add_argument("run_dir", help="Checkpoint directory containing artifacts/")
+    art_p.add_argument("ref_id", help="Artifact reference ID (e.g. art_...)")
+    art_p.add_argument("--offset", type=int, default=None, help="Character offset for slice")
+    art_p.add_argument("--limit", type=int, default=None, help="Maximum characters to print")
+    art_p.set_defaults(handler=_cmd_artifact)
 
     return parser
 

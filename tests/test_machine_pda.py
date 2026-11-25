@@ -19,6 +19,7 @@ from ares import (
     Task,
     TaskContext,
     TaskSpec,
+    Usage,
 )
 
 
@@ -397,3 +398,220 @@ def test_auto_spill_and_read_slice_in_downstream_task(tmp_path: Path) -> None:
     assert res.status == "done"
     assert res.output == "HEADER:|:TAIL"
     assert res.tasks["producer"].spilled_artifact_id is not None
+
+
+def test_tail_call_preserves_o1_depth_across_50_hops() -> None:
+    machine = StateMachine()
+
+    @machine.state("step")
+    def step(task: Task, deps: dict, ctx: TaskContext):
+        remaining = int(task.input["remaining"])
+        if remaining == 0:
+            return Done(output=task.input["acc"])
+        return Spawn(
+            tasks=[],
+            then=TaskSpec(
+                state="step",
+                input={"remaining": remaining - 1, "acc": task.input["acc"] + 1},
+            ),
+        )
+
+    res = machine.run(
+        TaskSpec(id="root", state="step", input={"remaining": 50, "acc": 0}),
+        budget=RunBudget(max_depth=3, max_tasks=100),
+    )
+    assert res.status == "done"
+    assert res.output == 50
+    assert len(res.tasks) == 51
+    assert all(t.depth == 0 for t in res.tasks.values())
+
+
+def test_pending_continuation_fails_when_child_fails() -> None:
+    machine = StateMachine()
+    cont_ran = False
+
+    @machine.state("root")
+    def root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        return Spawn(
+            tasks=[
+                TaskSpec(id="ok", state="leaf", input={"fail": False}),
+                TaskSpec(id="bad", state="leaf", input={"fail": True}),
+            ],
+            then=TaskSpec(id="cont", state="join"),
+        )
+
+    @machine.state("leaf")
+    def leaf(task: Task, deps: dict, ctx: TaskContext):
+        if task.input["fail"]:
+            return Fail(error="leaf_boom")
+        return Done(output=42)
+
+    @machine.state("join")
+    def join(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        nonlocal cont_ran
+        cont_ran = True
+        return Done(output=deps)
+
+    res = machine.run(TaskSpec(id="root", state="root"))
+    assert res.status == "failed"
+    assert not cont_ran
+    assert res.tasks["cont"].status == "failed"
+    assert res.tasks["root"].status == "failed"
+    assert "leaf_boom" in (res.tasks["cont"].error or "")
+
+
+def test_race_join_any_without_continuation_cancels_slow_subtree() -> None:
+    machine = StateMachine()
+    fast_done = threading.Event()
+    slow_child_ran = threading.Event()
+    events: list[Event] = []
+
+    @machine.state("root")
+    def root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        return Spawn(
+            tasks=[
+                TaskSpec(id="fast", state="fast_branch"),
+                TaskSpec(id="slow", state="slow_branch"),
+            ],
+            then=None,
+            join="any",
+        )
+
+    @machine.state("fast_branch")
+    def fast_branch(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        fast_done.set()
+        return Done(output="winner_payload")
+
+    @machine.state("slow_branch")
+    def slow_branch(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        # Spawn a nested child that must be cancelled before executing Wave 2.
+        fast_done.wait(timeout=2.0)
+        return Spawn(
+            tasks=[TaskSpec(id="slow_leaf", state="slow_leaf_state")],
+            then=TaskSpec(id="slow_cont", state="slow_leaf_state"),
+        )
+
+    @machine.state("slow_leaf_state")
+    def slow_leaf_state(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        slow_child_ran.set()
+        return Done(output="never")
+
+    res = machine.run(
+        TaskSpec(id="root", state="root"),
+        max_concurrent=2,
+        on_event=events.append,
+    )
+    assert res.status == "done"
+    assert res.output == "winner_payload"
+    assert not slow_child_ran.is_set()
+    assert set(res.cancelled_task_ids) >= {"slow", "slow_leaf", "slow_cont"}
+    assert any(ev.event_type == "task_cancelled" for ev in events)
+
+
+def test_race_join_any_with_continuation_and_all_fail() -> None:
+    machine = StateMachine()
+    seen_deps: dict[str, object] = {}
+
+    @machine.state("root")
+    def root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        return Spawn(
+            tasks=[
+                TaskSpec(id="b_fail", state="branch_fail"),
+                TaskSpec(id="b_win", state="branch_win"),
+                TaskSpec(id="b_lose", state="branch_lose"),
+            ],
+            then=TaskSpec(id="pick", state="pick_winner"),
+            join="any",
+        )
+
+    @machine.state("branch_fail")
+    def branch_fail(task: Task, deps: dict, ctx: TaskContext) -> Fail:
+        return Fail(error="early_fail")
+
+    @machine.state("branch_win")
+    def branch_win(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        return Done(output={"branch": "b_win", "score": 99})
+
+    @machine.state("branch_lose")
+    def branch_lose(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        return Spawn(tasks=[TaskSpec(id="lose_sub", state="branch_win")])
+
+    @machine.state("pick_winner")
+    def pick_winner(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        seen_deps.update(deps)
+        return Done(output={"picked": next(iter(deps.values()))})
+
+    res = machine.run(TaskSpec(id="root", state="root"), max_concurrent=3)
+    assert res.status == "done"
+    assert res.output == {"picked": {"branch": "b_win", "score": 99}}
+    assert list(seen_deps.keys()) == ["b_win"]
+    assert "b_lose" in res.cancelled_task_ids
+    assert "lose_sub" in res.cancelled_task_ids
+
+    # All children fail -> root fails and dormant continuation is cancelled.
+    fail_machine = StateMachine()
+
+    @fail_machine.state("root")
+    def fail_root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        return Spawn(
+            tasks=[
+                TaskSpec(id="f1", state="boom"),
+                TaskSpec(id="f2", state="boom"),
+            ],
+            then=TaskSpec(id="never_run", state="cont"),
+            join="any",
+        )
+
+    fail_machine.register_state("boom", lambda t, d, c: Fail(error="all_bad"))
+    fail_machine.register_state("cont", lambda t, d, c: Done(output="unreachable"))
+
+    fail_res = fail_machine.run(TaskSpec(id="root", state="root"), max_concurrent=2)
+    assert fail_res.status == "failed"
+    assert fail_res.tasks["never_run"].status == "cancelled"
+
+
+def test_usage_recording_and_token_cost_budgets() -> None:
+    machine = StateMachine()
+
+    @machine.state("root")
+    def root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        ctx.record_usage(prompt_tokens=10, completion_tokens=5, llm_calls=1, cost_usd=0.01)
+        return Spawn(
+            tasks=[TaskSpec(id="c1", state="child"), TaskSpec(id="c2", state="child")],
+            then=TaskSpec(id="join", state="join"),
+        )
+
+    @machine.state("child")
+    def child(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        return Done(
+            output=1,
+            usage=Usage(prompt_tokens=20, completion_tokens=10, llm_calls=1, cost_usd=0.02),
+        )
+
+    @machine.state("join")
+    def join(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        ctx.record_usage(prompt_tokens=5, completion_tokens=5, llm_calls=1, cost_usd=0.005)
+        return Done(output=sum(deps.values()))
+
+    ok_res = machine.run(TaskSpec(id="root", state="root"))
+    assert ok_res.status == "done"
+    assert ok_res.usage.prompt_tokens == 55
+    assert ok_res.usage.completion_tokens == 30
+    assert ok_res.usage.total_tokens == 85
+    assert ok_res.usage.llm_calls == 4
+    assert ok_res.usage.cost_usd == pytest.approx(0.055)
+
+    # Exceed max_tokens
+    tok_res = machine.run(
+        TaskSpec(id="root", state="root"),
+        budget=RunBudget(max_tokens=40),
+    )
+    assert tok_res.status == "budget_exceeded"
+    assert tok_res.tasks["join"].status == "pending"
+
+    # Exceed max_cost_usd
+    cost_res = machine.run(
+        TaskSpec(id="root", state="root"),
+        budget=RunBudget(max_cost_usd=0.03),
+    )
+    assert cost_res.status == "budget_exceeded"

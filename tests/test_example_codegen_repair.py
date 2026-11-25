@@ -256,3 +256,31 @@ def test_demo_runner_rle_encode(
     assert "task=rle_encode" in stdout
     assert "certified=True" in stdout
     assert "selected_branch=branch_0" in stdout
+
+
+def test_race_mode_cancels_slower_branches_after_branch_0_passes(tmp_path: Path) -> None:
+    all_res = build_machine(max_attempts=3, race=False).run(
+        TaskSpec(state="plan", input={"task": "slugify"}),
+        run_dir=tmp_path / "no_race",
+        max_concurrent=3,
+    )
+    race_res = build_machine(max_attempts=3, race=True).run(
+        TaskSpec(state="plan", input={"task": "slugify"}),
+        run_dir=tmp_path / "with_race",
+        max_concurrent=3,
+    )
+
+    assert race_res.status == "done"
+    store = ArtifactStore(tmp_path / "with_race" / "artifacts")
+    out = _unwrap(race_res.output, store)
+    assert out["certified"] is True
+    assert out["selected_branch"] == "branch_0"
+    assert out["attempts"] == 2
+    assert len(race_res.cancelled_task_ids) > 0
+    done_verifies_race = [
+        t for t in race_res.tasks.values() if t.state == "verify_pytest" and t.status == "done"
+    ]
+    done_verifies_all = [
+        t for t in all_res.tasks.values() if t.state == "verify_pytest" and t.status == "done"
+    ]
+    assert len(done_verifies_race) < len(done_verifies_all)

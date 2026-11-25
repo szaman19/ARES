@@ -164,3 +164,58 @@ def test_cli_run_human_output_and_error_cases(
     rc_missing = main(["inspect", str(tmp_path / "does_not_exist")])
     assert rc_missing == 1
     assert "Error:" in capsys.readouterr().err
+
+
+def test_cli_artifact_tree_and_token_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mod_name = _write_temp_machine(tmp_path, monkeypatch)
+    run_dir = tmp_path / "tree_art_run"
+
+    rc_run = main(
+        [
+            "run",
+            f"{mod_name}:machine",
+            "--state",
+            "entry",
+            "--id",
+            "root_1",
+            "--input",
+            '{"text": "WXYZ", "repeat": 30}',
+            "--run-dir",
+            str(run_dir),
+            "--max-inline-bytes",
+            "32",
+            "--max-tokens",
+            "1000",
+            "--json",
+        ]
+    )
+    assert rc_run == 0
+    run_out = json.loads(capsys.readouterr().out)
+    prep_ref = run_out["tasks"]["prep"]["spilled_artifact_id"]
+    assert prep_ref is not None
+
+    # inspect --tree
+    rc_tree = main(["inspect", str(run_dir), "--tree"])
+    assert rc_tree == 0
+    tree_out = capsys.readouterr().out
+    assert "Task Tree:" in tree_out
+    assert "root_1 [entry]" in tree_out
+    assert "prep [prep]" in tree_out
+    assert f"ref={prep_ref}" in tree_out
+
+    # ares artifact full and sliced
+    rc_art_full = main(["artifact", str(run_dir), prep_ref])
+    assert rc_art_full == 0
+    assert capsys.readouterr().out == "WXYZ" * 30
+
+    rc_art_slice = main(["artifact", str(run_dir), prep_ref, "--offset", "1", "--limit", "4"])
+    assert rc_art_slice == 0
+    assert capsys.readouterr().out == "XYZW"
+
+    rc_art_missing = main(["artifact", str(run_dir), "art_missing"])
+    assert rc_art_missing == 1
+    assert "Error:" in capsys.readouterr().err

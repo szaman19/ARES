@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ares.llm import (
     ContextLengthExceededError,
@@ -260,3 +260,67 @@ def test_ares_llm_boundary_no_core_or_domain_coupling() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_structured_validation_retry_accumulates_usage_and_repairs() -> None:
+    """Retry invalid JSON / schema outputs up to ``max_validation_retries`` and accumulate usage."""
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(body)
+        if len(seen_payloads) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": '{"answer": "ok"}'}}],  # missing confidence
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"answer": "ok", "confidence": 0.95}'}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28},
+            },
+        )
+
+    client = OpenAICompatClient(
+        max_validation_retries=1,
+        transport=httpx.MockTransport(handler),
+    )
+    resp = client.complete(
+        [LLMMessage(role="user", content="check")],
+        response_model=_StructuredAnswer,
+    )
+    assert len(seen_payloads) == 2
+    assert isinstance(resp.parsed, _StructuredAnswer)
+    assert resp.parsed.answer == "ok"
+    assert resp.parsed.confidence == pytest.approx(0.95)
+    assert resp.usage.prompt_tokens == 30
+    assert resp.usage.completion_tokens == 13
+    assert resp.usage.total_tokens == 43
+    assert "failed JSON/schema validation" in seen_payloads[1]["messages"][-1]["content"]
+
+
+def test_structured_validation_retries_zero_raises_immediately() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "not json at all"}}]},
+        )
+
+    client = OpenAICompatClient(
+        max_validation_retries=0,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises((json.JSONDecodeError, ValidationError)):
+        client.complete(
+            [LLMMessage(role="user", content="check")],
+            response_model=_StructuredAnswer,
+        )
+    assert calls == 1
