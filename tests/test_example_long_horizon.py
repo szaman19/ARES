@@ -12,7 +12,7 @@ import httpx
 from pydantic import BaseModel
 
 from ares import ArtifactStore, CheckpointStore, RunBudget, TaskSpec
-from ares.llm import ContextLengthExceededError, LLMMessage, LLMResponse, OpenAICompatClient
+from ares.ext.llm import ContextLengthExceededError, LLMMessage, LLMResponse, OpenAICompatClient
 from examples.long_horizon_small_context.machine import (
     HopExtraction,
     InstrumentedLLMClient,

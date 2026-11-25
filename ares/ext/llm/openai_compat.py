@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from ares.llm.base import (
+from ares.ext.llm.base import (
     ContextLengthExceededError,
     LLMMessage,
     LLMResponse,

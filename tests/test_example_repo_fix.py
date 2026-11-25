@@ -13,8 +13,8 @@ import pytest
 
 from ares import ArtifactStore, TaskSpec
 from ares.cli import main as cli_main
-from ares.llm import OpenAICompatClient
-from ares.sandbox import GitWorktreeSandbox
+from ares.ext.llm import OpenAICompatClient
+from ares.ext.git import GitWorktreeSandbox
 from examples.repo_fix import build_machine, create_sample_repo
 from examples.repo_fix.run import main as demo_main
 

@@ -5,7 +5,7 @@
 ## 1. Strict Boundaries
 
 - Core `ares` (`ares/types.py`, `ares/store.py`, `ares/machine.py`, `ares/cli.py`, `ares/__init__.py`) depends **only** on Python 3.11+ stdlib and `pydantic>=2.9.0`.
-- Core `ares` MUST NOT import `ares.llm`, `duckdb`, `sql`, `httpx`, `openai`, `google.genai`, `fastapi`, `matplotlib`, `numpy`, `pyarrow`, or `uvicorn`.
+- Core `ares` MUST NOT import `ares.ext`, `duckdb`, `sql`, `httpx`, `openai`, `google.genai`, `fastapi`, `matplotlib`, `numpy`, `pyarrow`, or `uvicorn`.
 - Core `ares` has no concept of `InvestigationBoard`, `Domain`, `SearchQuestion`, or query DSLs. Domain tools live inside state handlers or optional external packages.
 
 ## 2. Data Contracts (`ares/types.py`)

@@ -1,4 +1,4 @@
-"""Offline tests for ``ares.llm`` and ``OpenAICompatClient`` using ``httpx.MockTransport``."""
+"""Offline tests for ``ares.ext.llm`` and ``OpenAICompatClient`` using ``httpx.MockTransport``."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import httpx
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from ares.llm import (
+from ares.ext.llm import (
     ContextLengthExceededError,
     LLMClient,
     LLMMessage,
@@ -223,7 +223,7 @@ def test_http_500_raises_status_error() -> None:
 
 
 def test_ares_llm_boundary_no_core_or_domain_coupling() -> None:
-    """Verify ``ares.llm`` imports neither core ``ares.machine`` nor domain/DuckDB modules."""
+    """Verify ``ares.ext.llm`` imports neither core ``ares.machine`` nor domain/DuckDB modules."""
     forbidden_prefixes = (
         "ares.machine",
         "ares.store",
@@ -234,7 +234,7 @@ def test_ares_llm_boundary_no_core_or_domain_coupling() -> None:
         "fastapi",
         "uvicorn",
     )
-    llm_dir = Path(__file__).resolve().parent.parent / "ares" / "llm"
+    llm_dir = Path(__file__).resolve().parent.parent / "ares" / "ext" / "llm"
     for py_file in llm_dir.glob("*.py"):
         tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
         for node in ast.walk(tree):
@@ -249,7 +249,7 @@ def test_ares_llm_boundary_no_core_or_domain_coupling() -> None:
                 )
 
     probe = (
-        "import sys, ares.llm; "
+        "import sys, ares.ext.llm; "
         "bad = [m for m in ('duckdb', 'fastapi', 'uvicorn') if m in sys.modules]; "
         "assert not bad, f'Unexpectedly imported: {bad}'"
     )

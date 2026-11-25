@@ -6,7 +6,7 @@ import argparse
 import os
 from collections.abc import Sequence
 
-from ares.llm import OpenAICompatClient
+from ares.ext.llm import OpenAICompatClient
 from examples.long_horizon_small_context.machine import (
     BenchmarkSummary,
     MockSmallContextLLM,

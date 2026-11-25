@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ares import ArtifactStore, Done, Fail, Spawn, StateMachine, Task, TaskContext, TaskSpec
-from ares.llm import LLMMessage, OpenAICompatClient
+from ares.ext.llm import LLMMessage, OpenAICompatClient
 
 _PYTEST_TIMEOUT_S = 15
 _FAILURE_SLICE_LIMIT = 2048

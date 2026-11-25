@@ -11,7 +11,7 @@ import pytest
 
 from ares import ArtifactStore, RunBudget, TaskSpec
 from ares.cli import main as cli_main
-from ares.llm import OpenAICompatClient
+from ares.ext.llm import OpenAICompatClient
 from examples.codegen_verify_repair import TASKS, build_machine
 from examples.codegen_verify_repair.run import main as demo_main
 

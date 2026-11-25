@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ares import ArtifactStore, Done, RunBudget, Spawn, StateMachine, Task, TaskContext, TaskSpec
-from ares.llm import (
+from ares.ext.llm import (
     ContextLengthExceededError,
     LLMClient,
     LLMMessage,

@@ -17,7 +17,7 @@
 3. **Strict Boundary Hygiene:**
    - Core `ares/` depends **only** on Python stdlib + `pydantic`.
    - Zero `InvestigationBoard`, `Domain`, `SearchQuestion`, SQL/DuckDB, web servers, or mandatory LLM SDK coupling in core `ares/`.
-   - LLM adapters (`ares/llm/`) and domain tools (`duckdb`, `httpx`, `pytest` subprocesses) live strictly outside core `ares`.
+   - Optional extensions (`ares/ext/llm/`, `ares/ext/git.py`) and domain tools (`duckdb`, `httpx`, `pytest` subprocesses) live strictly outside core `ares`.
 4. **SDK-First, Thin CLI (`ares/cli.py`):**
    - `ares run`, `ares resume`, and `ares inspect` wrap the Python SDK cleanly using the standard checkpoint and event stream.
 
@@ -37,7 +37,7 @@
 
 ### Step 2: Core SDK & Optional LLM Adapter + Offline Tests
 - [x] Implement `ares/types.py` (143 LOC), `ares/store.py` (271 LOC), `ares/machine.py` (821 LOC), `ares/cli.py` (275 LOC), and `ares/__init__.py` (37 LOC) — 1,547 LOC total core.
-- [x] Implement optional `ares/llm/` (315 LOC: `LLMClient` protocol + `OpenAICompatClient` via `httpx`).
+- [x] Implement optional `ares/ext/llm/` (315 LOC: `LLMClient` protocol + `OpenAICompatClient` via `httpx`).
 - [x] Pass offline tests across `test_types_and_store.py`, `test_machine_pda.py`, `test_resume_and_suspend.py`, `test_boundary_hygiene.py`, `test_cli.py`, and `test_llm_openai_compat.py`.
 
 ### Step 3: Port 3 Flagship Examples (Abstraction Litmus Tests)

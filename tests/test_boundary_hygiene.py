@@ -8,8 +8,7 @@ import sys
 from pathlib import Path
 
 FORBIDDEN_MODULES = {
-    "ares.llm",
-    "ares.sandbox",
+    "ares.ext",
     "duckdb",
     "sql",
     "sqlite3",

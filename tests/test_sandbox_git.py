@@ -1,4 +1,4 @@
-"""Offline unit tests for ``ares.sandbox.GitWorktreeSandbox``."""
+"""Offline unit tests for ``ares.ext.git.GitWorktreeSandbox``."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ares.sandbox import CommandResult, GitWorktreeSandbox
+from ares.ext.git import CommandResult, GitWorktreeSandbox
 
 
 def _git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:

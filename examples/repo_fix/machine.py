@@ -19,8 +19,8 @@ from ares import (
     TaskContext,
     TaskSpec,
 )
-from ares.llm import LLMMessage, OpenAICompatClient
-from ares.sandbox import GitWorktreeSandbox
+from ares.ext.llm import LLMMessage, OpenAICompatClient
+from ares.ext.git import GitWorktreeSandbox
 
 _FAILURE_INLINE_LIMIT = 500
 _FAILURE_SLICE_LIMIT = 1000

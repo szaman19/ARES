@@ -20,7 +20,7 @@ ARES lets small- or bounded-context models and deterministic tools solve deep, b
 3. **Broken-Context Crash & Resume (`ares.store.CheckpointStore`)**
    - When `run_dir` is provided, every wave atomically checkpoints `state.json` and appends `events.jsonl`. `StateMachine.resume(run_dir)` resets interrupted `"running"` tasks to `"pending"` without re-running completed tasks.
 4. **Zero Bloat Core**
-   - Core `ares` depends only on `pydantic>=2.9.0`. Optional LLM adapters live in `ares.llm` (`OpenAICompatClient` with structured schema validation retries), optional git-worktree isolation lives in `ares.sandbox` (`GitWorktreeSandbox`), and domain tools (e.g., `duckdb`, `pytest` subprocesses) live strictly inside callers/examples.
+   - Core `ares` depends only on `pydantic>=2.9.0`. Reusable optional extensions live in `ares.ext` (`ares.ext.llm.OpenAICompatClient`, `ares.ext.git.GitWorktreeSandbox`) and are never imported by core `ares`, while domain tools (e.g., `duckdb`, `pytest` subprocesses) live strictly inside callers/examples.
 
 ---
 
