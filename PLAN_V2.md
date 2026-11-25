@@ -1,0 +1,53 @@
+# ARES v2 Roadmap: Automated Reasoning State Machines
+
+> **ARES = Automated Reasoning State Machines.**  
+> Pushdown-automaton (`Spawn` / `Done` / `Suspend` / `Fail`) + dependency-DAG execution for parallel reasoning, deterministic verification, and long or broken contexts — without requiring long-context frontier models.
+
+---
+
+## Core Architectural Principles
+
+1. **PDA + Dependency DAG (`ares/machine.py`):**
+   - Tasks execute in isolated local frames (`task.input` + `deps` outputs) rather than an ever-growing chat transcript.
+   - Any state handler can dynamically push subtasks and an optional continuation (`Spawn(tasks=[...], then=...)`), pop a compact result (`Done(output)`), pause (`Suspend`), or fail/retry (`Fail`).
+   - Ready tasks (all `depends_on` `"done"`) execute in parallel via `ThreadPoolExecutor` with optional `dedup_key` deduplication.
+2. **O(1) Context & Crash Resilience (`ares/store.py`):**
+   - `ArtifactStore` content-addresses large blobs and automatically spills outputs exceeding `budget.max_inline_bytes` to disk/store, passing a tiny `{__ares_ref__: ...}` handle downstream.
+   - `CheckpointStore` atomically snapshots `state.json` and appends `events.jsonl` after every wave so runs survive crashes, rate limits, and model handoffs via `StateMachine.resume(run_dir)`.
+3. **Strict Boundary Hygiene:**
+   - Core `ares/` depends **only** on Python stdlib + `pydantic`.
+   - Zero `InvestigationBoard`, `Domain`, `SearchQuestion`, SQL/DuckDB, web servers, or mandatory LLM SDK coupling in core `ares/`.
+   - LLM adapters (`ares/llm/`) and domain tools (`duckdb`, `httpx`, `pytest` subprocesses) live strictly outside core `ares`.
+4. **SDK-First, Thin CLI (`ares/cli.py`):**
+   - `ares run`, `ares resume`, and `ares inspect` wrap the Python SDK cleanly using the standard checkpoint and event stream.
+
+---
+
+## Step-by-Step Checklist
+
+### Step 0: Archive & Clean-Slate Branch (Kill Context Taint)
+- [x] Tag hackathon baseline as `v0-hackathon-archive` (`835a9d9`).
+- [x] Branch `v2/core-state-machine` from `origin/main` (`835a9d9`) and purge legacy hackathon code, docs, and skills.
+- [x] Trim `pyproject.toml` to core `pydantic` only with optional `[llm]`, `[examples]`, and `dev` extras.
+- [x] Write `PLAN_V2.md` and `docs/SPEC.md`.
+
+### Step 1: Core SDK Spec (`docs/SPEC.md`)
+- [x] Define `Task`, `TaskSpec`, `Transition` (`Done`, `Spawn`, `Suspend`, `Fail`), `RunBudget`, `Event`, `RunResult`.
+- [x] Specify PDA `Spawn(..., then=...)` waiting/popping semantics, `ArtifactStore` auto-spill, and `CheckpointStore` crash/resume guarantees.
+
+### Step 2: Core SDK & Optional LLM Adapter + Offline Tests
+- [ ] Implement `ares/types.py`, `ares/store.py`, `ares/machine.py`, `ares/cli.py`, and `ares/__init__.py`.
+- [ ] Implement optional `ares/llm/` (`LLMClient` protocol + `OpenAICompatClient` via `httpx`).
+- [ ] Pass offline tests for nested PDA `Spawn`/`then`, parallel dependency barriers, cycle detection, `dedup_key`, auto-spill, crash/suspend resume, CLI commands, and strict core import hygiene.
+
+### Step 3: Port 3 Flagship Examples (Abstraction Litmus Tests)
+- [ ] **`examples/long_horizon_small_context/`**: Tail-recursive multi-hop chain (`H=4, 8, 12`) proving O(1) bounded prompt size vs. rolling-context overflow, plus mid-chain crash/resume and `--mock` / `--base-url` support.
+- [ ] **`examples/coarse_to_fine_search/`**: 2-level dynamic `Spawn` coarse-to-fine search using `duckdb` strictly inside the example, separating 3-signal targets from 2-of-3 decoys and honest unverified cases.
+- [ ] **`examples/codegen_verify_repair/`**: Parallel competing codegen branches in isolated temp workspaces, deterministic `pytest` subprocess verification, bounded repair loop with compact/spilled failure feedback, and certified artifact selection.
+
+### Step 4: Thin CLI & Clean Documentation
+- [ ] Verify `ares run`, `ares resume`, and `ares inspect` end-to-end against example machines.
+- [ ] Write clean `README.md` centered strictly on ARES v2 PDA state machines.
+
+### Step 5: Full End-to-End Verification
+- [ ] Run full `uv run pytest -v`, all 3 example runners, and CLI smoke test on `v2/core-state-machine`.
