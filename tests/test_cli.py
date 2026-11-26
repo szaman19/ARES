@@ -219,3 +219,75 @@ def test_cli_artifact_tree_and_token_budget(
     rc_art_missing = main(["artifact", str(run_dir), "art_missing"])
     assert rc_art_missing == 1
     assert "Error:" in capsys.readouterr().err
+
+
+def test_cli_inspect_tail_and_tree_det_arts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mod_source = '''\
+from ares import Done, Spawn, StateMachine, Task, TaskContext, TaskSpec
+
+machine = StateMachine()
+
+
+@machine.state("root", deterministic=True)
+def root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+    ctx.emit("trace", {"note": "start"})
+    return Spawn(
+        tasks=[TaskSpec(id=f"w{i}", state="worker", input={"i": i}) for i in range(4)],
+        then=TaskSpec(id="agg", state="agg"),
+    )
+
+
+@machine.state("worker")
+def worker(task: Task, deps: dict, ctx: TaskContext) -> Done:
+    ref = ctx.store.put_text(f"payload-{task.input['i']}")
+    return Done(output=task.input["i"], artifacts=[ref])
+
+
+@machine.state("agg", deterministic=True)
+def agg(task: Task, deps: dict, ctx: TaskContext) -> Done:
+    return Done(output=sum(deps.values()))
+'''
+    mod_name = "temp_tail_machine"
+    (tmp_path / f"{mod_name}.py").write_text(mod_source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    run_dir = tmp_path / "tail_run"
+
+    rc_run = main(
+        [
+            "run",
+            f"{mod_name}:machine",
+            "--state",
+            "root",
+            "--id",
+            "root_1",
+            "--run-dir",
+            str(run_dir),
+            "--json",
+        ]
+    )
+    assert rc_run == 0
+    capsys.readouterr()
+
+    # Default --tail 10 hides earliest events when total > 10.
+    assert main(["inspect", str(run_dir), "--tree"]) == 0
+    default_out = capsys.readouterr().out
+    assert "root_1 [root] (done)" in default_out
+    assert " det" in default_out
+    assert "arts=1" in default_out
+    assert "[   1] " not in default_out
+
+    # --tail 3 shows only the last 3 events.
+    assert main(["inspect", str(run_dir), "--tail", "3"]) == 0
+    tail3_out = capsys.readouterr().out
+    event_lines = [ln for ln in tail3_out.splitlines() if ln.strip().startswith("[")]
+    assert len(event_lines) == 3
+
+    # --tail 0 shows all events starting from [   1].
+    assert main(["inspect", str(run_dir), "--tail", "0"]) == 0
+    tail_all_out = capsys.readouterr().out
+    assert "[   1] " in tail_all_out
+    assert "trace" in tail_all_out

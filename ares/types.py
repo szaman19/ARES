@@ -89,6 +89,8 @@ class Task(BaseModel):
     complete_on_resume: bool = False
     resume_data: Any = None
     spilled_artifact_id: str | None = None
+    deterministic: bool = False
+    artifact_refs: list[ArtifactRef] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
     metadata: dict[str, Any] = Field(default_factory=dict)
     duration_ms: float = 0.0
@@ -159,6 +161,7 @@ EventType = Literal[
     "task_cancelled",
     "checkpoint_saved",
     "run_finished",
+    "trace",
 ]
 
 

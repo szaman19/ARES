@@ -474,6 +474,22 @@ def build_machine(
                 temperature=0.0,
                 max_tokens=128,
             )
+            if response.usage.total_tokens > 0:
+                ctx.record_usage(
+                    prompt_tokens=response.usage.prompt_tokens,
+                    completion_tokens=response.usage.completion_tokens,
+                    total_tokens=response.usage.total_tokens,
+                    llm_calls=1,
+                )
+            else:
+                est_prompt = max(1, len(prompt) // 4)
+                est_completion = max(1, len(response.text) // 4)
+                ctx.record_usage(
+                    prompt_tokens=est_prompt,
+                    completion_tokens=est_completion,
+                    total_tokens=est_prompt + est_completion,
+                    llm_calls=1,
+                )
             extraction = _parse_extraction(response)
             if extraction.next_token or extraction.terminal:
                 break

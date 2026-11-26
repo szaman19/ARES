@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ares import ArtifactStore, Done, Fail, Spawn, StateMachine, Task, TaskContext, TaskSpec
-from ares.ext.llm import LLMMessage, OpenAICompatClient
+from ares.ext.llm import LLMMessage, LLMUsage, OpenAICompatClient
 
 _PYTEST_TIMEOUT_S = 15
 _FAILURE_SLICE_LIMIT = 2048
@@ -250,7 +250,7 @@ def _llm_generate(
     attempt: int,
     failure_summary: str,
     prev_code: str | None,
-) -> str:
+) -> tuple[str, LLMUsage]:
     """Generate or repair Python module source via an OpenAICompatClient."""
     branch_temps = {"branch_0": 0.0, "branch_1": 0.2, "branch_2": 0.4}
     temperature = branch_temps.get(branch_id, 0.2)
@@ -274,7 +274,7 @@ def _llm_generate(
         system=system,
         temperature=temperature,
     )
-    return _strip_python_fences(resp.text)
+    return _strip_python_fences(resp.text), resp.usage
 
 
 def _unwrap_dep(value: Any, store: ArtifactStore) -> Any:
@@ -363,8 +363,16 @@ def build_machine(
 
         if llm is None:
             source = _offline_generate(task_name, branch_id, attempt, failure_summary)
+            est_prompt = max(1, (len(TASKS[task_name].spec_text) + len(failure_summary)) // 4)
+            est_completion = max(1, len(source) // 4)
+            ctx.record_usage(
+                prompt_tokens=est_prompt,
+                completion_tokens=est_completion,
+                total_tokens=est_prompt + est_completion,
+                llm_calls=1,
+            )
         else:
-            source = _llm_generate(
+            source, usage = _llm_generate(
                 llm,
                 TASKS[task_name],
                 branch_id,
@@ -372,6 +380,22 @@ def build_machine(
                 failure_summary,
                 prev_code,
             )
+            if usage.total_tokens > 0:
+                ctx.record_usage(
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                    total_tokens=usage.total_tokens,
+                    llm_calls=1,
+                )
+            else:
+                est_prompt = max(1, (len(TASKS[task_name].spec_text) + len(failure_summary)) // 4)
+                est_completion = max(1, len(source) // 4)
+                ctx.record_usage(
+                    prompt_tokens=est_prompt,
+                    completion_tokens=est_completion,
+                    total_tokens=est_prompt + est_completion,
+                    llm_calls=1,
+                )
 
         code_ref = ctx.store.put_text(
             source,

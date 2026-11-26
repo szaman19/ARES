@@ -9,13 +9,16 @@ from pathlib import Path
 import pytest
 
 from ares import (
+    ArtifactRef,
     ArtifactStore,
+    CheckpointStore,
     Done,
     Event,
     Fail,
     RunBudget,
     Spawn,
     StateMachine,
+    Suspend,
     Task,
     TaskContext,
     TaskSpec,
@@ -615,3 +618,111 @@ def test_usage_recording_and_token_cost_budgets() -> None:
         budget=RunBudget(max_cost_usd=0.03),
     )
     assert cost_res.status == "budget_exceeded"
+
+
+def test_trace_events_done_artifacts_metadata_and_deterministic(tmp_path: Path) -> None:
+    machine = StateMachine()
+    events: list[Event] = []
+
+    @machine.state("det_root", deterministic=True)
+    def det_root(task: Task, deps: dict, ctx: TaskContext) -> Spawn:
+        ctx.emit("trace", {"phase": "root_enter", "step": 1})
+        return Spawn(
+            tasks=[TaskSpec(id="worker", state="nondet_worker", metadata={"origin": "root"})],
+            then=TaskSpec(id="det_join", state="det_join"),
+            metadata={"spawned_by": "det_root"},
+        )
+
+    @machine.state("nondet_worker")
+    def nondet_worker(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        ref1 = ctx.store.put_text("artifact one", name="one.txt")
+        ref2 = ctx.store.put_text("artifact two", name="two.txt")
+        ctx.emit("trace", {"phase": "worker_artifacts", "count": 2})
+        return Done(
+            output="work_done",
+            artifacts=[ref1, ref1, ref2],
+            metadata={"worker_status": "ok"},
+        )
+
+    @machine.state("det_join", deterministic=True)
+    def det_join(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        return Done(output=f"joined:{deps['worker']}", metadata={"finalized": True})
+
+    run_dir = tmp_path / "obs_run"
+    res = machine.run(
+        TaskSpec(id="root", state="det_root", metadata={"seed": 7}),
+        run_dir=run_dir,
+        on_event=events.append,
+    )
+    assert res.status == "done"
+    assert res.output == "joined:work_done"
+
+    # deterministic flag propagated from @machine.state(..., deterministic=True)
+    assert res.tasks["root"].deterministic is True
+    assert res.tasks["worker"].deterministic is False
+    assert res.tasks["det_join"].deterministic is True
+
+    # Transition.metadata merged onto Task.metadata across Spawn and Done
+    assert res.tasks["root"].metadata == {"seed": 7, "spawned_by": "det_root"}
+    assert res.tasks["worker"].metadata == {"origin": "root", "worker_status": "ok"}
+    assert res.tasks["det_join"].metadata == {"finalized": True}
+
+    # Done.artifacts persisted and deduped by ref_id on Task.artifact_refs
+    worker_refs = res.tasks["worker"].artifact_refs
+    assert len(worker_refs) == 2
+    assert all(isinstance(r, ArtifactRef) for r in worker_refs)
+    assert len({r.ref_id for r in worker_refs}) == 2
+
+    # Trace events & task_done artifacts payload recorded both in callback and events.jsonl
+    trace_events = [ev for ev in events if ev.event_type == "trace"]
+    assert [(ev.task_id, ev.payload) for ev in trace_events] == [
+        ("root", {"phase": "root_enter", "step": 1}),
+        ("worker", {"phase": "worker_artifacts", "count": 2}),
+    ]
+    worker_done_ev = next(
+        ev for ev in events if ev.event_type == "task_done" and ev.task_id == "worker"
+    )
+    assert "artifacts" in worker_done_ev.payload
+    assert set(worker_done_ev.payload["artifacts"]) == {r.ref_id for r in worker_refs}
+
+    persisted_events = CheckpointStore(run_dir).load_events()
+    assert any(ev.event_type == "trace" for ev in persisted_events)
+
+    # Verify Suspend and Fail also merge Transition.metadata
+    sf_machine = StateMachine()
+
+    @sf_machine.state("suspend_then_fail")
+    def suspend_then_fail(task: Task, deps: dict, ctx: TaskContext):
+        if ctx.resume_data is None:
+            return Suspend(reason="pause", resume_key="k", metadata={"paused": True})
+        return Fail(error="rejected", metadata={"failed_after_resume": True})
+
+    sf_dir = tmp_path / "sf_run"
+    r_susp = sf_machine.run(TaskSpec(id="sf", state="suspend_then_fail"), run_dir=sf_dir)
+    assert r_susp.status == "suspended"
+    assert r_susp.tasks["sf"].metadata == {"paused": True}
+
+    r_fail = sf_machine.resume(sf_dir, resume_inputs={"k": "reject"})
+    assert r_fail.status == "failed"
+    assert r_fail.tasks["sf"].metadata == {"paused": True, "failed_after_resume": True}
+
+
+def test_fresh_run_resets_stale_events_jsonl_in_reused_run_dir(tmp_path: Path) -> None:
+    machine = StateMachine()
+
+    @machine.state("echo")
+    def echo(task: Task, deps: dict, ctx: TaskContext) -> Done:
+        return Done(output=task.input["val"])
+
+    run_dir = tmp_path / "reused_dir"
+    r1 = machine.run(TaskSpec(id="first_root", state="echo", input={"val": 1}), run_dir=run_dir)
+    assert r1.status == "done"
+    ev1 = CheckpointStore(run_dir).load_events()
+    assert any(ev.task_id == "first_root" for ev in ev1)
+
+    r2 = machine.run(TaskSpec(id="second_root", state="echo", input={"val": 2}), run_dir=run_dir)
+    assert r2.status == "done"
+    ev2 = CheckpointStore(run_dir).load_events()
+    assert ev2[0].seq == 1
+    assert all(ev.task_id != "first_root" for ev in ev2)
+    assert any(ev.task_id == "second_root" for ev in ev2)

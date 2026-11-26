@@ -29,6 +29,7 @@ class LLMResponse(BaseModel):
 
     text: str
     parsed: Any = None
+    reasoning: str | None = None
     usage: LLMUsage = Field(default_factory=LLMUsage)
     raw: dict[str, Any] = Field(default_factory=dict)
 

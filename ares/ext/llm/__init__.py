@@ -8,6 +8,7 @@ from ares.ext.llm.base import (
     LLMUsage,
 )
 from ares.ext.llm.openai_compat import OpenAICompatClient
+from ares.ext.llm.tracing import TracedLLMClient
 
 __all__ = [
     "ContextLengthExceededError",
@@ -16,4 +17,5 @@ __all__ = [
     "LLMResponse",
     "LLMUsage",
     "OpenAICompatClient",
+    "TracedLLMClient",
 ]

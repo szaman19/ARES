@@ -273,6 +273,7 @@ class _RunSession:
 
         for spec, tid in zip(specs, assigned_ids, strict=True):
             deps = list(dict.fromkeys(spec.depends_on))
+            cfg = self.machine._states.get(spec.state)
             new_tasks[tid] = Task(
                 id=tid,
                 state=spec.state,
@@ -281,6 +282,7 @@ class _RunSession:
                 parent_id=parent_id,
                 depth=depth,
                 dedup_key=spec.dedup_key,
+                deterministic=bool(cfg.deterministic) if cfg is not None else False,
                 metadata=dict(spec.metadata),
             )
 
@@ -292,6 +294,7 @@ class _RunSession:
             else:
                 then_deps = list(dict.fromkeys([*then_spec.depends_on, *assigned_ids]))
                 then_status = "pending"
+            then_cfg = self.machine._states.get(then_spec.state)
             then_task = Task(
                 id=then_id,
                 state=then_spec.state,
@@ -301,6 +304,7 @@ class _RunSession:
                 depth=eff_then_depth,
                 status=then_status,
                 dedup_key=then_spec.dedup_key,
+                deterministic=bool(then_cfg.deterministic) if then_cfg is not None else False,
                 metadata=dict(then_spec.metadata),
             )
             new_tasks[then_id] = then_task
@@ -619,6 +623,9 @@ class _RunSession:
         return transition, elapsed_ms, ctx.recorded_usage()
 
     def _apply_transition(self, task: Task, transition: Transition) -> None:
+        if transition.metadata:
+            task.metadata.update(transition.metadata)
+
         if isinstance(transition, Done):
             output_val, ref = self.store.maybe_spill(
                 transition.output,
@@ -627,12 +634,23 @@ class _RunSession:
             task.output = output_val
             if ref is not None:
                 task.spilled_artifact_id = ref.ref_id
+            if transition.artifacts:
+                seen_ref_ids = {existing.ref_id for existing in task.artifact_refs}
+                for art_ref in transition.artifacts:
+                    if art_ref.ref_id not in seen_ref_ids:
+                        task.artifact_refs.append(art_ref)
+                        seen_ref_ids.add(art_ref.ref_id)
             task.error = None
             task.status = "done"
+            done_payload: dict[str, Any] = {
+                "spilled": ref.ref_id if ref is not None else None,
+            }
+            if transition.artifacts:
+                done_payload["artifacts"] = [a.ref_id for a in transition.artifacts]
             self.emit(
                 "task_done",
                 task_id=task.id,
-                payload={"spilled": ref.ref_id if ref is not None else None},
+                payload=done_payload,
             )
             return
 
@@ -918,6 +936,8 @@ class StateMachine:
             run_path = Path(run_dir)
             resolved_run_dir = str(run_path)
             checkpoint = CheckpointStore(run_path)
+            if checkpoint.events_path.exists():
+                checkpoint.events_path.write_text("", encoding="utf-8")
             store = ArtifactStore(run_path / "artifacts")
         else:
             store = ArtifactStore(None)

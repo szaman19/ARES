@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
 from ares import ArtifactStore, TaskSpec
+from ares.ext.llm import OpenAICompatClient
 from examples.repo_fix.fixture import create_sample_repo
 from examples.repo_fix.machine import build_machine
 
@@ -24,14 +26,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ARES repo_fix multi-file GitWorktreeSandbox demo")
     parser.add_argument("--no-race", action="store_true", help="Disable join='any' sibling cancellation")
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument(
+        "--mock",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use deterministic offline patcher (default: True unless --base-url is set).",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="OpenAI-compatible base URL when running with --no-mock.",
+    )
+    parser.add_argument(
+        "--model",
+        default="qwen2.5:3b",
+        help="Model name for OpenAICompatClient when running with --no-mock.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    use_mock = (args.base_url is None) if args.mock is None else bool(args.mock)
+    llm: OpenAICompatClient | None = None
+    if not use_mock:
+        llm = OpenAICompatClient(
+            base_url=args.base_url or "http://localhost:11434/v1",
+            model=args.model,
+            api_key=os.environ.get("OPENAI_API_KEY"),
+        )
 
     with tempfile.TemporaryDirectory(prefix="ares_repo_fix_") as tmpdir:
         tmp_path = Path(tmpdir)
         repo_dir = create_sample_repo(tmp_path / "sample_repo")
         run_dir = tmp_path / "ares_run"
 
-        machine = build_machine(max_attempts=args.max_attempts, race=not args.no_race)
+        machine = build_machine(llm=llm, max_attempts=args.max_attempts, race=not args.no_race)
         res = machine.run(
             TaskSpec(state="locate", input={"repo_dir": str(repo_dir)}),
             run_dir=run_dir,

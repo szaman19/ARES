@@ -15,14 +15,14 @@
 - **`Usage`**: `prompt_tokens`, `completion_tokens`, `total_tokens`, `llm_calls`, `cost_usd` (with `.add()` / `+` helper).
 - **`ArtifactRef`** *(frozen)*: `ref_id`, `sha256`, `byte_size`, `mime_type`, `preview`, `path`
 - **`TaskSpec`**: `id: str | None = None`, `state: str`, `input: dict[str, Any] = {}`, `depends_on: list[str] = []`, `dedup_key: str | None = None`, `metadata: dict[str, Any] = {}`
-- **`Task`**: runtime frame including `id`, `state`, `input`, `depends_on`, `parent_id`, `depth`, `status`, `output`, `error`, `attempts`, `dedup_key`, `join_mode`, `continuation_id`, `wait_for`, `suspend_reason`, `resume_key`, `complete_on_resume`, `resume_data`, `spilled_artifact_id`, `usage`, `metadata`, `duration_ms`.
+- **`Task`**: runtime frame including `id`, `state`, `input`, `depends_on`, `parent_id`, `depth`, `status`, `output`, `error`, `attempts`, `dedup_key`, `join_mode`, `continuation_id`, `wait_for`, `suspend_reason`, `resume_key`, `complete_on_resume`, `resume_data`, `spilled_artifact_id`, `deterministic`, `artifact_refs`, `usage`, `metadata`, `duration_ms`.
 - **`Transition`** *(discriminated union)*:
-  - `Done(output=None, artifacts=[], usage=None, metadata={})` — Pop current task as `"done"`.
-  - `Spawn(tasks=[], then=None, join="all", metadata={})` — Push child tasks and optional continuation `then`.
-  - `Suspend(reason, resume_key=None, complete_on_resume=False, metadata={})` — Pause task cleanly.
-  - `Fail(error, retryable=False, metadata={})` — Fail or retry up to `max_retries`.
+  - `Done(output=None, artifacts=[], usage=None, metadata={})` — Pop current task as `"done"`, merging `artifacts` onto `Task.artifact_refs` (deduped by `ref_id`) and `metadata` onto `Task.metadata`.
+  - `Spawn(tasks=[], then=None, join="all", metadata={})` — Push child tasks and optional continuation `then`, merging `metadata` onto `Task.metadata`.
+  - `Suspend(reason, resume_key=None, complete_on_resume=False, metadata={})` — Pause task cleanly, merging `metadata` onto `Task.metadata`.
+  - `Fail(error, retryable=False, metadata={})` — Fail or retry up to `max_retries`, merging `metadata` onto `Task.metadata`.
 - **`RunBudget`**: `max_tasks=500`, `max_depth=32`, `max_wall_clock_s=300.0`, `max_inline_bytes=4096`, `max_tokens=None`, `max_cost_usd=None`.
-- **`Event`**: `seq`, `timestamp`, `event_type` (includes `"task_cancelled"`), `task_id`, `payload`.
+- **`Event`**: `seq`, `timestamp`, `event_type` (`"task_enqueued"`, `"task_started"`, `"task_spawned"`, `"task_done"`, `"task_deduped"`, `"task_retried"`, `"task_suspended"`, `"task_failed"`, `"task_cancelled"`, `"checkpoint_saved"`, `"run_finished"`, `"trace"`), `task_id`, `payload`.
 - **`RunResult`**: `run_id`, `status` (`"done" | "suspended" | "failed" | "budget_exceeded"`), `root_task_id`, `output`, `tasks`, `suspended_task_ids`, `failed_task_ids`, `cancelled_task_ids`, `usage`, `run_dir`, `wall_clock_ms`.
 
 ## 3. PDA `Spawn`, Tail-Call Depth & Race Semantics (`ares/machine.py`)
@@ -32,7 +32,7 @@ Handler signature:
 def handler(task: Task, deps: dict[str, Any], ctx: TaskContext) -> Transition: ...
 ```
 - `deps` maps each `dep_id` in `task.depends_on` to `tasks[dep_id].output` (auto-spilled handles when large).
-- Handlers can record incremental LLM telemetry via `ctx.record_usage(prompt_tokens=..., completion_tokens=..., llm_calls=..., cost_usd=...)` (or `Done(usage=...)`), accumulated onto `Task.usage` and `RunResult.usage`.
+- Handlers can record incremental LLM telemetry via `ctx.record_usage(prompt_tokens=..., completion_tokens=..., total_tokens=..., llm_calls=..., cost_usd=...)` (or `Done(usage=...)`), accumulated onto `Task.usage` and `RunResult.usage`, and emit structured diagnostic traces via `ctx.emit("trace", payload={...})`.
 
 When task `T` returns `Spawn(tasks=children, then=K, join=...)`:
 1. **`children` non-empty, `then=K` present, `join="all"`**:
@@ -64,4 +64,15 @@ When task `T` returns `Spawn(tasks=children, then=K, join=...)`:
 ## 5. Long & Broken Contexts (`ares/store.py`)
 
 - **`ArtifactStore`**: Content-addressed store (in-memory or `<run_dir>/artifacts/`) with `maybe_spill()` auto-spilling outputs larger than `max_inline_bytes` and `read_slice()` / `get_text()` / `get_json()`.
-- **`CheckpointStore`**: Atomic `<run_dir>/state.json` + append-only `<run_dir>/events.jsonl` after every wave; `StateMachine.resume(run_dir, resume_inputs=...)` recovers `"running"` tasks and wakes matching `"suspended"` tasks.
+- **`CheckpointStore`**: Atomic `<run_dir>/state.json` + append-only `<run_dir>/events.jsonl` after every wave; a fresh `StateMachine.run(..., run_dir=...)` truncates any stale `events.jsonl` in a reused directory, whereas `StateMachine.resume(run_dir, resume_inputs=...)` appends to the prior event log, recovers `"running"` tasks, and wakes matching `"suspended"` tasks.
+
+## 6. Thin CLI (`ares/cli.py`) & Optional Extensions (`ares/ext/`)
+
+- **CLI subcommands**:
+  - `ares run <module:attr> --state <state> [--input JSON] [--run-dir DIR] [--max-tasks N] [--max-inline-bytes N] [--max-tokens N] [--max-cost-usd F] [--json]`
+  - `ares resume <run_dir> --machine <module:attr> [--provide KEY=JSON ...] [--json]`
+  - `ares inspect <run_dir> [--tree] [--tail N] [--json]` (shows usage, DAG tree with `det` / `arts=N` / `ref=...` tags, artifacts, and trailing events; `--tail 0` prints all events)
+  - `ares artifact <run_dir> <ref_id> [--offset N] [--limit N]`
+- **Optional extensions** (strictly outside core `ares`):
+  - `ares.ext.llm`: `LLMClient` protocol, `LLMMessage`, `LLMResponse`, `LLMUsage`, `ContextLengthExceededError`, `OpenAICompatClient`, and tracing helpers.
+  - `ares.ext.git`: `GitWorktreeSandbox` for isolated ephemeral `git worktree` execution, unified diff extraction, patch application, and cleanup.

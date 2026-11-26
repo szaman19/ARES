@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -39,6 +40,10 @@ _FENCE_RE = re.compile(
     r"```(?:json)?\s*\n?(.*?)\n?```",
     re.DOTALL | re.IGNORECASE,
 )
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+
+_NON_RETRYABLE_STATUSES: frozenset[int] = frozenset({400, 401, 403, 404, 422})
 
 
 def _strip_json_fences(text: str) -> str:
@@ -96,16 +101,37 @@ def _append_schema_instructions(
     return updated
 
 
-def _extract_text(data: dict[str, Any]) -> str:
-    """Extract assistant text content from an OpenAI chat completion payload."""
+def _extract_reasoning_and_text(data: dict[str, Any]) -> tuple[str, str | None]:
+    """Extract visible text and optional reasoning trace from an OpenAI completion payload."""
     choices = data.get("choices") or []
     if not choices:
-        return ""
+        return "", None
     message = choices[0].get("message") or {}
     content = message.get("content")
-    if content is None:
-        return ""
-    return str(content)
+    raw_text = "" if content is None else str(content)
+
+    reasoning_parts: list[str] = []
+    raw_reasoning = message.get("reasoning_content") or message.get("reasoning")
+    if raw_reasoning is not None:
+        stripped_reasoning = str(raw_reasoning).strip()
+        if stripped_reasoning:
+            reasoning_parts.append(stripped_reasoning)
+
+    think_matches = _THINK_RE.findall(raw_text)
+    for match in think_matches:
+        stripped_think = match.strip()
+        if stripped_think and stripped_think not in reasoning_parts:
+            reasoning_parts.append(stripped_think)
+
+    visible_text = _THINK_RE.sub("", raw_text).strip() if think_matches else raw_text
+    reasoning = "\n\n".join(reasoning_parts) if reasoning_parts else None
+    return visible_text, reasoning
+
+
+def _extract_text(data: dict[str, Any]) -> str:
+    """Extract assistant text content from an OpenAI chat completion payload."""
+    text, _ = _extract_reasoning_and_text(data)
+    return text
 
 
 def _extract_usage(data: dict[str, Any], latency_ms: float) -> LLMUsage:
@@ -133,6 +159,9 @@ class OpenAICompatClient:
         timeout_s: float = 60.0,
         reasoning_effort: str | None = None,
         max_validation_retries: int = 1,
+        max_http_retries: int = 2,
+        retry_backoff_s: float = 0.05,
+        retry_statuses: tuple[int, ...] = (429, 500, 502, 503, 504),
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -142,7 +171,34 @@ class OpenAICompatClient:
         self.timeout_s = timeout_s
         self.reasoning_effort = reasoning_effort
         self.max_validation_retries = max(0, int(max_validation_retries))
+        self.max_http_retries = max(0, int(max_http_retries))
+        self.retry_backoff_s = max(0.0, float(retry_backoff_s))
+        self.retry_statuses = tuple(retry_statuses)
         self.transport = transport
+        self._client: httpx.Client | None = None
+        self._client_lock = threading.Lock()
+
+    def _get_client(self) -> httpx.Client:
+        with self._client_lock:
+            if self._client is None or self._client.is_closed:
+                self._client = httpx.Client(
+                    timeout=self.timeout_s,
+                    transport=self.transport,
+                )
+            return self._client
+
+    def close(self) -> None:
+        """Close the pooled ``httpx.Client`` if currently open."""
+        with self._client_lock:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
+
+    def __enter__(self) -> OpenAICompatClient:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -172,6 +228,40 @@ class OpenAICompatClient:
             headers=self._headers(),
             json=payload,
         )
+
+    def _should_retry_status(self, status_code: int) -> bool:
+        if status_code in _NON_RETRYABLE_STATUSES:
+            return False
+        return status_code in self.retry_statuses
+
+    def _post_with_retry(
+        self,
+        client: httpx.Client,
+        payload: dict[str, Any],
+    ) -> httpx.Response:
+        for attempt in range(self.max_http_retries + 1):
+            try:
+                resp = self._post(client, payload)
+            except httpx.TransportError:
+                if attempt >= self.max_http_retries:
+                    raise
+                if self.retry_backoff_s > 0:
+                    time.sleep(self.retry_backoff_s * (2**attempt))
+                continue
+
+            if _is_context_length_error(resp.status_code, resp.text):
+                raise ContextLengthExceededError(
+                    f"Context length exceeded (HTTP {resp.status_code}): {resp.text}"
+                )
+
+            if self._should_retry_status(resp.status_code) and attempt < self.max_http_retries:
+                if self.retry_backoff_s > 0:
+                    time.sleep(self.retry_backoff_s * (2**attempt))
+                continue
+
+            return resp
+
+        raise RuntimeError("Unreachable OpenAICompatClient HTTP retry exit")
 
     def complete(
         self,
@@ -211,81 +301,74 @@ class OpenAICompatClient:
         current_messages = list(serialized_messages)
         max_attempts = 1 + (self.max_validation_retries if response_model is not None else 0)
 
-        with httpx.Client(timeout=self.timeout_s, transport=self.transport) as client:
-            for attempt in range(max_attempts):
-                t0 = time.perf_counter()
-                req_messages = (
-                    current_messages
-                    if (use_response_format or response_model is None)
-                    else _append_schema_instructions(current_messages, response_model)
+        client = self._get_client()
+        for attempt in range(max_attempts):
+            t0 = time.perf_counter()
+            req_messages = (
+                current_messages
+                if (use_response_format or response_model is None)
+                else _append_schema_instructions(current_messages, response_model)
+            )
+            payload = _make_payload(req_messages, with_schema_fmt=use_response_format)
+            resp = self._post_with_retry(client, payload)
+
+            if (
+                response_model is not None
+                and use_response_format
+                and _is_response_format_rejected(resp.status_code, resp.text)
+            ):
+                use_response_format = False
+                fallback_payload = _make_payload(
+                    _append_schema_instructions(current_messages, response_model),
+                    with_schema_fmt=False,
                 )
-                payload = _make_payload(req_messages, with_schema_fmt=use_response_format)
-                resp = self._post(client, payload)
+                resp = self._post_with_retry(client, fallback_payload)
 
-                if _is_context_length_error(resp.status_code, resp.text):
-                    raise ContextLengthExceededError(
-                        f"Context length exceeded (HTTP {resp.status_code}): {resp.text}"
-                    )
+            resp.raise_for_status()
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            data: dict[str, Any] = resp.json()
+            step_usage = _extract_usage(data, latency_ms)
+            total_usage = LLMUsage(
+                prompt_tokens=total_usage.prompt_tokens + step_usage.prompt_tokens,
+                completion_tokens=total_usage.completion_tokens + step_usage.completion_tokens,
+                total_tokens=total_usage.total_tokens + step_usage.total_tokens,
+                latency_ms=round(total_usage.latency_ms + step_usage.latency_ms, 3),
+            )
+            text, reasoning = _extract_reasoning_and_text(data)
 
-                if (
-                    response_model is not None
-                    and use_response_format
-                    and _is_response_format_rejected(resp.status_code, resp.text)
-                ):
-                    use_response_format = False
-                    fallback_payload = _make_payload(
-                        _append_schema_instructions(current_messages, response_model),
-                        with_schema_fmt=False,
-                    )
-                    resp = self._post(client, fallback_payload)
-                    if _is_context_length_error(resp.status_code, resp.text):
-                        raise ContextLengthExceededError(
-                            f"Context length exceeded (HTTP {resp.status_code}): {resp.text}"
-                        )
-
-                resp.raise_for_status()
-                latency_ms = (time.perf_counter() - t0) * 1000.0
-                data: dict[str, Any] = resp.json()
-                step_usage = _extract_usage(data, latency_ms)
-                total_usage = LLMUsage(
-                    prompt_tokens=total_usage.prompt_tokens + step_usage.prompt_tokens,
-                    completion_tokens=total_usage.completion_tokens + step_usage.completion_tokens,
-                    total_tokens=total_usage.total_tokens + step_usage.total_tokens,
-                    latency_ms=round(total_usage.latency_ms + step_usage.latency_ms, 3),
+            if response_model is None:
+                return LLMResponse(
+                    text=text,
+                    parsed=None,
+                    reasoning=reasoning,
+                    usage=total_usage,
+                    raw=data,
                 )
-                text = _extract_text(data)
 
-                if response_model is None:
-                    return LLMResponse(
-                        text=text,
-                        parsed=None,
-                        usage=total_usage,
-                        raw=data,
-                    )
-
-                cleaned = _strip_json_fences(text)
-                try:
-                    parsed = response_model.model_validate(json.loads(cleaned))
-                    return LLMResponse(
-                        text=text,
-                        parsed=parsed,
-                        usage=total_usage,
-                        raw=data,
-                    )
-                except (json.JSONDecodeError, ValidationError) as exc:
-                    if attempt + 1 >= max_attempts:
-                        raise
-                    schema_json = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
-                    current_messages = [
-                        *current_messages,
-                        {"role": "assistant", "content": text},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Your previous output failed JSON/schema validation ({exc}). "
-                                f"Return ONLY valid JSON matching schema: {schema_json}"
-                            ),
-                        },
-                    ]
+            cleaned = _strip_json_fences(text)
+            try:
+                parsed = response_model.model_validate(json.loads(cleaned))
+                return LLMResponse(
+                    text=text,
+                    parsed=parsed,
+                    reasoning=reasoning,
+                    usage=total_usage,
+                    raw=data,
+                )
+            except (json.JSONDecodeError, ValidationError) as exc:
+                if attempt + 1 >= max_attempts:
+                    raise
+                schema_json = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+                current_messages = [
+                    *current_messages,
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Your previous output failed JSON/schema validation ({exc}). "
+                            f"Return ONLY valid JSON matching schema: {schema_json}"
+                        ),
+                    },
+                ]
 
         raise RuntimeError("Unreachable OpenAICompatClient completion loop exit")

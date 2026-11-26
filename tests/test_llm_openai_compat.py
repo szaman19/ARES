@@ -324,3 +324,206 @@ def test_structured_validation_retries_zero_raises_immediately() -> None:
             response_model=_StructuredAnswer,
         )
     assert calls == 1
+
+
+def test_think_block_stripping_and_reasoning_capture_plain_text() -> None:
+    """Strip ``<think>`` blocks from ``response.text`` while preserving ``response.reasoning``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "<THINK>\nFirst step.\nSecond step.\n</THINK>\n\n"
+                                "def add(a, b):\n    return a + b"
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 20, "total_tokens": 32},
+            },
+        )
+
+    client = OpenAICompatClient(transport=httpx.MockTransport(handler))
+    resp = client.complete([LLMMessage(role="user", content="Write add")])
+    assert resp.text == "def add(a, b):\n    return a + b"
+    assert resp.reasoning == "First step.\nSecond step."
+
+
+def test_think_block_stripping_with_structured_response_model() -> None:
+    """Ensure ``<think>`` blocks are stripped before JSON parsing for ``response_model``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "<think>Computing answer carefully...</think>\n"
+                                '```json\n{"answer": "42", "confidence": 0.99}\n```'
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 15, "completion_tokens": 25, "total_tokens": 40},
+            },
+        )
+
+    client = OpenAICompatClient(transport=httpx.MockTransport(handler))
+    resp = client.complete(
+        [LLMMessage(role="user", content="Answer?")],
+        response_model=_StructuredAnswer,
+    )
+    assert "<think>" not in resp.text
+    assert resp.reasoning == "Computing answer carefully..."
+    assert resp.parsed == _StructuredAnswer(answer="42", confidence=0.99)
+
+
+def test_reasoning_content_and_reasoning_field_extraction() -> None:
+    """Extract ``reasoning_content`` / ``reasoning`` fields and combine with ``<think>`` blocks."""
+    from ares.ext.llm.openai_compat import _extract_reasoning_and_text
+
+    text1, reason1 = _extract_reasoning_and_text(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "final result",
+                        "reasoning_content": "deepseek chain of thought",
+                    }
+                }
+            ]
+        }
+    )
+    assert text1 == "final result"
+    assert reason1 == "deepseek chain of thought"
+
+    text2, reason2 = _extract_reasoning_and_text(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "<think>inline thought</think>\nvisible",
+                        "reasoning": "provider thought",
+                    }
+                }
+            ]
+        }
+    )
+    assert text2 == "visible"
+    assert reason2 == "provider thought\n\ninline thought"
+
+    text3, reason3 = _extract_reasoning_and_text(
+        {"choices": [{"message": {"role": "assistant", "content": "plain"}}]}
+    )
+    assert text3 == "plain"
+    assert reason3 is None
+
+
+def test_transient_http_retry_recovers_on_429_503_and_transport_error() -> None:
+    """Retry transient 429/503 responses and ``httpx.TransportError`` with backoff."""
+    attempts = 0
+
+    def status_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, json={"error": "rate limit"})
+        if attempts == 2:
+            return httpx.Response(503, json={"error": "service unavailable"})
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "recovered"}}]},
+        )
+
+    client = OpenAICompatClient(
+        max_http_retries=2,
+        retry_backoff_s=0.001,
+        transport=httpx.MockTransport(status_handler),
+    )
+    resp = client.complete([LLMMessage(role="user", content="hi")])
+    assert resp.text == "recovered"
+    assert attempts == 3
+
+    transport_attempts = 0
+
+    def transport_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal transport_attempts
+        transport_attempts += 1
+        if transport_attempts == 1:
+            raise httpx.ConnectError("transient network drop", request=request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok-after-drop"}}]},
+        )
+
+    client2 = OpenAICompatClient(
+        max_http_retries=1,
+        retry_backoff_s=0.001,
+        transport=httpx.MockTransport(transport_handler),
+    )
+    resp2 = client2.complete([LLMMessage(role="user", content="hi")])
+    assert resp2.text == "ok-after-drop"
+    assert transport_attempts == 2
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+def test_non_retryable_status_codes_are_not_retried(status_code: int) -> None:
+    """Never retry non-transient 4xx status codes."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status_code, json={"error": "bad request"})
+
+    client = OpenAICompatClient(
+        max_http_retries=3,
+        retry_backoff_s=0.001,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        client.complete([LLMMessage(role="user", content="hi")])
+    assert calls == 1
+
+
+def test_pooled_client_lifecycle_and_context_manager() -> None:
+    """Reuse lazy pooled ``httpx.Client`` across calls and close it via ``close()`` or ``with``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "pong"}}]},
+        )
+
+    with OpenAICompatClient(transport=httpx.MockTransport(handler)) as client:
+        assert client._client is None
+        resp1 = client.complete([LLMMessage(role="user", content="1")])
+        pooled = client._client
+        assert pooled is not None
+        assert not pooled.is_closed
+
+        resp2 = client.complete([LLMMessage(role="user", content="2")])
+        assert client._client is pooled
+        assert resp1.text == "pong"
+        assert resp2.text == "pong"
+
+    assert client._client is None
+    assert pooled.is_closed
+
+    client_manual = OpenAICompatClient(transport=httpx.MockTransport(handler))
+    client_manual.complete([LLMMessage(role="user", content="3")])
+    manual_pooled = client_manual._client
+    assert manual_pooled is not None
+    client_manual.close()
+    assert client_manual._client is None
+    assert manual_pooled.is_closed

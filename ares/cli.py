@@ -119,8 +119,12 @@ def _print_tasks_tree(tasks: dict[str, Task], root_task_id: str) -> None:
         task = tasks[tid]
         branch = "" if is_root else ("└─ " if is_last else "├─ ")
         extras: list[str] = [f"depth={task.depth}", f"{task.duration_ms:.1f}ms"]
+        if task.deterministic:
+            extras.append("det")
         if task.usage.total_tokens > 0:
             extras.append(f"tok={task.usage.total_tokens}")
+        if task.artifact_refs:
+            extras.append(f"arts={len(task.artifact_refs)}")
         if task.spilled_artifact_id:
             extras.append(f"ref={task.spilled_artifact_id}")
         print(f"  {prefix}{branch}{task.id} [{task.state}] ({task.status}) {' '.join(extras)}")
@@ -270,8 +274,12 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         else:
             _print_tasks_table(tasks)
         _print_artifacts(refs)
+        tail = int(getattr(args, "tail", 10))
+        if tail < 0:
+            raise ValueError(f"--tail must be >= 0, got {tail}")
+        shown_events = events if tail == 0 else events[-tail:]
         print(f"\nEvents ({len(events)} total):")
-        for ev in events[-10:]:
+        for ev in shown_events:
             print("  " + _format_event_line(ev))
     return 0
 
@@ -355,6 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--tree",
         action="store_true",
         help="Display tasks as an indented parent-child DAG tree",
+    )
+    inspect_p.add_argument(
+        "--tail",
+        type=int,
+        default=10,
+        help="Number of trailing events to display (0 for all, default: 10)",
     )
     inspect_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON output")
     inspect_p.set_defaults(handler=_cmd_inspect)

@@ -1,26 +1,25 @@
 # ARES
 
-> **Automated Reasoning State Machines** — Pushdown-automaton (`Spawn` / `Done` / `Suspend` / `Fail`) + dependency-DAG orchestration for parallel reasoning, deterministic verification, and long or broken contexts.
-
-ARES lets small- or bounded-context models and deterministic tools solve deep, branching tasks without stuffing an ever-growing transcript into a single prompt. Every state executes in an isolated local frame, pushes child tasks or continuations dynamically, spills large payloads to a content-addressed `ArtifactStore`, and checkpoints atomically so runs survive crashes and handoffs.
+**Automated Reasoning State Machines** — an execution runtime for **Propose → Verify → Refine** scientific reasoning pipelines designed to work with small local models and provide full step-by-step visibility.
 
 ---
 
-## Core Concepts
+## What It Is Suited For
 
-1. **PDA + Dependency DAG (`ares.machine.StateMachine`)**
-   - Each state handler `(task, deps, ctx) -> Transition` sees only its local `task.input` and the compact outputs of `task.depends_on`.
-   - **`Done(output, usage=None)`** completes the task and unblocks dependents.
-   - **`Spawn(tasks=[...], then=Continuation | None, join="all" | "any")`** pushes parallel child tasks (optionally with inter-task `depends_on`) and pauses the parent in `"waiting"` until `then` (or all children) pops a result back. Tail calls (`Spawn(tasks=[], then=...)`) preserve stack depth `O(1)`, and `join="any"` races competing branches—cancelling slower siblings as soon as a winner completes.
-   - **`Suspend(reason, resume_key=...)`** pauses cleanly for external input or manual intervention.
-   - **`Fail(error, retryable=...)`** supports bounded retries (`max_retries`) and clean failure propagation.
-2. **O(1) Bounded Context & Budgets (`ares.store.ArtifactStore`, `ares.types.RunBudget`)**
-   - Outputs larger than `RunBudget.max_inline_bytes` automatically spill to content-addressed storage (`__ares_ref__` handle + short preview). Downstream states inspect slices on demand via `ctx.store.read_slice(...)` or `get_text(...)` / `get_json(...)`.
-   - Handlers record token/call/cost telemetry via `ctx.record_usage(...)` against optional `RunBudget(max_tokens=..., max_cost_usd=...)`.
-3. **Broken-Context Crash & Resume (`ares.store.CheckpointStore`)**
-   - When `run_dir` is provided, every wave atomically checkpoints `state.json` and appends `events.jsonl`. `StateMachine.resume(run_dir)` resets interrupted `"running"` tasks to `"pending"` without re-running completed tasks.
-4. **Zero Bloat Core**
-   - Core `ares` depends only on `pydantic>=2.9.0`. Reusable optional extensions live in `ares.ext` (`ares.ext.llm.OpenAICompatClient`, `ares.ext.git.GitWorktreeSandbox`) and are never imported by core `ares`, while domain tools (e.g., `duckdb`, `pytest` subprocesses) live strictly inside callers/examples.
+- **Propose → Verify → Refine loops:** Iteratively proposing and refining candidate solvers, models, or code against external deterministic checks.
+- **Coarse-to-fine screening:** Narrowing large paper corpora or multi-table datasets to top candidates, verifying them blindly, and returning `unverified` when evidence is incomplete.
+- **Long or human-gated workflows:** Pipelines that must survive crashes, track token/cost usage, or pause for scientist sign-off and new data without restarting from scratch.
+
+---
+
+## Approach (At a Glance)
+
+- **Isolated local frames:** Each step receives only its direct inputs rather than an ever-growing chat transcript, keeping prompt size bounded.
+- **Out-of-line data:** Large datasets, logs, and documents stay on disk; downstream steps inspect bounded slices on demand.
+- **Blind verification:** External tools and test suites evaluate candidates without seeing the generator's prose.
+- **Parallel branching & checkpoints:** Competing branches can run concurrently with early stopping on first verified success, wave-level checkpointing, and pause/resume.
+
+For internal state-machine semantics, data contracts, and boundary rules, see [`docs/SPEC.md`](docs/SPEC.md).
 
 ---
 
@@ -49,11 +48,11 @@ def plan(task: Task, deps: dict, ctx: TaskContext) -> Transition:
 @m.state("square", deterministic=True)
 def square(task: Task, deps: dict, ctx: TaskContext) -> Transition:
     x = task.input["x"]
-    return Done(x * x)
+    return Done(output=x * x)
 
 @m.state("sum_all", deterministic=True)
 def sum_all(task: Task, deps: dict, ctx: TaskContext) -> Transition:
-    return Done(sum(deps.values()))
+    return Done(output=sum(deps.values()))
 
 res = m.run(TaskSpec(state="plan", input={"items": [2, 3, 4]}), max_concurrent=3)
 print(res.status, res.output)  # done 29
@@ -61,34 +60,37 @@ print(res.status, res.output)  # done 29
 
 ---
 
-## CLI
+## CLI & Visualization
 
 ```bash
-# Run a state machine from module:attr (instance or zero-arg factory)
+# Run a state machine
 uv run ares run examples.codegen_verify_repair.machine:build_machine \
   --state plan --input '{"task": "slugify"}' --run-dir /tmp/ares_run
 
-# Inspect task DAG (--tree for indented parent-child view), statuses, artifacts, and usage
+# Inspect DAG tree, statuses, artifacts, and recent events
 uv run ares inspect /tmp/ares_run --tree
 
-# Print a stored artifact or slice by ref_id
+# Read a stored artifact or slice
 uv run ares artifact /tmp/ares_run art_<id> --offset 0 --limit 1024
 
-# Resume a crashed or suspended run
+# Resume a crashed or paused run
 uv run ares resume /tmp/ares_run \
   --machine examples.codegen_verify_repair.machine:build_machine
+
+# Export a checkpointed run to an interactive single-file HTML trace viewer
+uv run python -m ares.ext.viz /tmp/ares_run -o /tmp/trace.html
 ```
 
 ---
 
 ## Examples
 
-| Example | What It Demonstrates | Run |
+| Example | Focus | Run |
 | :--- | :--- | :--- |
-| [`examples/long_horizon_small_context/`](examples/long_horizon_small_context/run.py) | Tail-recursive `H`-hop chains (`H=4, 8, 12`) keeping O(1) prompt size while a rolling-context baseline overflows; crash/resume + optional `OpenAICompatClient` (`--base-url`) | `uv run python -m examples.long_horizon_small_context.run` |
-| [`examples/coarse_to_fine_search/`](examples/coarse_to_fine_search/run.py) | 2-level dynamic `Spawn` coarse-to-fine search using `duckdb` strictly inside the example; separates 3-signal targets from 2-of-3 decoys | `uv run python -m examples.coarse_to_fine_search.run` |
-| [`examples/codegen_verify_repair/`](examples/codegen_verify_repair/run.py) | Parallel competing codegen branches (with optional `race=True` `join="any"` cancellation), isolated `pytest` subprocess verification, and bounded repair loops over spilled failure summaries | `uv run python -m examples.codegen_verify_repair.run` |
-| [`examples/repo_fix/`](examples/repo_fix/run.py) | Multi-file bounded repository navigation (`locate` -> parallel `inspect_file`) + parallel `GitWorktreeSandbox` patching/repair (`join="any"`) producing a verified `git diff` artifact | `uv run python -m examples.repo_fix.run` |
+| [`examples/long_horizon_small_context/`](examples/long_horizon_small_context/run.py) | Bounded-context multi-hop chains vs. rolling-transcript overflow; crash/resume + `--base-url` | `uv run python -m examples.long_horizon_small_context.run` |
+| [`examples/coarse_to_fine_search/`](examples/coarse_to_fine_search/run.py) | 2-level coarse-to-fine DuckDB screening; separates 3-signal targets from 2-of-3 decoys | `uv run python -m examples.coarse_to_fine_search.run` |
+| [`examples/codegen_verify_repair/`](examples/codegen_verify_repair/run.py) | Parallel codegen, isolated `pytest` verification, and bounded refinement over failure slices | `uv run python -m examples.codegen_verify_repair.run` |
+| [`examples/repo_fix/`](examples/repo_fix/run.py) | Multi-file repository search and parallel git-worktree patching producing a verified diff | `uv run python -m examples.repo_fix.run` |
 
 ---
 

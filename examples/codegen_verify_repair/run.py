@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
 from ares import ArtifactStore, RunResult, TaskSpec
+from ares.ext.llm import OpenAICompatClient
 from examples.codegen_verify_repair.machine import TASKS, build_machine
 
 
@@ -59,9 +61,10 @@ def run_demo(
     task_name: str = "slugify",
     max_attempts: int = 3,
     run_dir: str | Path | None = None,
+    llm: OpenAICompatClient | None = None,
 ) -> RunResult:
     """Execute the codegen-verify-repair demo and print a structured report."""
-    machine = build_machine(max_attempts=max_attempts)
+    machine = build_machine(llm=llm, max_attempts=max_attempts)
     root = TaskSpec(state="plan", input={"task": task_name, "max_attempts": max_attempts})
 
     if run_dir is not None:
@@ -129,8 +132,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional persistent run directory (uses temporary dir if omitted)",
     )
+    parser.add_argument(
+        "--mock",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use deterministic offline code generator (default: True unless --base-url is set).",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="OpenAI-compatible base URL when running with --no-mock.",
+    )
+    parser.add_argument(
+        "--model",
+        default="qwen2.5:3b",
+        help="Model name for OpenAICompatClient when running with --no-mock.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
-    run_demo(task_name=args.task, max_attempts=args.max_attempts, run_dir=args.run_dir)
+    use_mock = (args.base_url is None) if args.mock is None else bool(args.mock)
+    llm: OpenAICompatClient | None = None
+    if not use_mock:
+        llm = OpenAICompatClient(
+            base_url=args.base_url or "http://localhost:11434/v1",
+            model=args.model,
+            api_key=os.environ.get("OPENAI_API_KEY"),
+        )
+    run_demo(
+        task_name=args.task,
+        max_attempts=args.max_attempts,
+        run_dir=args.run_dir,
+        llm=llm,
+    )
     return 0
 
 
