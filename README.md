@@ -23,7 +23,22 @@ For internal state-machine semantics, data contracts, and boundary rules, see [`
 
 ---
 
+## Installation
+
+```bash
+pip install ares-sdk
+# With optional OpenAI-compatible LLM client (httpx)
+pip install "ares-sdk[llm]"
+
+# Or with uv
+uv add ares-sdk
+```
+
+---
+
 ## Quickstart
+
+For local development from this repository:
 
 ```bash
 uv sync --all-groups

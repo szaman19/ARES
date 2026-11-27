@@ -1,12 +1,42 @@
 [project]
-name = "ares"
+name = "ares-sdk"
 version = "0.2.0"
 description = "ARES: Automated Reasoning State Machines for parallel agent execution, deterministic verification, and long/broken contexts."
 readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Shehtab Zaman" }]
 requires-python = ">=3.11"
+keywords = [
+    "agents",
+    "state-machine",
+    "pushdown-automaton",
+    "dag",
+    "llm",
+    "reasoning",
+    "workflow",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2.9.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/szaman19/ARES"
+Repository = "https://github.com/szaman19/ARES"
+Issues = "https://github.com/szaman19/ARES/issues"
+Changelog = "https://github.com/szaman19/ARES/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 llm = [
@@ -33,6 +63,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ares"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/ares",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
 
+import ares
 from ares import ArtifactStore
 from ares.cli import main
 
@@ -291,3 +293,15 @@ def agg(task: Task, deps: dict, ctx: TaskContext) -> Done:
     tail_all_out = capsys.readouterr().out
     assert "[   1] " in tail_all_out
     assert "trace" in tail_all_out
+
+
+def test_cli_version_flag_and_pyproject_sync(capsys: pytest.CaptureFixture[str]) -> None:
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with pyproject_path.open("rb") as fh:
+        data = tomllib.load(fh)
+    assert ares.__version__ == data["project"]["version"]
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+    assert exc_info.value.code == 0
+    assert f"ares {ares.__version__}" in capsys.readouterr().out

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from ares import __version__
 from ares.machine import StateMachine
 from ares.store import ArtifactStore, CheckpointStore
 from ares.types import ArtifactRef, Event, RunBudget, RunResult, Task, TaskSpec, Usage
@@ -307,6 +308,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ares",
         description="ARES v2: Pushdown Automaton + DAG State Machine CLI",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

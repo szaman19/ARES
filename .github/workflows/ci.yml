@@ -29,3 +29,26 @@ jobs:
 
       - name: Run pytest
         run: uv run --python ${{ matrix.python-version }} pytest -v
+
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Build wheel and sdist
+        run: uv build --python 3.11
+
+      - name: Verify wheel contents and smoke test
+        run: |
+          python3 -c 'import glob, zipfile; zf = zipfile.ZipFile(glob.glob("dist/*.whl")[0]); assert "ares/py.typed" in zf.namelist(), "ares/py.typed missing from wheel"'
+          uv run --isolated --no-project --with dist/*.whl python -c "import ares; print(ares.__version__)"
+          uv run --isolated --no-project --with dist/*.whl ares --version
+          uv run --isolated --no-project --with dist/*.whl ares --help

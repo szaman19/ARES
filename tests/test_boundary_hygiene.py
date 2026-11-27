@@ -63,7 +63,10 @@ def test_core_ares_ast_has_no_forbidden_imports_or_symbols() -> None:
 
         for mod in imports:
             top = mod.split(".", 1)[0]
-            assert mod not in FORBIDDEN_MODULES, f"{py_file.name} imports forbidden {mod}"
+            for forbidden in FORBIDDEN_MODULES:
+                assert mod != forbidden and not mod.startswith(forbidden + "."), (
+                    f"{py_file.name} imports forbidden {mod}"
+                )
             assert top not in FORBIDDEN_MODULES, f"{py_file.name} imports forbidden {top}"
             if top != "ares" and top != "pydantic":
                 assert top in sys.stdlib_module_names, (
